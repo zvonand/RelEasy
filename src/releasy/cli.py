@@ -39,7 +39,7 @@ def cli(ctx: click.Context, config_path: str | None) -> None:
 @click.option("--work-dir", default=None, help="Working directory for git operations")
 @click.pass_context
 def run(ctx: click.Context, onto: str, work_dir: str | None) -> None:
-    """Run the full rebase pipeline onto a specified upstream commit."""
+    """Run the full pipeline onto a specified upstream commit."""
     from releasy.pipeline import run_pipeline
 
     config = _load_config_or_exit(ctx.obj["config_path"])
@@ -116,7 +116,7 @@ def release(
     include_skipped: bool,
     work_dir: str | None,
 ) -> None:
-    """Build a release branch from an upstream tag with CI + feature commits."""
+    """Create release base branch + per-feature PRs from an upstream tag."""
     from releasy.release import build_release
 
     config = _load_config_or_exit(ctx.obj["config_path"])
@@ -135,15 +135,17 @@ def feature() -> None:
 
 @feature.command(name="add")
 @click.option("--id", "feature_id", required=True, help="Feature identifier")
-@click.option("--branch", required=True, help="Git branch name")
+@click.option("--source-branch", required=True, help="Existing branch with feature commits")
 @click.option("--description", required=True, help="Feature description")
 @click.pass_context
-def feature_add(ctx: click.Context, feature_id: str, branch: str, description: str) -> None:
+def feature_add(
+    ctx: click.Context, feature_id: str, source_branch: str, description: str,
+) -> None:
     """Add a new feature branch."""
     from releasy.feature import add_feature
 
     config = _load_config_or_exit(ctx.obj["config_path"])
-    if not add_feature(config, feature_id, branch, description):
+    if not add_feature(config, feature_id, source_branch, description):
         raise SystemExit(1)
 
 

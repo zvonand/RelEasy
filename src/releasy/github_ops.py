@@ -1,4 +1,4 @@
-"""GitHub operations: commit/push state files and sync to GitHub Projects v2."""
+"""GitHub operations: commit/push state, project board sync, and PR creation."""
 
 from __future__ import annotations
 
@@ -15,6 +15,34 @@ from releasy.state import PipelineState
 log = logging.getLogger(__name__)
 
 GRAPHQL_URL = "https://api.github.com/graphql"
+
+
+# ---------------------------------------------------------------------------
+# Remote URL parsing
+# ---------------------------------------------------------------------------
+
+
+def parse_remote_url(url: str) -> tuple[str, str] | None:
+    """Extract (owner, repo) from a GitHub remote URL.
+
+    Supports SSH (git@github.com:owner/repo.git) and
+    HTTPS (https://github.com/owner/repo.git).
+    """
+    m = re.match(r"git@github\.com:(.+)/(.+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.match(r"https://github\.com/(.+)/(.+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1), m.group(2)
+    return None
+
+
+def get_fork_repo_slug(config: Config) -> str | None:
+    """Return 'owner/repo' for the fork remote from config."""
+    parsed = parse_remote_url(config.fork.remote)
+    if not parsed:
+        return None
+    return f"{parsed[0]}/{parsed[1]}"
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +78,54 @@ def commit_and_push_state(message: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Pull Request creation (PyGithub REST API)
+# ---------------------------------------------------------------------------
+
+
+def create_pull_request(
+    config: Config,
+    head: str,
+    base: str,
+    title: str,
+    body: str,
+) -> str | None:
+    """Create a pull request on the fork repo.
+
+    Args:
+        config: Config with fork remote URL.
+        head: Source branch name.
+        base: Target branch name.
+        title: PR title.
+        body: PR body (markdown).
+
+    Returns the PR URL, or None if creation failed.
+    """
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set — cannot create PR")
+        return None
+
+    slug = get_fork_repo_slug(config)
+    if not slug:
+        log.warning("Could not parse fork remote URL: %s", config.fork.remote)
+        return None
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        pr = repo.create_pull(title=title, body=body, head=head, base=base)
+        return pr.html_url
+    except GithubException as exc:
+        log.warning("Failed to create PR: %s", exc)
+        return None
+    except Exception as exc:
+        log.warning("Unexpected error creating PR: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # GitHub Projects v2 integration (GraphQL API)
 # ---------------------------------------------------------------------------
 
@@ -80,12 +156,7 @@ def _gql(query: str, variables: dict | None = None) -> dict | None:
 
 
 def _parse_project_url(url: str) -> tuple[str, int, bool] | None:
-    """Parse a GitHub Project URL into (owner, number, is_org).
-
-    Supports:
-      https://github.com/orgs/<org>/projects/<n>
-      https://github.com/users/<user>/projects/<n>
-    """
+    """Parse a GitHub Project URL into (owner, number, is_org)."""
     m = re.match(r"https://github\.com/orgs/([^/]+)/projects/(\d+)", url)
     if m:
         return m.group(1), int(m.group(2)), True
@@ -96,7 +167,6 @@ def _parse_project_url(url: str) -> tuple[str, int, bool] | None:
 
 
 def _get_project_id(owner: str, number: int, is_org: bool) -> str | None:
-    """Resolve a project's node ID from owner + number."""
     if is_org:
         query = """
         query($owner: String!, $number: Int!) {
@@ -105,8 +175,6 @@ def _get_project_id(owner: str, number: int, is_org: bool) -> str | None:
           }
         }
         """
-        data = _gql(query, {"owner": owner, "number": number})
-        return data["organization"]["projectV2"]["id"] if data else None
     else:
         query = """
         query($owner: String!, $number: Int!) {
@@ -115,15 +183,17 @@ def _get_project_id(owner: str, number: int, is_org: bool) -> str | None:
           }
         }
         """
-        data = _gql(query, {"owner": owner, "number": number})
-        return data["user"]["projectV2"]["id"] if data else None
+    data = _gql(query, {"owner": owner, "number": number})
+    if not data:
+        return None
+    try:
+        key = "organization" if is_org else "user"
+        return data[key]["projectV2"]["id"]
+    except (KeyError, TypeError):
+        return None
 
 
 def _get_status_field(project_id: str) -> tuple[str, dict[str, str]] | None:
-    """Find the Status single-select field and its option IDs.
-
-    Returns (field_id, {option_name_lower: option_id}).
-    """
     query = """
     query($projectId: ID!) {
       node(id: $projectId) {
@@ -144,8 +214,12 @@ def _get_status_field(project_id: str) -> tuple[str, dict[str, str]] | None:
     data = _gql(query, {"projectId": project_id})
     if not data:
         return None
+    try:
+        field_nodes = data["node"]["fields"]["nodes"]
+    except (KeyError, TypeError):
+        return None
 
-    for field_node in data["node"]["fields"]["nodes"]:
+    for field_node in field_nodes:
         if field_node.get("name", "").lower() == "status":
             options = {
                 opt["name"].lower(): opt["id"]
@@ -156,7 +230,6 @@ def _get_status_field(project_id: str) -> tuple[str, dict[str, str]] | None:
 
 
 def _find_item_by_title(project_id: str, title: str) -> str | None:
-    """Find an existing draft issue in the project by title."""
     query = """
     query($projectId: ID!) {
       node(id: $projectId) {
@@ -176,8 +249,12 @@ def _find_item_by_title(project_id: str, title: str) -> str | None:
     data = _gql(query, {"projectId": project_id})
     if not data:
         return None
+    try:
+        items = data["node"]["items"]["nodes"]
+    except (KeyError, TypeError):
+        return None
 
-    for item in data["node"]["items"]["nodes"]:
+    for item in items:
         content = item.get("content")
         if content and content.get("title") == title:
             return item["id"]
@@ -185,7 +262,6 @@ def _find_item_by_title(project_id: str, title: str) -> str | None:
 
 
 def _add_draft_issue(project_id: str, title: str, body: str) -> str | None:
-    """Add a draft issue to the project. Returns the item ID."""
     mutation = """
     mutation($projectId: ID!, $title: String!, $body: String!) {
       addProjectV2DraftIssue(input: {projectId: $projectId, title: $title, body: $body}) {
@@ -194,29 +270,15 @@ def _add_draft_issue(project_id: str, title: str, body: str) -> str | None:
     }
     """
     data = _gql(mutation, {"projectId": project_id, "title": title, "body": body})
-    if data:
+    if not data:
+        return None
+    try:
         return data["addProjectV2DraftIssue"]["projectItem"]["id"]
-    return None
-
-
-def _update_draft_issue_body(item_id: str, body: str) -> bool:
-    """Update the body of an existing draft issue."""
-    mutation = """
-    mutation($itemId: ID!, $body: String!) {
-      updateProjectV2DraftIssue(input: {draftIssueId: $itemId, body: $body}) {
-        draftIssue { id }
-      }
-    }
-    """
-    # The API actually expects the DraftIssue ID, not the item ID.
-    # We need the content ID. For simplicity, we recreate items instead.
-    # This mutation uses the draft issue's own ID, which we don't always have.
-    # Fall through to upsert pattern in sync_project.
-    return False
+    except (KeyError, TypeError):
+        return None
 
 
 def _set_item_field(project_id: str, item_id: str, field_id: str, option_id: str) -> bool:
-    """Set a single-select field value on a project item."""
     mutation = """
     mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
       updateProjectV2ItemFieldValue(input: {
@@ -239,7 +301,6 @@ def _set_item_field(project_id: str, item_id: str, field_id: str, option_id: str
 
 
 def _delete_item(project_id: str, item_id: str) -> bool:
-    """Remove an item from the project."""
     mutation = """
     mutation($projectId: ID!, $itemId: ID!) {
       deleteProjectV2Item(input: {projectId: $projectId, itemId: $itemId}) {
@@ -262,14 +323,7 @@ STATUS_MAP = {
 
 
 def sync_project(config: Config, state: PipelineState) -> bool:
-    """Sync pipeline state to a GitHub Project board.
-
-    Creates/updates one draft-issue card per branch with its current status.
-    Expects the project to have a single-select "Status" field with options
-    matching: Ok, Conflict, Resolved, Skipped, Disabled, Pending.
-
-    Returns True if sync succeeded, False if skipped or failed.
-    """
+    """Sync pipeline state to a GitHub Project board."""
     project_url = config.notifications.github_project
     if not project_url:
         return False
@@ -290,31 +344,29 @@ def sync_project(config: Config, state: PipelineState) -> bool:
         log.warning("Could not resolve project ID for %s", project_url)
         return False
 
-    # Get the Status field
     status_info = _get_status_field(project_id)
     status_field_id = None
     status_options: dict[str, str] = {}
     if status_info:
         status_field_id, status_options = status_info
 
-    # Build the list of branches to sync
-    branches: list[tuple[str, str, list[str]]] = []  # (title, status, conflict_files)
+    branches: list[tuple[str, str, list[str]]] = []
 
-    # CI branch
+    ci_label = state.ci_branch.branch_name or config.ci.branch_prefix
     branches.append((
-        config.ci_branch,
+        ci_label,
         state.ci_branch.status,
         state.ci_branch.conflict_files,
     ))
 
-    # Feature branches
     for feat in config.features:
         fs = state.features.get(feat.id)
         if fs:
-            branches.append((f"{feat.branch} ({feat.id})", fs.status, fs.conflict_files))
+            label = fs.branch_name or feat.source_branch
+            branches.append((f"{label} ({feat.id})", fs.status, fs.conflict_files))
         else:
             status = "disabled" if not feat.enabled else "pending"
-            branches.append((f"{feat.branch} ({feat.id})", status, []))
+            branches.append((f"{feat.source_branch} ({feat.id})", status, []))
 
     synced = 0
     for title, status, conflict_files in branches:
@@ -326,10 +378,8 @@ def sync_project(config: Config, state: PipelineState) -> bool:
             body_parts.append(f"**Conflict files:**\n{files_str}")
         body = "\n\n".join(body_parts)
 
-        # Upsert: find existing item or create new one
         item_id = _find_item_by_title(project_id, title)
         if item_id:
-            # Delete and recreate to update the body
             _delete_item(project_id, item_id)
 
         item_id = _add_draft_issue(project_id, title, body)
@@ -337,7 +387,6 @@ def sync_project(config: Config, state: PipelineState) -> bool:
             log.warning("Failed to create project item for %s", title)
             continue
 
-        # Set the Status field if available
         if status_field_id and status_options:
             mapped = STATUS_MAP.get(status, "Pending")
             option_id = status_options.get(mapped.lower())

@@ -15,14 +15,16 @@ BranchStatus = Literal["pending", "ok", "conflict", "resolved", "skipped", "disa
 @dataclass
 class CIBranchState:
     status: BranchStatus = "pending"
-    rebased_onto: str | None = None
+    branch_name: str | None = None  # versioned branch name, e.g. ci/antalya/abc12345
+    base_commit: str | None = None  # upstream commit the branch was created from
     conflict_files: list[str] = field(default_factory=list)
 
 
 @dataclass
 class FeatureState:
     status: BranchStatus = "pending"
-    rebased_onto: str | None = None
+    branch_name: str | None = None  # versioned branch name, e.g. feature/s3-disk/abc12345
+    base_commit: str | None = None  # upstream commit (via CI branch) the branch was created from
     conflict_files: list[str] = field(default_factory=list)
 
 
@@ -62,7 +64,8 @@ def load_state(state_path: Path | None = None) -> PipelineState:
     ci_raw = run.get("ci_branch", {})
     ci_state = CIBranchState(
         status=ci_raw.get("status", "pending"),
-        rebased_onto=ci_raw.get("rebased_onto"),
+        branch_name=ci_raw.get("branch_name"),
+        base_commit=ci_raw.get("base_commit"),
         conflict_files=ci_raw.get("conflict_files", []),
     )
 
@@ -70,7 +73,8 @@ def load_state(state_path: Path | None = None) -> PipelineState:
     for fid, fraw in run.get("features", {}).items():
         features[fid] = FeatureState(
             status=fraw.get("status", "pending"),
-            rebased_onto=fraw.get("rebased_onto"),
+            branch_name=fraw.get("branch_name"),
+            base_commit=fraw.get("base_commit"),
             conflict_files=fraw.get("conflict_files", []),
         )
 
@@ -90,15 +94,19 @@ def save_state(state: PipelineState, state_path: Path | None = None) -> None:
     features_data = {}
     for fid, fs in state.features.items():
         entry: dict = {"status": fs.status}
-        if fs.rebased_onto:
-            entry["rebased_onto"] = fs.rebased_onto
+        if fs.branch_name:
+            entry["branch_name"] = fs.branch_name
+        if fs.base_commit:
+            entry["base_commit"] = fs.base_commit
         if fs.conflict_files:
             entry["conflict_files"] = fs.conflict_files
         features_data[fid] = entry
 
     ci_data: dict = {"status": state.ci_branch.status}
-    if state.ci_branch.rebased_onto:
-        ci_data["rebased_onto"] = state.ci_branch.rebased_onto
+    if state.ci_branch.branch_name:
+        ci_data["branch_name"] = state.ci_branch.branch_name
+    if state.ci_branch.base_commit:
+        ci_data["base_commit"] = state.ci_branch.base_commit
     if state.ci_branch.conflict_files:
         ci_data["conflict_files"] = state.ci_branch.conflict_files
 

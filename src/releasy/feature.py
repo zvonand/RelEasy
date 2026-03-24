@@ -13,7 +13,7 @@ console = Console()
 def add_feature(
     config: Config,
     feature_id: str,
-    branch: str,
+    source_branch: str,
     description: str,
     enabled: bool = True,
 ) -> bool:
@@ -26,17 +26,20 @@ def add_feature(
         FeatureConfig(
             id=feature_id,
             description=description,
-            branch=branch,
+            source_branch=source_branch,
             enabled=enabled,
         )
     )
     save_config(config)
-    console.print(f"[green]✓[/green] Added feature [cyan]{feature_id}[/cyan] ({branch})")
+    prefix = config.feature_branch_prefix(feature_id)
+    console.print(
+        f"[green]✓[/green] Added feature [cyan]{feature_id}[/cyan] "
+        f"(source: {source_branch}, versioned: {prefix}/<sha>)"
+    )
     return True
 
 
 def enable_feature(config: Config, feature_id: str) -> bool:
-    """Enable a feature."""
     feat = config.get_feature(feature_id)
     if feat is None:
         console.print(f"[red]Feature '{feature_id}' not found[/red]")
@@ -51,7 +54,6 @@ def enable_feature(config: Config, feature_id: str) -> bool:
 
 
 def disable_feature(config: Config, feature_id: str) -> bool:
-    """Disable a feature."""
     feat = config.get_feature(feature_id)
     if feat is None:
         console.print(f"[red]Feature '{feature_id}' not found[/red]")
@@ -66,7 +68,6 @@ def disable_feature(config: Config, feature_id: str) -> bool:
 
 
 def remove_feature(config: Config, feature_id: str) -> bool:
-    """Remove a feature from the configuration."""
     feat = config.get_feature(feature_id)
     if feat is None:
         console.print(f"[red]Feature '{feature_id}' not found[/red]")
@@ -78,16 +79,22 @@ def remove_feature(config: Config, feature_id: str) -> bool:
 
 
 def list_features(config: Config) -> None:
-    """List all features in a table."""
     table = Table(title="Features")
     table.add_column("ID", style="cyan")
-    table.add_column("Branch")
+    table.add_column("Source Branch")
+    table.add_column("Versioned Prefix")
+    table.add_column("Depends On")
     table.add_column("Description")
     table.add_column("Enabled")
 
     for feat in config.features:
         enabled_str = "[green]yes[/green]" if feat.enabled else "[dim]no[/dim]"
-        table.add_row(feat.id, feat.branch, feat.description, enabled_str)
+        prefix = config.feature_branch_prefix(feat.id)
+        deps = ", ".join(feat.depends_on) if feat.depends_on else ""
+        table.add_row(
+            feat.id, feat.source_branch, prefix + "/<sha>",
+            deps, feat.description, enabled_str,
+        )
 
     if not config.features:
         console.print("[dim]No features configured.[/dim]")

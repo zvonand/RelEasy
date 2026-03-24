@@ -39,29 +39,31 @@ def generate_status_md(config: Config, state: PipelineState) -> str:
         "",
         f"Last run: {run_date} \u00b7 Upstream commit: `{onto}`",
         "",
-        "| Branch | Status | Last Rebased | Conflict Files |",
-        "|--------|--------|--------------|----------------|",
+        "| Branch | Status | Based On | Conflict Files |",
+        "|--------|--------|----------|----------------|",
     ]
 
     # CI branch row
     ci = state.ci_branch
+    ci_label = ci.branch_name or config.ci.branch_prefix
     ci_status = STATUS_ICONS.get(ci.status, ci.status)
-    ci_date = _format_date(state.started_at) if ci.status == "ok" else ""
-    ci_conflicts = ", ".join(ci.conflict_files) if ci.conflict_files else ""
-    lines.append(f"| {config.ci_branch} | {ci_status} | {ci_date} | {ci_conflicts} |")
+    ci_base = f"`{ci.base_commit[:12]}`" if ci.base_commit else ""
+    ci_conflicts = ", ".join(f"`{f}`" for f in ci.conflict_files) if ci.conflict_files else ""
+    lines.append(f"| {ci_label} | {ci_status} | {ci_base} | {ci_conflicts} |")
 
     # Feature branch rows
     for feat in config.features:
         fs = state.features.get(feat.id)
         if fs is None:
             status_str = STATUS_ICONS["disabled"] if not feat.enabled else STATUS_ICONS["pending"]
-            lines.append(f"| {feat.branch} | {status_str} | | |")
+            lines.append(f"| {feat.source_branch} | {status_str} | | |")
             continue
 
+        label = fs.branch_name or feat.source_branch
         status_str = STATUS_ICONS.get(fs.status, fs.status)
-        rebased_date = _format_date(state.started_at) if fs.status == "ok" else ""
-        conflicts = ", ".join(fs.conflict_files) if fs.conflict_files else ""
-        lines.append(f"| {feat.branch} | {status_str} | {rebased_date} | {conflicts} |")
+        base = f"`{fs.base_commit[:12]}`" if fs.base_commit else ""
+        conflicts = ", ".join(f"`{f}`" for f in fs.conflict_files) if fs.conflict_files else ""
+        lines.append(f"| {label} | {status_str} | {base} | {conflicts} |")
 
     lines.append("")
     return "\n".join(lines)

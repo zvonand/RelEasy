@@ -22,23 +22,30 @@ class ForkConfig:
 
 
 @dataclass
+class CIConfig:
+    branch_prefix: str  # e.g. "ci/antalya" → branches become ci/antalya/<sha8>
+    source_branch: str  # initial source branch (e.g. "antalya-ci") for bootstrap
+
+
+@dataclass
 class FeatureConfig:
     id: str
     description: str
-    branch: str
+    source_branch: str  # existing branch where feature commits live
     enabled: bool = True
+    depends_on: list[str] = field(default_factory=list)  # feature IDs this depends on (ordering TBD)
 
 
 @dataclass
 class NotificationsConfig:
-    github_project: str | None = None  # GitHub Project URL or number (optional)
+    github_project: str | None = None
 
 
 @dataclass
 class Config:
     upstream: UpstreamConfig
     fork: ForkConfig
-    ci_branch: str
+    ci: CIConfig
     features: list[FeatureConfig] = field(default_factory=list)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
 
@@ -49,8 +56,31 @@ class Config:
     def get_feature(self, feature_id: str) -> FeatureConfig | None:
         return next((f for f in self.features if f.id == feature_id), None)
 
+    @property
+    def project_name(self) -> str:
+        """Extract project name from CI branch prefix (e.g. 'ci/antalya' → 'antalya')."""
+        parts = self.ci.branch_prefix.split("/")
+        return parts[-1] if len(parts) > 1 else parts[0]
+
     def get_feature_by_branch(self, branch: str) -> FeatureConfig | None:
-        return next((f for f in self.features if f.branch == branch), None)
+        """Match by source_branch or by versioned branch prefix."""
+        for f in self.features:
+            prefix = self.feature_branch_prefix(f.id)
+            if f.source_branch == branch or branch.startswith(prefix + "/"):
+                return f
+        return None
+
+    def ci_branch_name(self, short_sha: str) -> str:
+        """Build a versioned CI branch name: ci/<project>/<sha8>"""
+        return f"{self.ci.branch_prefix}/{short_sha[:8]}"
+
+    def feature_branch_prefix(self, feature_id: str) -> str:
+        """Build the prefix for versioned feature branches: feature/<project>/<id>"""
+        return f"feature/{self.project_name}/{feature_id}"
+
+    def feature_branch_name(self, feature_id: str, short_sha: str) -> str:
+        """Build a versioned feature branch name: feature/<project>/<id>/<sha8>"""
+        return f"{self.feature_branch_prefix(feature_id)}/{short_sha[:8]}"
 
 
 def load_config(config_path: Path | None = None) -> Config:
@@ -77,14 +107,21 @@ def load_config(config_path: Path | None = None) -> Config:
         remote_name=raw["fork"].get("remote_name", "origin"),
     )
 
+    ci_raw = raw["ci"]
+    ci = CIConfig(
+        branch_prefix=ci_raw["branch_prefix"],
+        source_branch=ci_raw["source_branch"],
+    )
+
     features = []
     for feat_raw in raw.get("features", []):
         features.append(
             FeatureConfig(
                 id=feat_raw["id"],
                 description=feat_raw["description"],
-                branch=feat_raw["branch"],
+                source_branch=feat_raw["source_branch"],
                 enabled=feat_raw.get("enabled", True),
+                depends_on=feat_raw.get("depends_on", []),
             )
         )
 
@@ -95,7 +132,7 @@ def load_config(config_path: Path | None = None) -> Config:
     return Config(
         upstream=upstream,
         fork=fork,
-        ci_branch=raw["ci_branch"],
+        ci=ci,
         features=features,
         notifications=notifications,
     )
@@ -106,10 +143,6 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     if config_path is None:
         config_path = Path.cwd() / "config.yaml"
 
-    notif: dict = {}
-    if config.notifications.github_project:
-        notif["github_project"] = config.notifications.github_project
-
     data: dict = {
         "upstream": {
             "remote": config.upstream.remote,
@@ -119,19 +152,28 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
             "remote": config.fork.remote,
             "remote_name": config.fork.remote_name,
         },
-        "ci_branch": config.ci_branch,
+        "ci": {
+            "branch_prefix": config.ci.branch_prefix,
+            "source_branch": config.ci.source_branch,
+        },
         "features": [
             {
-                "id": f.id,
-                "description": f.description,
-                "branch": f.branch,
-                "enabled": f.enabled,
+                k: v
+                for k, v in {
+                    "id": f.id,
+                    "description": f.description,
+                    "source_branch": f.source_branch,
+                    "enabled": f.enabled,
+                    "depends_on": f.depends_on or None,
+                }.items()
+                if v is not None
             }
             for f in config.features
         ],
     }
-    if notif:
-        data["notifications"] = notif
+
+    if config.notifications.github_project:
+        data["notifications"] = {"github_project": config.notifications.github_project}
 
     with open(config_path, "w") as f:
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)

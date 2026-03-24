@@ -6,23 +6,32 @@ fork:
   remote: https://github.com/Altinity/ClickHouse.git
   remote_name: origin
 
-ci_branch: antalya-ci
+ci:
+  branch_prefix: ci/antalya         # versioned branches: ci/antalya/<sha8>
+  source_branch: antalya-ci          # initial source (used on first run)
 
 features:
   - id: s3-disk
     description: "Custom S3 disk improvements"
-    branch: feature/antalya-s3-disk
+    source_branch: feature/antalya-s3-disk
     enabled: true
 
   - id: keeper-cfg
     description: "Keeper config extensions"
-    branch: feature/antalya-keeper-cfg
+    source_branch: feature/antalya-keeper-cfg
     enabled: true
 
   - id: observability
     description: "Observability hooks"
-    branch: feature/antalya-observability
+    source_branch: feature/antalya-observability
     enabled: false
+
+  # Example: feature that depends on another
+  # - id: disk-cache
+  #   description: "Shared disk cache layer"
+  #   source_branch: feature/antalya-disk-cache
+  #   depends_on: [s3-disk]
+  #   enabled: true
 
 # Optional: sync branch status to a GitHub Project board.
 # The project needs a single-select "Status" field with options:
