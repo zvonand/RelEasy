@@ -1,0 +1,31 @@
+upstream:
+  remote: https://github.com/ClickHouse/ClickHouse.git
+  remote_name: upstream
+
+fork:
+  remote: https://github.com/Altinity/ClickHouse.git
+  remote_name: origin
+
+ci_branch: antalya-ci
+
+features:
+  - id: s3-disk
+    description: "Custom S3 disk improvements"
+    branch: feature/antalya-s3-disk
+    enabled: true
+
+  - id: keeper-cfg
+    description: "Keeper config extensions"
+    branch: feature/antalya-keeper-cfg
+    enabled: true
+
+  - id: observability
+    description: "Observability hooks"
+    branch: feature/antalya-observability
+    enabled: false
+
+# Optional: sync branch status to a GitHub Project board.
+# The project needs a single-select "Status" field with options:
+#   Ok, Conflict, Resolved, Skipped, Disabled, Pending
+# notifications:
+#   github_project: https://github.com/orgs/Altinity/projects/1

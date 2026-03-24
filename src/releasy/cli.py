@@ -1,0 +1,193 @@
+"""CLI entry point using Click."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import click
+
+from releasy import __version__
+
+
+def _load_config_or_exit(config_path: str | None = None) -> "Config":
+    from releasy.config import load_config
+
+    path = Path(config_path) if config_path else None
+    try:
+        return load_config(path)
+    except FileNotFoundError as e:
+        raise click.ClickException(str(e))
+    except Exception as e:
+        raise click.ClickException(f"Failed to load config: {e}")
+
+
+@click.group()
+@click.version_option(version=__version__, prog_name="releasy")
+@click.option("--config", "config_path", default=None, help="Path to config.yaml")
+@click.pass_context
+def cli(ctx: click.Context, config_path: str | None) -> None:
+    """RelEasy — manage fork rebases and release construction."""
+    ctx.ensure_object(dict)
+    ctx.obj["config_path"] = config_path
+
+
+# ---------- Maintenance pipeline ----------
+
+
+@cli.command()
+@click.option("--onto", required=True, help="Upstream commit SHA to rebase onto")
+@click.option("--work-dir", default=None, help="Working directory for git operations")
+@click.pass_context
+def run(ctx: click.Context, onto: str, work_dir: str | None) -> None:
+    """Run the full rebase pipeline onto a specified upstream commit."""
+    from releasy.pipeline import run_pipeline
+
+    config = _load_config_or_exit(ctx.obj["config_path"])
+    wd = Path(work_dir) if work_dir else None
+    state = run_pipeline(config, onto, wd)
+
+    has_conflicts = (
+        state.ci_branch.status == "conflict"
+        or any(fs.status == "conflict" for fs in state.features.values())
+    )
+    if has_conflicts:
+        raise SystemExit(1)
+
+
+@cli.command(name="continue")
+@click.option("--branch", required=True, help="Branch name or feature ID to mark as resolved")
+@click.pass_context
+def continue_cmd(ctx: click.Context, branch: str) -> None:
+    """Mark a conflict-resolved branch and update state."""
+    from releasy.pipeline import continue_branch
+
+    config = _load_config_or_exit(ctx.obj["config_path"])
+    if not continue_branch(config, branch):
+        raise SystemExit(1)
+
+
+@cli.command()
+@click.option("--branch", required=True, help="Branch name or feature ID to skip")
+@click.pass_context
+def skip(ctx: click.Context, branch: str) -> None:
+    """Skip a conflicted branch for this run."""
+    from releasy.pipeline import skip_branch
+
+    config = _load_config_or_exit(ctx.obj["config_path"])
+    if not skip_branch(config, branch):
+        raise SystemExit(1)
+
+
+@cli.command()
+@click.pass_context
+def abort(ctx: click.Context) -> None:
+    """Abort the current run, leaving all branches as-is."""
+    from releasy.pipeline import abort_run
+
+    config = _load_config_or_exit(ctx.obj["config_path"])
+    abort_run(config)
+
+
+@cli.command()
+@click.pass_context
+def status(ctx: click.Context) -> None:
+    """Print current pipeline state."""
+    from releasy.pipeline import print_status
+
+    config = _load_config_or_exit(ctx.obj["config_path"])
+    print_status(config)
+
+
+# ---------- Release ----------
+
+
+@cli.command()
+@click.option("--upstream-tag", required=True, help="Upstream tag to base release on")
+@click.option("--name", required=True, help="Release branch name")
+@click.option("--strict", is_flag=True, help="Abort if any enabled feature is not ok")
+@click.option("--include-skipped", is_flag=True, help="Include skipped features in release")
+@click.option("--work-dir", default=None, help="Working directory for git operations")
+@click.pass_context
+def release(
+    ctx: click.Context,
+    upstream_tag: str,
+    name: str,
+    strict: bool,
+    include_skipped: bool,
+    work_dir: str | None,
+) -> None:
+    """Build a release branch from an upstream tag with CI + feature commits."""
+    from releasy.release import build_release
+
+    config = _load_config_or_exit(ctx.obj["config_path"])
+    wd = Path(work_dir) if work_dir else None
+    if not build_release(config, upstream_tag, name, strict, include_skipped, wd):
+        raise SystemExit(1)
+
+
+# ---------- Feature management ----------
+
+
+@cli.group()
+def feature() -> None:
+    """Manage feature branches."""
+
+
+@feature.command(name="add")
+@click.option("--id", "feature_id", required=True, help="Feature identifier")
+@click.option("--branch", required=True, help="Git branch name")
+@click.option("--description", required=True, help="Feature description")
+@click.pass_context
+def feature_add(ctx: click.Context, feature_id: str, branch: str, description: str) -> None:
+    """Add a new feature branch."""
+    from releasy.feature import add_feature
+
+    config = _load_config_or_exit(ctx.obj["config_path"])
+    if not add_feature(config, feature_id, branch, description):
+        raise SystemExit(1)
+
+
+@feature.command(name="enable")
+@click.option("--id", "feature_id", required=True, help="Feature identifier")
+@click.pass_context
+def feature_enable(ctx: click.Context, feature_id: str) -> None:
+    """Enable a feature branch."""
+    from releasy.feature import enable_feature
+
+    config = _load_config_or_exit(ctx.obj["config_path"])
+    if not enable_feature(config, feature_id):
+        raise SystemExit(1)
+
+
+@feature.command(name="disable")
+@click.option("--id", "feature_id", required=True, help="Feature identifier")
+@click.pass_context
+def feature_disable(ctx: click.Context, feature_id: str) -> None:
+    """Disable a feature branch."""
+    from releasy.feature import disable_feature
+
+    config = _load_config_or_exit(ctx.obj["config_path"])
+    if not disable_feature(config, feature_id):
+        raise SystemExit(1)
+
+
+@feature.command(name="remove")
+@click.option("--id", "feature_id", required=True, help="Feature identifier")
+@click.pass_context
+def feature_remove(ctx: click.Context, feature_id: str) -> None:
+    """Remove a feature branch."""
+    from releasy.feature import remove_feature
+
+    config = _load_config_or_exit(ctx.obj["config_path"])
+    if not remove_feature(config, feature_id):
+        raise SystemExit(1)
+
+
+@feature.command(name="list")
+@click.pass_context
+def feature_list(ctx: click.Context) -> None:
+    """List all configured features."""
+    from releasy.feature import list_features
+
+    config = _load_config_or_exit(ctx.obj["config_path"])
+    list_features(config)
