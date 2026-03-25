@@ -501,12 +501,19 @@ def print_status(config: Config) -> None:
     table.add_column("Branch", style="cyan")
     table.add_column("Status")
     table.add_column("Based On")
+    table.add_column("Source PR")
     table.add_column("Conflict Files", style="red")
 
     style_map = {
         "ok": "green", "conflict": "red", "resolved": "blue",
         "skipped": "yellow", "disabled": "dim", "pending": "dim",
     }
+
+    def _pr_cell(fs: FeatureState | None) -> str:
+        if not fs or not fs.pr_url:
+            return ""
+        label = f"#{fs.pr_number}" if fs.pr_number else "PR"
+        return f"[link={fs.pr_url}]{label}[/link]"
 
     # CI branch
     ci = state.ci_branch
@@ -516,6 +523,7 @@ def print_status(config: Config) -> None:
         ci_label,
         f"[{status_style}]{ci.status}[/{status_style}]",
         (ci.base_commit or "")[:12],
+        "",
         ", ".join(ci.conflict_files),
     )
 
@@ -526,17 +534,16 @@ def print_status(config: Config) -> None:
         shown_ids.add(feat.id)
         if fs is None:
             status = "disabled" if not feat.enabled else "pending"
-            table.add_row(feat.source_branch, f"[dim]{status}[/dim]", "", "")
+            table.add_row(feat.source_branch, f"[dim]{status}[/dim]", "", "", "")
             continue
 
         label = fs.branch_name or feat.source_branch
-        if fs.pr_url:
-            label = f"{label} ({fs.pr_url})"
         status_style = style_map.get(fs.status, "white")
         table.add_row(
             label,
             f"[{status_style}]{fs.status}[/{status_style}]",
             (fs.base_commit or "")[:12],
+            _pr_cell(fs),
             ", ".join(fs.conflict_files),
         )
 
@@ -545,13 +552,12 @@ def print_status(config: Config) -> None:
         if fid in shown_ids:
             continue
         label = fs.branch_name or fid
-        if fs.pr_url:
-            label = f"{label} ({fs.pr_url})"
         status_style = style_map.get(fs.status, "white")
         table.add_row(
             label,
             f"[{status_style}]{fs.status}[/{status_style}]",
             (fs.base_commit or "")[:12],
+            _pr_cell(fs),
             ", ".join(fs.conflict_files),
         )
 

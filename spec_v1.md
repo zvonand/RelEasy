@@ -246,12 +246,13 @@ Updated after every state change. Committed and pushed to the tool repo automati
 
 Last run: 2026-03-21 · Upstream commit: `abc1234567890`
 
-| Branch                                    | Status      | Based On       | Conflict Files              |
-|-------------------------------------------|-------------|----------------|-----------------------------|
-| ci/antalya/abc12345                       | ✅ ok       | `abc12345678`  |                             |
-| feature/antalya/s3-disk/abc12345          | ✅ ok       | `abc12345678`  |                             |
-| feature/antalya/keeper-cfg/abc12345       | 🔴 conflict | `abc12345678`  | `src/Storages/StorageS3.cpp` |
-| feature/antalya-observability             | ⏸ disabled  |                |                             |
+| Branch                                    | Status      | Based On       | Source PR | Conflict Files              |
+|-------------------------------------------|-------------|----------------|-----------|---------------------------  |
+| ci/antalya/abc12345                       | ✅ ok       | `abc12345678`  |           |                             |
+| feature/antalya/s3-disk/abc12345          | ✅ ok       | `abc12345678`  |           |                             |
+| feature/antalya/keeper-cfg/abc12345       | 🔴 conflict | `abc12345678`  |           | `src/Storages/StorageS3.cpp` |
+| feature/antalya-observability             | ⏸ disabled  |                |           |                             |
+| feature/antalya/pr-1234/abc12345          | ✅ ok       | `abc12345678`  | [#1234](https://github.com/Altinity/ClickHouse/pull/1234) | |
 ```
 
 Status values: `✅ ok` · `🔴 conflict` · `🔵 resolved` · `⏭ skipped` · `⏸ disabled` · `⏳ pending`
