@@ -11,7 +11,6 @@ merge-base with upstream determines the divergence point.
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 from rich.console import Console
@@ -20,18 +19,25 @@ from releasy.config import Config, FeatureConfig
 from releasy.git_ops import (
     cherry_pick_merge_commit,
     cherry_pick_range,
+    commit_conflict_markers,
     count_commits,
     create_branch_from_ref,
     ensure_work_repo,
-    fetch_all,
     fetch_pr_ref,
+    fetch_remote,
     find_merge_base,
     force_push,
     get_branch_tip,
     get_short_sha,
+    branch_exists,
     stash_and_clean,
 )
-from releasy.github_ops import commit_and_push_state, search_prs_by_label, sync_project
+from releasy.github_ops import (
+    commit_and_push_state,
+    create_pull_request,
+    search_prs_by_labels,
+    sync_project,
+)
 from releasy.state import CIBranchState, FeatureState, PipelineState, load_state, save_state
 from releasy.status import write_status_md
 
@@ -51,24 +57,36 @@ def _carry_pr_metadata(prev_fs: FeatureState | None) -> dict:
 
 
 def _update_state_and_status(config: Config, state: PipelineState) -> None:
-    """Persist state + STATUS.md, sync project board, and push to the tool repo."""
+    """Persist state + STATUS.md, and optionally sync project board / push."""
     save_state(state, config.repo_dir)
     write_status_md(config, state)
-    sync_project(config, state)
-    commit_and_push_state(f"releasy: update state — onto {state.onto}", config.repo_dir)
+    if config.push:
+        sync_project(config, state)
+        commit_and_push_state(f"releasy: update state — onto {state.onto}", config.repo_dir)
 
 
 def _resolve_source_branch(
     state_branch: str | None,
     config_source: str,
     fork_remote: str,
+    repo_path: Path | None = None,
 ) -> str:
-    """Determine the remote ref to cherry-pick from.
+    """Determine the ref to cherry-pick from.
 
-    If a previous versioned branch exists in state, use that.
-    Otherwise fall back to the config's source_branch.
+    If a previous versioned branch exists in state, try remote then local.
+    Otherwise fall back to the config's source_branch on the remote.
     """
-    if state_branch:
+    if state_branch and repo_path is not None:
+        remote_ref = f"{fork_remote}/{state_branch}"
+        from releasy.git_ops import run_git
+        result = run_git(["rev-parse", "--verify", remote_ref], repo_path, check=False)
+        if result.returncode == 0:
+            return remote_ref
+        # Branch may only exist locally (push disabled)
+        result = run_git(["rev-parse", "--verify", state_branch], repo_path, check=False)
+        if result.returncode == 0:
+            return state_branch
+    elif state_branch:
         return f"{fork_remote}/{state_branch}"
     return f"{fork_remote}/{config_source}"
 
@@ -105,82 +123,120 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
 
     save_state(state, config.repo_dir)
 
-    if work_dir is None:
-        work_dir = Path(tempfile.mkdtemp(prefix="releasy-"))
+    work_dir = config.resolve_work_dir(work_dir)
     console.print(f"[dim]Working directory: {work_dir}[/dim]")
 
+    console.print(f"[dim]Setting up repository...[/dim]")
     repo_path = ensure_work_repo(config, work_dir)
-    fetch_all(config, repo_path)
+    console.print(f"[dim]Repo: {repo_path}[/dim]")
+
+    console.print(f"Fetching [cyan]{config.upstream.remote_name}[/cyan]...", end=" ")
+    fetch_remote(repo_path, config.upstream.remote_name)
+    console.print("[green]done[/green]")
+
+    console.print(f"Fetching [cyan]{config.fork.remote_name}[/cyan]...", end=" ")
+    fetch_remote(repo_path, config.fork.remote_name)
+    console.print("[green]done[/green]")
 
     short_sha = get_short_sha(repo_path, onto)
     new_ci_branch = config.ci_branch_name(short_sha)
 
     # --- Stage 1: Create clean CI branch and cherry-pick CI commits ---
-    console.print(
-        f"\n[bold]Stage 1:[/bold] Creating [cyan]{new_ci_branch}[/cyan] "
-        f"from [yellow]{onto[:12]}[/yellow] and cherry-picking CI commits"
-    )
+    ci_exists = branch_exists(repo_path, new_ci_branch, config.fork.remote_name)
 
-    # Determine source of CI commits
-    source_ref = _resolve_source_branch(
-        prev_state.ci_branch.branch_name,
-        config.ci.source_branch,
-        config.fork.remote_name,
-    )
-
-    # Find the divergence point: where the source branch parts from upstream
-    if prev_state.ci_branch.base_commit:
-        # We know exactly where the old branch was based — commits start right after that
-        divergence = prev_state.ci_branch.base_commit
+    if ci_exists and config.ci.if_exists == "skip":
+        console.print(
+            f"\n[bold]Stage 1:[/bold] [cyan]{new_ci_branch}[/cyan] "
+            f"already exists — skipping (if_exists: skip)"
+        )
+        state.ci_branch = CIBranchState(
+            status="ok",
+            branch_name=new_ci_branch,
+            base_commit=onto,
+        )
+        _update_state_and_status(config, state)
     else:
-        # First run: find merge-base between source branch and the --onto ref
-        divergence = find_merge_base(repo_path, source_ref, onto)
-        if divergence is None:
-            console.print(f"  [red]✗[/red] Could not find merge-base between {source_ref} and {onto}")
-            state.ci_branch = CIBranchState(
-                status="conflict", conflict_files=[],
+        if ci_exists:
+            console.print(
+                f"\n[bold]Stage 1:[/bold] Recreating [cyan]{new_ci_branch}[/cyan] "
+                f"from [yellow]{onto}[/yellow] (if_exists: redo)"
             )
-            _update_state_and_status(config, state)
-            return state
-
-    source_tip = get_branch_tip(repo_path, source_ref)
-    n_commits = count_commits(repo_path, divergence, source_tip)
-    console.print(f"  Source: [dim]{source_ref}[/dim] ({n_commits} commit(s) to apply)")
-
-    # Create the clean branch
-    stash_and_clean(repo_path)
-    create_branch_from_ref(repo_path, new_ci_branch, onto)
-
-    if n_commits > 0:
-        result = cherry_pick_range(repo_path, divergence, source_tip)
-        if result.success:
-            console.print(f"  [green]✓[/green] Cherry-picked {n_commits} CI commit(s)")
         else:
-            console.print(f"  [red]✗[/red] Conflict cherry-picking CI commits!")
-            for f in result.conflict_files:
-                console.print(f"    [red]•[/red] {f}")
-            state.ci_branch = CIBranchState(
-                status="conflict",
-                branch_name=new_ci_branch,
-                base_commit=onto,
-                conflict_files=result.conflict_files,
+            console.print(
+                f"\n[bold]Stage 1:[/bold] Creating [cyan]{new_ci_branch}[/cyan] "
+                f"from [yellow]{onto}[/yellow] and cherry-picking CI commits"
             )
-            _update_state_and_status(config, state)
-            console.print("\n[red]Stage 1 failed. Stage 2 will not run.[/red]")
-            return state
-    else:
-        console.print(f"  [dim]No CI commits to apply — branch is clean upstream[/dim]")
 
-    # Push the new CI branch
-    force_push(repo_path, new_ci_branch, config.fork.remote_name)
-    console.print(f"  [green]✓[/green] Pushed [cyan]{new_ci_branch}[/cyan]")
+        source_ref = _resolve_source_branch(
+            prev_state.ci_branch.branch_name,
+            config.ci.source_branch,
+            config.fork.remote_name,
+            repo_path,
+        )
 
-    state.ci_branch = CIBranchState(
-        status="ok",
-        branch_name=new_ci_branch,
-        base_commit=onto,
-    )
-    _update_state_and_status(config, state)
+        if prev_state.ci_branch.base_commit:
+            divergence = prev_state.ci_branch.base_commit
+        else:
+            # Resolve onto to a SHA in case it's a tag or symbolic ref
+            onto_sha = get_branch_tip(repo_path, onto)
+            divergence = find_merge_base(repo_path, source_ref, onto_sha)
+            if divergence is None:
+                console.print(
+                    f"  [red]✗[/red] Could not find merge-base between "
+                    f"{source_ref} and {onto} ({onto_sha[:12]})"
+                )
+                console.print(f"  [dim]Hint: does '{config.ci.source_branch}' exist on the fork remote?[/dim]")
+                state.ci_branch = CIBranchState(
+                    status="conflict", conflict_files=[],
+                )
+                _update_state_and_status(config, state)
+                return state
+
+        source_tip = get_branch_tip(repo_path, source_ref)
+        n_commits = count_commits(repo_path, divergence, source_tip)
+        console.print(f"  Source: [dim]{source_ref}[/dim] ({n_commits} commit(s) to apply)")
+
+        stash_and_clean(repo_path)
+        create_branch_from_ref(repo_path, new_ci_branch, onto)
+
+        if n_commits > 0:
+            result = cherry_pick_range(
+                repo_path, divergence, source_tip, abort_on_conflict=False,
+            )
+            if result.success:
+                console.print(f"  [green]✓[/green] Cherry-picked {n_commits} CI commit(s)")
+            else:
+                console.print(f"  [red]✗[/red] Conflict cherry-picking CI commits!")
+                for f in result.conflict_files:
+                    console.print(f"    [red]•[/red] {f}")
+                console.print(
+                    f"\n  [yellow]Resolve the conflict in:[/yellow] {repo_path}"
+                    f"\n  [yellow]Branch:[/yellow] {new_ci_branch}"
+                    f"\n  Then run: [bold]releasy continue --branch {new_ci_branch}[/bold]"
+                )
+                state.ci_branch = CIBranchState(
+                    status="conflict",
+                    branch_name=new_ci_branch,
+                    base_commit=onto,
+                    conflict_files=result.conflict_files,
+                )
+                _update_state_and_status(config, state)
+                return state
+        else:
+            console.print(f"  [dim]No CI commits to apply — branch is clean upstream[/dim]")
+
+        if config.push:
+            force_push(repo_path, new_ci_branch, config.fork.remote_name)
+            console.print(f"  [green]✓[/green] Pushed [cyan]{new_ci_branch}[/cyan]")
+        else:
+            console.print(f"  [dim]Skipping push (push not enabled)[/dim]")
+
+        state.ci_branch = CIBranchState(
+            status="ok",
+            branch_name=new_ci_branch,
+            base_commit=onto,
+        )
+        _update_state_and_status(config, state)
 
     # --- Stage 2: Create clean feature branches and cherry-pick ---
     console.print(
@@ -198,6 +254,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
             prev_feat.branch_name if prev_feat else None,
             feat.source_branch,
             config.fork.remote_name,
+            repo_path,
         )
 
         # Find divergence point: we always compare the feature branch against the
@@ -210,6 +267,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
                 prev_state.ci_branch.branch_name,
                 config.ci.source_branch,
                 config.fork.remote_name,
+                repo_path,
             )
             feat_divergence = get_branch_tip(repo_path, old_ci_ref)
         else:
@@ -217,6 +275,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
             # at some point. merge-base(feature, ci) finds that fork point.
             ci_source_ref = _resolve_source_branch(
                 None, config.ci.source_branch, config.fork.remote_name,
+                repo_path,
             )
             feat_divergence = find_merge_base(repo_path, feat_source_ref, ci_source_ref)
             if feat_divergence is None:
@@ -240,13 +299,20 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
         create_branch_from_ref(repo_path, new_feat_branch, new_ci_branch)
 
         if n_feat_commits > 0:
-            result = cherry_pick_range(repo_path, feat_divergence, feat_source_tip)
+            result = cherry_pick_range(
+                repo_path, feat_divergence, feat_source_tip, abort_on_conflict=False,
+            )
             if result.success:
                 console.print(f"    [green]✓[/green] Cherry-picked {n_feat_commits} commit(s)")
             else:
                 console.print(f"    [red]✗[/red] Conflict!")
                 for f in result.conflict_files:
                     console.print(f"      [red]•[/red] {f}")
+                console.print(
+                    f"\n    [yellow]Resolve the conflict in:[/yellow] {repo_path}"
+                    f"\n    [yellow]Branch:[/yellow] {new_feat_branch}"
+                    f"\n    Then run: [bold]releasy continue --branch {feat.id}[/bold]"
+                )
                 state.features[feat.id] = FeatureState(
                     status="conflict",
                     branch_name=new_feat_branch,
@@ -259,8 +325,11 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
         else:
             console.print(f"    [dim]No feature commits to apply[/dim]")
 
-        force_push(repo_path, new_feat_branch, config.fork.remote_name)
-        console.print(f"    [green]✓[/green] Pushed [cyan]{new_feat_branch}[/cyan]")
+        if config.push:
+            force_push(repo_path, new_feat_branch, config.fork.remote_name)
+            console.print(f"    [green]✓[/green] Pushed [cyan]{new_feat_branch}[/cyan]")
+        else:
+            console.print(f"    [dim]Skipping push (push not enabled)[/dim]")
 
         state.features[feat.id] = FeatureState(
             status="ok",
@@ -282,8 +351,10 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
         existing_ids = {feat.id for feat in config.features}
 
         for pr_source in config.pr_sources:
-            console.print(f"\n  Searching for PRs with label [yellow]{pr_source.label}[/yellow]")
-            prs = search_prs_by_label(config, pr_source.label)
+            labels_str = ", ".join(pr_source.labels)
+            filter_str = " (merged only)" if pr_source.merged_only else ""
+            console.print(f"\n  Searching for PRs with labels [yellow]{labels_str}[/yellow]{filter_str}")
+            prs = search_prs_by_labels(config, pr_source.labels, pr_source.merged_only)
 
             if not prs:
                 console.print(f"    [dim]No PRs found[/dim]")
@@ -300,11 +371,28 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
                     continue
 
                 new_pr_branch = config.feature_branch_name(feature_id, short_sha)
+
+                pr_branch_exists = branch_exists(
+                    repo_path, new_pr_branch, config.fork.remote_name,
+                )
+                if pr_branch_exists and pr_source.if_exists == "skip":
+                    console.print(
+                        f"\n    [cyan]{new_pr_branch}[/cyan] (PR #{pr.number}: {pr.title})"
+                        f" — already exists, skipping"
+                    )
+                    continue
+
                 desc = pr.title
                 if pr_source.description:
                     desc = f"{pr_source.description}: {desc}"
 
-                console.print(f"\n    [cyan]{new_pr_branch}[/cyan] (PR #{pr.number}: {pr.title})")
+                if pr_branch_exists:
+                    console.print(
+                        f"\n    [cyan]{new_pr_branch}[/cyan] (PR #{pr.number}: {pr.title})"
+                        f" — recreating (if_exists: redo)"
+                    )
+                else:
+                    console.print(f"\n    [cyan]{new_pr_branch}[/cyan] (PR #{pr.number}: {pr.title})")
                 console.print(f"      PR: {pr.url}  [{pr.state}]")
 
                 pr_meta = {
@@ -329,7 +417,9 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
                 create_branch_from_ref(repo_path, new_pr_branch, new_ci_branch)
 
                 if pr.state == "merged" and pr.merge_commit_sha:
-                    cp_result = cherry_pick_merge_commit(repo_path, pr.merge_commit_sha)
+                    cp_result = cherry_pick_merge_commit(
+                        repo_path, pr.merge_commit_sha, abort_on_conflict=False,
+                    )
                 else:
                     if not fetch_pr_ref(repo_path, config.fork.remote_name, pr.number):
                         console.print(
@@ -343,21 +433,26 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
                         )
                         _update_state_and_status(config, state)
                         continue
-                    cp_result = cherry_pick_merge_commit(repo_path, "FETCH_HEAD")
-
-                if cp_result.success:
-                    force_push(repo_path, new_pr_branch, config.fork.remote_name)
-                    console.print(f"      [green]✓[/green] Pushed [cyan]{new_pr_branch}[/cyan]")
-                    state.features[feature_id] = FeatureState(
-                        status="ok",
-                        branch_name=new_pr_branch,
-                        base_commit=onto,
-                        **pr_meta,
+                    cp_result = cherry_pick_merge_commit(
+                        repo_path, "FETCH_HEAD", abort_on_conflict=False,
                     )
-                else:
+
+                has_conflict = not cp_result.success
+
+                if has_conflict:
                     console.print(f"      [red]✗[/red] Conflict!")
                     for cf in cp_result.conflict_files:
                         console.print(f"        [red]•[/red] {cf}")
+                    commit_conflict_markers(repo_path)
+                    console.print(f"      [yellow]↑[/yellow] Committed conflict markers as WIP")
+
+                if config.push:
+                    force_push(repo_path, new_pr_branch, config.fork.remote_name)
+                    console.print(f"      [green]✓[/green] Pushed [cyan]{new_pr_branch}[/cyan]")
+                else:
+                    console.print(f"      [dim]Skipping push (push not enabled)[/dim]")
+
+                if has_conflict:
                     state.features[feature_id] = FeatureState(
                         status="conflict",
                         branch_name=new_pr_branch,
@@ -365,6 +460,34 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
                         conflict_files=cp_result.conflict_files,
                         **pr_meta,
                     )
+                else:
+                    state.features[feature_id] = FeatureState(
+                        status="ok",
+                        branch_name=new_pr_branch,
+                        base_commit=onto,
+                        **pr_meta,
+                    )
+
+                if config.push and pr_source.auto_pr:
+                    pr_title = f"[releasy] {pr.title}"
+                    pr_body_parts = []
+                    if has_conflict:
+                        pr_body_parts.append(
+                            "> **WARNING:** This branch has unresolved conflict "
+                            "markers and needs manual resolution.\n"
+                        )
+                    pr_body_parts.append(f"Cherry-picked from #{pr.number} onto `{new_ci_branch}`.")
+                    if pr.body:
+                        pr_body_parts.append(f"\n---\n\n{pr.body}")
+                    rebase_pr_url = create_pull_request(
+                        config, new_pr_branch, new_ci_branch,
+                        pr_title, "\n".join(pr_body_parts),
+                    )
+                    if rebase_pr_url:
+                        state.features[feature_id].rebase_pr_url = rebase_pr_url
+                        console.print(f"      [green]✓[/green] PR opened: {rebase_pr_url}")
+                    else:
+                        console.print(f"      [yellow]![/yellow] Could not create PR")
 
                 _update_state_and_status(config, state)
 

@@ -7,7 +7,6 @@ and opens a GitHub PR targeting the release branch.
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 from rich.console import Console
@@ -137,12 +136,21 @@ def build_release(
         features_to_include.append(feat)
 
     # --- Set up working repo ---
-    if work_dir is None:
-        work_dir = Path(tempfile.mkdtemp(prefix="releasy-release-"))
+    work_dir = config.resolve_work_dir(work_dir)
     console.print(f"[dim]Working directory: {work_dir}[/dim]")
 
+    console.print(f"[dim]Setting up repository...[/dim]")
     repo_path = ensure_work_repo(config, work_dir)
-    fetch_all(config, repo_path)
+    console.print(f"[dim]Repo: {repo_path}[/dim]")
+
+    from releasy.git_ops import fetch_remote
+    console.print(f"Fetching [cyan]{config.upstream.remote_name}[/cyan]...", end=" ")
+    fetch_remote(repo_path, config.upstream.remote_name)
+    console.print("[green]done[/green]")
+
+    console.print(f"Fetching [cyan]{config.fork.remote_name}[/cyan]...", end=" ")
+    fetch_remote(repo_path, config.fork.remote_name)
+    console.print("[green]done[/green]")
 
     # --- Step 1: Create release base branch from upstream tag ---
     console.print(
@@ -182,9 +190,12 @@ def build_release(
         console.print(f"\n[dim]No CI branch state — skipping CI commits[/dim]")
 
     # --- Step 3: Push the base release branch ---
-    console.print(f"\n[bold]Pushing base branch[/bold] [cyan]{branch_name}[/cyan]")
-    force_push(repo_path, branch_name, config.fork.remote_name)
-    console.print(f"  [green]✓[/green] Pushed")
+    if config.push:
+        console.print(f"\n[bold]Pushing base branch[/bold] [cyan]{branch_name}[/cyan]")
+        force_push(repo_path, branch_name, config.fork.remote_name)
+        console.print(f"  [green]✓[/green] Pushed")
+    else:
+        console.print(f"\n[dim]Skipping push of base branch (push not enabled)[/dim]")
 
     # --- Step 4: Per-feature branches and PRs ---
     console.print(f"\n[bold]Creating per-feature branches and PRs[/bold]")
@@ -257,23 +268,25 @@ def build_release(
             run_git(["branch", "-D", feat_pr_branch], repo_path, check=False)
             continue
 
-        # Push the feature PR branch
-        force_push(repo_path, feat_pr_branch, config.fork.remote_name)
-        console.print(f"    [green]✓[/green] Pushed ({n_feat} commits squashed into 1)")
+        pr_url = None
+        if config.push:
+            force_push(repo_path, feat_pr_branch, config.fork.remote_name)
+            console.print(f"    [green]✓[/green] Pushed ({n_feat} commits squashed into 1)")
 
-        # Open a PR — reuse original PR title/body if the feature came from a PR
-        original_body = fs.pr_body if fs.pr_body else None
-        pr_title = f"[releasy] {feat.id}: {feat.description}"
-        pr_body = _build_pr_body(feat, n_feat, branch_name, original_body)
-        pr_url = create_pull_request(config, feat_pr_branch, branch_name, pr_title, pr_body)
+            original_body = fs.pr_body if fs.pr_body else None
+            pr_title = f"[releasy] {feat.id}: {feat.description}"
+            pr_body = _build_pr_body(feat, n_feat, branch_name, original_body)
+            pr_url = create_pull_request(config, feat_pr_branch, branch_name, pr_title, pr_body)
 
-        if pr_url:
-            console.print(f"    [green]✓[/green] PR opened: {pr_url}")
+            if pr_url:
+                console.print(f"    [green]✓[/green] PR opened: {pr_url}")
+            else:
+                console.print(
+                    f"    [yellow]![/yellow] Branch pushed but PR not created "
+                    f"(set RELEASY_GITHUB_TOKEN to enable)"
+                )
         else:
-            console.print(
-                f"    [yellow]![/yellow] Branch pushed but PR not created "
-                f"(set RELEASY_GITHUB_TOKEN to enable)"
-            )
+            console.print(f"    [dim]Skipping push (push not enabled)[/dim]")
 
         pr_results.append((feat.id, feat_pr_branch, pr_url))
 

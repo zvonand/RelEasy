@@ -1,3 +1,12 @@
+# Push branches to origin and open PRs.
+# Default is false — everything stays local until you enable this.
+# push: true
+
+# Where to clone the fork for git operations.
+# If omitted, uses the current working directory.
+# Can also be overridden with --work-dir on the CLI.
+# work_dir: /tmp/releasy-work
+
 upstream:
   remote: https://github.com/ClickHouse/ClickHouse.git
   remote_name: upstream
@@ -9,6 +18,7 @@ fork:
 ci:
   branch_prefix: ci/antalya         # versioned branches: ci/antalya/<sha8>
   source_branch: antalya-ci          # initial source (used on first run)
+  # if_exists: skip                  # skip (default) or redo — what to do if the CI branch already exists
 
 features:
   - id: s3-disk
@@ -33,12 +43,17 @@ features:
   #   depends_on: [s3-disk]
   #   enabled: true
 
-# PR-based features: discover PRs in the fork repo by label.
-# Each matching PR becomes its own feature branch.
+# PR-based features: discover PRs in the fork repo by labels.
+# A PR must have ALL listed labels to be included.
+# Set merged_only: true to skip open PRs.
+# Set auto_pr: true to auto-create a PR into the CI branch after cherry-pick.
 # Requires RELEASY_GITHUB_TOKEN.
 # pr_sources:
-#   - label: "forward-port"
+#   - labels: ["forward-port", "v26.1"]
 #     description: "Forward-ported changes"
+#     merged_only: true
+#     auto_pr: true
+#     if_exists: skip                # skip (default) or redo — what to do if the feature branch already exists
 
 # Optional: sync branch status to a GitHub Project board.
 # The project needs a single-select "Status" field with options:

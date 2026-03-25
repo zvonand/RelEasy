@@ -25,6 +25,7 @@ class ForkConfig:
 class CIConfig:
     branch_prefix: str  # e.g. "ci/antalya" → branches become ci/antalya/<sha8>
     source_branch: str  # initial source branch (e.g. "antalya-ci") for bootstrap
+    if_exists: str = "skip"  # "skip" or "redo"
 
 
 @dataclass
@@ -38,8 +39,11 @@ class FeatureConfig:
 
 @dataclass
 class PRSourceConfig:
-    label: str
+    labels: list[str]
     description: str = ""
+    merged_only: bool = False
+    auto_pr: bool = False
+    if_exists: str = "skip"  # "skip" or "redo"
 
 
 @dataclass
@@ -56,11 +60,24 @@ class Config:
     pr_sources: list[PRSourceConfig] = field(default_factory=list)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     config_path: Path = field(default_factory=lambda: Path.cwd() / "config.yaml")
+    work_dir: Path | None = None
+    push: bool = False
 
     @property
     def repo_dir(self) -> Path:
         """Directory containing config.yaml (and state.yaml, STATUS.md)."""
         return self.config_path.parent
+
+    def resolve_work_dir(self, cli_override: Path | None = None) -> Path:
+        """Resolve the working directory for git clone operations.
+
+        Priority: CLI --work-dir > config work_dir > current directory.
+        """
+        if cli_override is not None:
+            return cli_override.resolve()
+        if self.work_dir is not None:
+            return self.work_dir.resolve()
+        return Path.cwd()
 
     @property
     def enabled_features(self) -> list[FeatureConfig]:
@@ -126,6 +143,7 @@ def load_config(config_path: Path | None = None) -> Config:
     ci = CIConfig(
         branch_prefix=ci_raw["branch_prefix"],
         source_branch=ci_raw["source_branch"],
+        if_exists=ci_raw.get("if_exists", "skip"),
     )
 
     features = []
@@ -142,16 +160,25 @@ def load_config(config_path: Path | None = None) -> Config:
 
     pr_sources = []
     for ps_raw in raw.get("pr_sources", []):
+        raw_labels = ps_raw.get("labels", [])
+        if isinstance(raw_labels, str):
+            raw_labels = [raw_labels]
         pr_sources.append(
             PRSourceConfig(
-                label=ps_raw["label"],
+                labels=raw_labels,
                 description=ps_raw.get("description", ""),
+                merged_only=ps_raw.get("merged_only", False),
+                auto_pr=ps_raw.get("auto_pr", False),
+                if_exists=ps_raw.get("if_exists", "skip"),
             )
         )
 
     notifications = NotificationsConfig(
         github_project=raw.get("notifications", {}).get("github_project"),
     )
+
+    raw_work_dir = raw.get("work_dir")
+    work_dir = Path(raw_work_dir).resolve() if raw_work_dir else None
 
     return Config(
         upstream=upstream,
@@ -161,6 +188,8 @@ def load_config(config_path: Path | None = None) -> Config:
         pr_sources=pr_sources,
         notifications=notifications,
         config_path=config_path,
+        work_dir=work_dir,
+        push=raw.get("push", False),
     )
 
 
@@ -179,8 +208,13 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
             "remote_name": config.fork.remote_name,
         },
         "ci": {
-            "branch_prefix": config.ci.branch_prefix,
-            "source_branch": config.ci.source_branch,
+            k: v
+            for k, v in {
+                "branch_prefix": config.ci.branch_prefix,
+                "source_branch": config.ci.source_branch,
+                "if_exists": config.ci.if_exists if config.ci.if_exists != "skip" else None,
+            }.items()
+            if v is not None
         },
         "features": [
             {
@@ -198,14 +232,30 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         ],
     }
 
+    if config.work_dir:
+        data["work_dir"] = str(config.work_dir)
+
     if config.pr_sources:
         data["pr_sources"] = [
-            {k: v for k, v in {"label": ps.label, "description": ps.description or None}.items() if v is not None}
+            {
+                k: v
+                for k, v in {
+                    "labels": ps.labels,
+                    "description": ps.description or None,
+                    "merged_only": ps.merged_only or None,
+                    "auto_pr": ps.auto_pr or None,
+                    "if_exists": ps.if_exists if ps.if_exists != "skip" else None,
+                }.items()
+                if v is not None
+            }
             for ps in config.pr_sources
         ]
 
     if config.notifications.github_project:
         data["notifications"] = {"github_project": config.notifications.github_project}
+
+    if config.push:
+        data["push"] = True
 
     with open(config_path, "w") as f:
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)

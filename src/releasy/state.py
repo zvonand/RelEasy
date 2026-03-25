@@ -30,6 +30,7 @@ class FeatureState:
     pr_number: int | None = None  # PR number (for PR-sourced features)
     pr_title: str | None = None  # original PR title (preserved for release PR creation)
     pr_body: str | None = None  # original PR body (preserved for release PR creation)
+    rebase_pr_url: str | None = None  # auto-created PR targeting CI branch
 
 
 @dataclass
@@ -85,6 +86,7 @@ def load_state(repo_dir: Path | None = None) -> PipelineState:
             pr_number=fraw.get("pr_number"),
             pr_title=fraw.get("pr_title"),
             pr_body=fraw.get("pr_body"),
+            rebase_pr_url=fraw.get("rebase_pr_url"),
         )
 
     return PipelineState(
@@ -118,6 +120,8 @@ def save_state(state: PipelineState, repo_dir: Path | None = None) -> None:
             entry["pr_title"] = fs.pr_title
         if fs.pr_body:
             entry["pr_body"] = fs.pr_body
+        if fs.rebase_pr_url:
+            entry["rebase_pr_url"] = fs.rebase_pr_url
         features_data[fid] = entry
 
     ci_data: dict = {"status": state.ci_branch.status}

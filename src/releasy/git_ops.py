@@ -54,12 +54,16 @@ def run_git(
 
 
 def ensure_work_repo(config: Config, work_dir: Path) -> Path:
-    """Ensure a local clone of the fork exists at work_dir.
+    """Ensure a local clone of the fork exists and has the right remotes.
 
-    Sets up both the fork (origin) and upstream remotes.
+    If work_dir itself is a git repo, it is used directly.
+    Otherwise, a clone is created at work_dir/repo.
     Returns the repo path.
     """
-    repo_path = work_dir / "repo"
+    if (work_dir / ".git").exists():
+        repo_path = work_dir
+    else:
+        repo_path = work_dir / "repo"
 
     if not (repo_path / ".git").exists():
         run_git(["clone", config.fork.remote, "repo"], work_dir)
@@ -106,8 +110,26 @@ def stash_and_clean(repo_path: Path) -> None:
 
 
 def create_branch_from_ref(repo_path: Path, branch_name: str, ref: str) -> None:
-    """Create a new branch from a given ref and check it out."""
+    """Create (or recreate) a branch from a given ref and check it out."""
+    # Delete the local branch if it already exists, so -b doesn't fail
+    run_git(["branch", "-D", branch_name], repo_path, check=False)
     run_git(["checkout", "-b", branch_name, ref], repo_path)
+
+
+def branch_exists(repo_path: Path, branch: str, remote: str | None = None) -> bool:
+    """Check if a branch exists locally or on a remote.
+
+    If remote is given, checks refs/remotes/<remote>/<branch>.
+    Also checks the local branch. Returns True if either exists.
+    """
+    candidates = [f"refs/heads/{branch}"]
+    if remote:
+        candidates.append(f"refs/remotes/{remote}/{branch}")
+    for ref in candidates:
+        result = run_git(["rev-parse", "--verify", ref], repo_path, check=False)
+        if result.returncode == 0:
+            return True
+    return False
 
 
 def force_push(repo_path: Path, branch: str, remote: str) -> None:
@@ -181,8 +203,14 @@ def get_conflict_files(repo_path: Path) -> list[str]:
     return conflicts
 
 
-def cherry_pick_range(repo_path: Path, base_ref: str, tip_ref: str) -> OperationResult:
-    """Cherry-pick a range of commits (base_ref..tip_ref] onto current branch."""
+def cherry_pick_range(
+    repo_path: Path, base_ref: str, tip_ref: str, *, abort_on_conflict: bool = True,
+) -> OperationResult:
+    """Cherry-pick a range of commits (base_ref..tip_ref] onto current branch.
+
+    When abort_on_conflict is False the working tree is left in the
+    conflicted state so the caller can commit the conflict markers.
+    """
     commits = get_commit_range(repo_path, base_ref, tip_ref)
     if not commits:
         return OperationResult(success=True, conflict_files=[])
@@ -196,7 +224,8 @@ def cherry_pick_range(repo_path: Path, base_ref: str, tip_ref: str) -> Operation
         return OperationResult(success=True, conflict_files=[])
 
     conflict_files = get_conflict_files(repo_path)
-    run_git(["cherry-pick", "--abort"], repo_path, check=False)
+    if abort_on_conflict:
+        run_git(["cherry-pick", "--abort"], repo_path, check=False)
     return OperationResult(
         success=False,
         conflict_files=conflict_files,
@@ -222,8 +251,14 @@ def fetch_pr_ref(repo_path: Path, remote: str, pr_number: int) -> bool:
     return result.returncode == 0
 
 
-def cherry_pick_merge_commit(repo_path: Path, commit: str) -> OperationResult:
-    """Cherry-pick a merge commit using its first-parent diff."""
+def cherry_pick_merge_commit(
+    repo_path: Path, commit: str, *, abort_on_conflict: bool = True,
+) -> OperationResult:
+    """Cherry-pick a merge commit using its first-parent diff.
+
+    When abort_on_conflict is False the working tree is left in the
+    conflicted state so the caller can commit the conflict markers.
+    """
     result = run_git(
         ["cherry-pick", "-m", "1", "--no-edit", commit],
         repo_path,
@@ -233,12 +268,29 @@ def cherry_pick_merge_commit(repo_path: Path, commit: str) -> OperationResult:
         return OperationResult(success=True, conflict_files=[])
 
     conflict_files = get_conflict_files(repo_path)
-    run_git(["cherry-pick", "--abort"], repo_path, check=False)
+    if abort_on_conflict:
+        run_git(["cherry-pick", "--abort"], repo_path, check=False)
     return OperationResult(
         success=False,
         conflict_files=conflict_files,
         error_message=result.stderr.strip() if result.stderr else None,
     )
+
+
+def commit_conflict_markers(repo_path: Path) -> bool:
+    """Stage all files (including conflict markers) and commit as WIP.
+
+    Call this after a failed cherry-pick with abort_on_conflict=False.
+    Returns True if the commit succeeded.
+    """
+    run_git(["add", "--all"], repo_path, check=False)
+    result = run_git(
+        ["commit", "--no-edit", "-m",
+         "WIP: unresolved conflict markers \u2014 needs manual resolution"],
+        repo_path,
+        check=False,
+    )
+    return result.returncode == 0
 
 
 # ---------------------------------------------------------------------------

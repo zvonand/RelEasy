@@ -84,6 +84,18 @@ def commit_and_push_state(message: str, repo_dir: Path | None = None) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _assert_not_upstream(config: Config, slug: str) -> None:
+    """Hard safeguard: refuse to operate against the upstream repo."""
+    upstream_parsed = parse_remote_url(config.upstream.remote)
+    if upstream_parsed:
+        upstream_slug = f"{upstream_parsed[0]}/{upstream_parsed[1]}"
+        if slug == upstream_slug:
+            raise ValueError(
+                f"CRITICAL: Refusing to create PR against upstream repo '{slug}'. "
+                "PRs must only target the fork."
+            )
+
+
 def create_pull_request(
     config: Config,
     head: str,
@@ -101,6 +113,7 @@ def create_pull_request(
         body: PR body (markdown).
 
     Returns the PR URL, or None if creation failed.
+    Raises ValueError if the target repo matches upstream.
     """
     token = get_github_token()
     if not token:
@@ -111,6 +124,8 @@ def create_pull_request(
     if not slug:
         log.warning("Could not parse fork remote URL: %s", config.fork.remote)
         return None
+
+    _assert_not_upstream(config, slug)
 
     try:
         from github import Github, GithubException
@@ -141,12 +156,19 @@ class PRInfo:
     merge_commit_sha: str | None
     head_sha: str
     url: str
+    merged_at: str | None = None  # ISO timestamp of merge
 
 
-def search_prs_by_label(config: Config, label: str) -> list[PRInfo]:
-    """Search the fork repo for PRs matching a label.
+def search_prs_by_labels(
+    config: Config,
+    labels: list[str],
+    merged_only: bool = False,
+) -> list[PRInfo]:
+    """Search the fork repo for PRs that have ALL specified labels.
 
-    Returns PRs sorted by number.  Skips closed-but-not-merged PRs.
+    Returns PRs sorted by merge date (earliest first), with open PRs last.
+    Skips closed-but-not-merged PRs.
+    When merged_only is True, only merged PRs are returned.
     """
     token = get_github_token()
     if not token:
@@ -158,6 +180,9 @@ def search_prs_by_label(config: Config, label: str) -> list[PRInfo]:
         log.warning("Could not parse fork remote URL: %s", config.fork.remote)
         return []
 
+    if not labels:
+        return []
+
     try:
         from github import Github, GithubException
 
@@ -165,13 +190,17 @@ def search_prs_by_label(config: Config, label: str) -> list[PRInfo]:
         repo = gh.get_repo(slug)
         results: list[PRInfo] = []
 
-        for issue in repo.get_issues(labels=[label], state="all"):
+        # GitHub API filters by all labels when given a list, so this
+        # already implements AND semantics.
+        for issue in repo.get_issues(labels=labels, state="all"):
             if issue.pull_request is None:
                 continue
             pr = repo.get_pull(issue.number)
             if pr.merged:
                 pr_state = "merged"
             elif pr.state == "open":
+                if merged_only:
+                    continue
                 pr_state = "open"
             else:
                 continue  # closed but not merged — skip
@@ -184,12 +213,14 @@ def search_prs_by_label(config: Config, label: str) -> list[PRInfo]:
                 merge_commit_sha=pr.merge_commit_sha if pr.merged else None,
                 head_sha=pr.head.sha,
                 url=pr.html_url,
+                merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
             ))
 
-        results.sort(key=lambda p: p.number)
+        # Merged PRs first in merge order, then open PRs by number.
+        results.sort(key=lambda p: (p.merged_at or "9999", p.number))
         return results
     except GithubException as exc:
-        log.warning("Failed to search PRs by label '%s': %s", label, exc)
+        log.warning("Failed to search PRs by labels %s: %s", labels, exc)
         return []
     except Exception as exc:
         log.warning("Unexpected error searching PRs: %s", exc)
