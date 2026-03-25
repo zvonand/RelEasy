@@ -1,7 +1,8 @@
-"""Two-stage pipeline: create clean branches and cherry-pick changes.
+"""Three-stage pipeline: create clean branches and cherry-pick changes.
 
 Stage 1: CI branch — create ci/<prefix>/<sha8> from upstream, cherry-pick CI commits.
 Stage 2: Feature branches — create feature/<id>/<sha8> from CI branch, cherry-pick feature commits.
+Stage 3: PR-based features — discover PRs by label, cherry-pick merge commits onto CI branch.
 
 On subsequent runs, the previous versioned branch (from state) is used as the
 source of commits. On the first run, the source_branch from config is used and
@@ -17,22 +18,36 @@ from rich.console import Console
 
 from releasy.config import Config, FeatureConfig
 from releasy.git_ops import (
+    cherry_pick_merge_commit,
     cherry_pick_range,
     count_commits,
     create_branch_from_ref,
     ensure_work_repo,
     fetch_all,
+    fetch_pr_ref,
     find_merge_base,
     force_push,
     get_branch_tip,
     get_short_sha,
     stash_and_clean,
 )
-from releasy.github_ops import commit_and_push_state, sync_project
+from releasy.github_ops import commit_and_push_state, search_prs_by_label, sync_project
 from releasy.state import CIBranchState, FeatureState, PipelineState, load_state, save_state
 from releasy.status import write_status_md
 
 console = Console()
+
+
+def _carry_pr_metadata(prev_fs: FeatureState | None) -> dict:
+    """Extract PR metadata fields from a previous FeatureState for carry-forward."""
+    if not prev_fs or not prev_fs.pr_number:
+        return {}
+    return {
+        "pr_url": prev_fs.pr_url,
+        "pr_number": prev_fs.pr_number,
+        "pr_title": prev_fs.pr_title,
+        "pr_body": prev_fs.pr_body,
+    }
 
 
 def _update_state_and_status(config: Config, state: PipelineState) -> None:
@@ -59,12 +74,26 @@ def _resolve_source_branch(
 
 
 def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> PipelineState:
-    """Execute the full two-stage pipeline.
+    """Execute the full three-stage pipeline.
 
     Stage 1: Create clean CI branch from upstream <onto>, cherry-pick CI commits.
     Stage 2: Create clean feature branches from the new CI branch, cherry-pick feature commits.
+    Stage 3: Discover PRs by label, cherry-pick merge commits onto feature branches.
     """
     prev_state = load_state()
+
+    # Synthesize FeatureConfig entries for PR-sourced features from a previous run.
+    # This makes Stage 2 handle them on subsequent runs (cherry-pick from previous
+    # versioned branch) instead of Stage 3 re-cherry-picking the merge commit.
+    for fid, prev_fs in prev_state.features.items():
+        if prev_fs.pr_number and config.get_feature(fid) is None:
+            config.features.append(FeatureConfig(
+                id=fid,
+                description=prev_fs.pr_title or f"PR #{prev_fs.pr_number}",
+                source_branch="",
+                enabled=True,
+            ))
+
     state = PipelineState()
     state.set_started(onto)
 
@@ -197,6 +226,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
                 )
                 state.features[feat.id] = FeatureState(
                     status="conflict", branch_name=new_feat_branch, base_commit=onto,
+                    **_carry_pr_metadata(prev_feat),
                 )
                 _update_state_and_status(config, state)
                 continue
@@ -222,6 +252,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
                     branch_name=new_feat_branch,
                     base_commit=onto,
                     conflict_files=result.conflict_files,
+                    **_carry_pr_metadata(prev_feat),
                 )
                 _update_state_and_status(config, state)
                 continue
@@ -235,8 +266,107 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
             status="ok",
             branch_name=new_feat_branch,
             base_commit=onto,
+            **_carry_pr_metadata(prev_feat),
         )
         _update_state_and_status(config, state)
+
+    # --- Stage 3: PR-based features (bootstrap new PRs only) ---
+    # PRs already known from a previous run were synthesized into config.features
+    # above and processed by Stage 2. Stage 3 only handles newly discovered PRs.
+    if config.pr_sources:
+        console.print(
+            f"\n[bold]Stage 3:[/bold] PR-based features "
+            f"from [cyan]{new_ci_branch}[/cyan]"
+        )
+
+        existing_ids = {feat.id for feat in config.features}
+
+        for pr_source in config.pr_sources:
+            console.print(f"\n  Searching for PRs with label [yellow]{pr_source.label}[/yellow]")
+            prs = search_prs_by_label(config, pr_source.label)
+
+            if not prs:
+                console.print(f"    [dim]No PRs found[/dim]")
+                continue
+
+            console.print(f"    Found {len(prs)} PR(s)")
+
+            for pr in prs:
+                feature_id = f"pr-{pr.number}"
+
+                if feature_id in existing_ids:
+                    # Already handled by Stage 2 (from previous state) or
+                    # conflicts with a static feature — skip.
+                    continue
+
+                new_pr_branch = config.feature_branch_name(feature_id, short_sha)
+                desc = pr.title
+                if pr_source.description:
+                    desc = f"{pr_source.description}: {desc}"
+
+                console.print(f"\n    [cyan]{new_pr_branch}[/cyan] (PR #{pr.number}: {pr.title})")
+                console.print(f"      PR: {pr.url}  [{pr.state}]")
+
+                pr_meta = {
+                    "pr_url": pr.url,
+                    "pr_number": pr.number,
+                    "pr_title": pr.title,
+                    "pr_body": pr.body,
+                }
+
+                state.features[feature_id] = FeatureState(status="pending", **pr_meta)
+
+                config.features.append(FeatureConfig(
+                    id=feature_id,
+                    description=desc,
+                    source_branch="",
+                    enabled=True,
+                ))
+
+                existing_ids.add(feature_id)
+
+                stash_and_clean(repo_path)
+                create_branch_from_ref(repo_path, new_pr_branch, new_ci_branch)
+
+                if pr.state == "merged" and pr.merge_commit_sha:
+                    cp_result = cherry_pick_merge_commit(repo_path, pr.merge_commit_sha)
+                else:
+                    if not fetch_pr_ref(repo_path, config.fork.remote_name, pr.number):
+                        console.print(
+                            f"      [red]✗[/red] Could not fetch merge ref for PR #{pr.number}"
+                        )
+                        state.features[feature_id] = FeatureState(
+                            status="conflict",
+                            branch_name=new_pr_branch,
+                            base_commit=onto,
+                            **pr_meta,
+                        )
+                        _update_state_and_status(config, state)
+                        continue
+                    cp_result = cherry_pick_merge_commit(repo_path, "FETCH_HEAD")
+
+                if cp_result.success:
+                    force_push(repo_path, new_pr_branch, config.fork.remote_name)
+                    console.print(f"      [green]✓[/green] Pushed [cyan]{new_pr_branch}[/cyan]")
+                    state.features[feature_id] = FeatureState(
+                        status="ok",
+                        branch_name=new_pr_branch,
+                        base_commit=onto,
+                        **pr_meta,
+                    )
+                else:
+                    console.print(f"      [red]✗[/red] Conflict!")
+                    for cf in cp_result.conflict_files:
+                        console.print(f"        [red]•[/red] {cf}")
+                    state.features[feature_id] = FeatureState(
+                        status="conflict",
+                        branch_name=new_pr_branch,
+                        base_commit=onto,
+                        conflict_files=cp_result.conflict_files,
+                        **pr_meta,
+                    )
+
+                _update_state_and_status(config, state)
 
     # Summary
     console.print("\n[bold]Pipeline complete.[/bold]")
@@ -263,8 +393,11 @@ def _resolve_branch_target(
     feat = config.get_feature(branch_name) or config.get_feature_by_branch(branch_name)
     if feat is None:
         for fid, fs in state.features.items():
-            if fs.branch_name == branch_name:
+            if fs.branch_name == branch_name or fid == branch_name:
                 feat = config.get_feature(fid)
+                if feat is None:
+                    # PR-sourced feature not in config — synthesize a minimal FeatureConfig
+                    feat = FeatureConfig(id=fid, description=fid, source_branch="")
                 break
 
     if feat is not None:
@@ -386,15 +519,34 @@ def print_status(config: Config) -> None:
         ", ".join(ci.conflict_files),
     )
 
-    # Features
+    # Features (source-branch and PR-based)
+    shown_ids: set[str] = set()
     for feat in config.features:
         fs = state.features.get(feat.id)
+        shown_ids.add(feat.id)
         if fs is None:
             status = "disabled" if not feat.enabled else "pending"
             table.add_row(feat.source_branch, f"[dim]{status}[/dim]", "", "")
             continue
 
         label = fs.branch_name or feat.source_branch
+        if fs.pr_url:
+            label = f"{label} ({fs.pr_url})"
+        status_style = style_map.get(fs.status, "white")
+        table.add_row(
+            label,
+            f"[{status_style}]{fs.status}[/{status_style}]",
+            (fs.base_commit or "")[:12],
+            ", ".join(fs.conflict_files),
+        )
+
+    # PR features that are in state but not in config (from a previous run)
+    for fid, fs in state.features.items():
+        if fid in shown_ids:
+            continue
+        label = fs.branch_name or fid
+        if fs.pr_url:
+            label = f"{label} ({fs.pr_url})"
         status_style = style_map.get(fs.status, "white")
         table.add_row(
             label,

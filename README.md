@@ -33,6 +33,7 @@ All branches follow the pattern `<type>/<project>/<name>/<sha8>`:
 | CI | `ci/antalya/abc12345` | CI/infra changes on top of upstream `abc12345` |
 | Feature | `feature/antalya/exportmergetree/abc12345` | Feature on top of CI branch based on `abc12345` |
 | Feature | `feature/antalya/s3-disk/abc12345` | Another feature, same upstream base |
+| PR Feature | `feature/antalya/pr-1234/abc12345` | PR #1234 cherry-picked onto CI branch |
 
 The `<sha8>` is the first 8 characters of the upstream commit the branch is based on.
 
@@ -53,7 +54,7 @@ cp config.yaml.example config.yaml
 2. Set up authentication:
 
 ```bash
-export RELEASY_GITHUB_TOKEN="ghp_..."      # for PR creation & Project sync (optional)
+export RELEASY_GITHUB_TOKEN="ghp_..."      # for PR discovery, PR creation & Project sync
 export RELEASY_SSH_KEY_PATH="~/.ssh/id_rsa" # optional, defaults to SSH agent
 ```
 
@@ -92,6 +93,11 @@ features:
     depends_on: [s3-disk]           # ordering TBD — list after dependencies for now
     enabled: true
 
+# PR-based features: discover PRs in the fork repo by label
+pr_sources:
+  - label: "forward-port"
+    description: "Forward-ported changes"
+
 # Optional: sync to a GitHub Project board
 notifications:
   github_project: https://github.com/orgs/Altinity/projects/1
@@ -102,6 +108,7 @@ notifications:
 - Feature order determines apply order during release construction
 - `enabled: false` excludes a feature from both the pipeline and release
 - `depends_on` declares inter-feature dependencies; automatic ordering is planned — for now, list features in dependency order
+- `pr_sources` discovers PRs by label in the fork repo and creates a feature branch per PR (requires `RELEASY_GITHUB_TOKEN`)
 
 ## CLI Reference
 
@@ -182,6 +189,20 @@ For each enabled feature:
 3. Push to fork remote
 
 Conflicts on one feature do not block others.
+
+### Stage 3 — PR-Based Features (Bootstrap)
+
+If `pr_sources` is configured, the tool searches the fork repo for PRs matching each label. Only **new** PRs are processed here — PRs from a previous run already have a versioned branch in state and are handled by Stage 2.
+
+For each new PR:
+
+1. Create `feature/<project>/pr-<number>/<sha8>` from the CI branch
+2. Cherry-pick the PR's merge commit (`-m 1`) onto the feature branch
+   - Merged PRs: use the actual merge commit SHA
+   - Open PRs: fetch GitHub's auto-generated merge ref and cherry-pick it
+3. Push to fork remote
+
+After the first run, the PR feature behaves like a regular source-branch feature — Stage 2 cherry-picks from the previous versioned branch, preserving any conflict resolutions. The original PR title and description are stored in state and reused when creating release PRs.
 
 ## Conflict Resolution
 

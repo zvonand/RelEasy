@@ -33,6 +33,13 @@ features:
   #   depends_on: [s3-disk]
   #   enabled: true
 
+# PR-based features: discover PRs in the fork repo by label.
+# Each matching PR becomes its own feature branch.
+# Requires RELEASY_GITHUB_TOKEN.
+# pr_sources:
+#   - label: "forward-port"
+#     description: "Forward-ported changes"
+
 # Optional: sync branch status to a GitHub Project board.
 # The project needs a single-select "Status" field with options:
 #   Ok, Conflict, Resolved, Skipped, Disabled, Pending

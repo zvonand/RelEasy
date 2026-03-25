@@ -37,6 +37,12 @@ class FeatureConfig:
 
 
 @dataclass
+class PRSourceConfig:
+    label: str
+    description: str = ""
+
+
+@dataclass
 class NotificationsConfig:
     github_project: str | None = None
 
@@ -47,6 +53,7 @@ class Config:
     fork: ForkConfig
     ci: CIConfig
     features: list[FeatureConfig] = field(default_factory=list)
+    pr_sources: list[PRSourceConfig] = field(default_factory=list)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
 
     @property
@@ -125,6 +132,15 @@ def load_config(config_path: Path | None = None) -> Config:
             )
         )
 
+    pr_sources = []
+    for ps_raw in raw.get("pr_sources", []):
+        pr_sources.append(
+            PRSourceConfig(
+                label=ps_raw["label"],
+                description=ps_raw.get("description", ""),
+            )
+        )
+
     notifications = NotificationsConfig(
         github_project=raw.get("notifications", {}).get("github_project"),
     )
@@ -134,6 +150,7 @@ def load_config(config_path: Path | None = None) -> Config:
         fork=fork,
         ci=ci,
         features=features,
+        pr_sources=pr_sources,
         notifications=notifications,
     )
 
@@ -171,6 +188,12 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
             for f in config.features
         ],
     }
+
+    if config.pr_sources:
+        data["pr_sources"] = [
+            {k: v for k, v in {"label": ps.label, "description": ps.description or None}.items() if v is not None}
+            for ps in config.pr_sources
+        ]
 
     if config.notifications.github_project:
         data["notifications"] = {"github_project": config.notifications.github_project}

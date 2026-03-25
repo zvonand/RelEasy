@@ -42,6 +42,7 @@ def _build_pr_body(
     feat: FeatureConfig,
     n_commits: int,
     release_name: str,
+    original_pr_body: str | None = None,
 ) -> str:
     """Build the PR body for a feature."""
     lines = [
@@ -50,6 +51,12 @@ def _build_pr_body(
         f"Feature `{feat.id}` squashed into a single commit ({n_commits} original commit(s)).",
         "",
     ]
+
+    if original_pr_body:
+        lines.append("### Original PR Description")
+        lines.append("")
+        lines.append(original_pr_body)
+        lines.append("")
 
     if feat.depends_on:
         dep_links = []
@@ -81,6 +88,17 @@ def build_release(
     4. For each feature: create a branch with squashed commit, push, open PR
     """
     state = load_state()
+
+    # Synthesize FeatureConfig for PR-sourced features found in state
+    existing_ids = {f.id for f in config.features}
+    for fid, fs in state.features.items():
+        if fs.pr_number and fid not in existing_ids:
+            config.features.append(FeatureConfig(
+                id=fid,
+                description=fs.pr_title or f"PR #{fs.pr_number}",
+                source_branch="",
+                enabled=True,
+            ))
 
     # --- Pre-flight checks ---
     warnings = []
@@ -243,9 +261,10 @@ def build_release(
         force_push(repo_path, feat_pr_branch, config.fork.remote_name)
         console.print(f"    [green]✓[/green] Pushed ({n_feat} commits squashed into 1)")
 
-        # Open a PR
+        # Open a PR — reuse original PR title/body if the feature came from a PR
+        original_body = fs.pr_body if fs.pr_body else None
         pr_title = f"[releasy] {feat.id}: {feat.description}"
-        pr_body = _build_pr_body(feat, n_feat, branch_name)
+        pr_body = _build_pr_body(feat, n_feat, branch_name, original_body)
         pr_url = create_pull_request(config, feat_pr_branch, branch_name, pr_title, pr_body)
 
         if pr_url:

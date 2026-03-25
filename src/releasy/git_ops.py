@@ -205,6 +205,43 @@ def cherry_pick_range(repo_path: Path, base_ref: str, tip_ref: str) -> Operation
 
 
 # ---------------------------------------------------------------------------
+# PR merge-commit cherry-pick
+# ---------------------------------------------------------------------------
+
+
+def fetch_pr_ref(repo_path: Path, remote: str, pr_number: int) -> bool:
+    """Fetch a PR's merge ref from GitHub (needed for open PRs).
+
+    Returns True if the merge ref was fetched successfully.
+    """
+    result = run_git(
+        ["fetch", remote, f"refs/pull/{pr_number}/merge"],
+        repo_path,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def cherry_pick_merge_commit(repo_path: Path, commit: str) -> OperationResult:
+    """Cherry-pick a merge commit using its first-parent diff."""
+    result = run_git(
+        ["cherry-pick", "-m", "1", "--no-edit", commit],
+        repo_path,
+        check=False,
+    )
+    if result.returncode == 0:
+        return OperationResult(success=True, conflict_files=[])
+
+    conflict_files = get_conflict_files(repo_path)
+    run_git(["cherry-pick", "--abort"], repo_path, check=False)
+    return OperationResult(
+        success=False,
+        conflict_files=conflict_files,
+        error_message=result.stderr.strip() if result.stderr else None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Squash
 # ---------------------------------------------------------------------------
 

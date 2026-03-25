@@ -4,7 +4,7 @@
 
 A standalone CLI tool that manages rebasing Altinity's ClickHouse fork branches onto a specified upstream commit. Instead of rebasing long-lived branches in place, it creates **versioned branches** from clean upstream commits and cherry-picks changes on top.
 
-The tool manages one CI base branch and any number of feature branches, runs them through a two-stage pipeline, and reports status to a `STATUS.md` file and optionally a GitHub Project board.
+The tool manages one CI base branch and any number of feature branches, runs them through a three-stage pipeline, and reports status to a `STATUS.md` file and optionally a GitHub Project board.
 
 The tool lives in its own repository alongside its configuration and state files.
 
@@ -30,6 +30,7 @@ All managed branches follow the pattern `<type>/<project>/<name>/<sha8>`:
 |------|---------|---------|
 | CI | `ci/<project>/<sha8>` | `ci/antalya/abc12345` |
 | Feature | `feature/<project>/<id>/<sha8>` | `feature/antalya/exportmergetree/abc12345` |
+| PR Feature | `feature/<project>/pr-<number>/<sha8>` | `feature/antalya/pr-1234/abc12345` |
 
 - `<project>` is derived from `ci.branch_prefix` in config (e.g. `ci/antalya` → project = `antalya`)
 - `<sha8>` is the first 8 characters of the upstream commit the branch is based on
@@ -74,6 +75,11 @@ features:
     depends_on: [s3-disk]           # applied after s3-disk (dependency ordering TBD)
     enabled: true
 
+# PR-based features: discover PRs in the fork repo by label
+# pr_sources:
+#   - label: "forward-port"
+#     description: "Forward-ported changes"
+
 # Optional: sync status to a GitHub Project board
 # notifications:
 #   github_project: https://github.com/orgs/Altinity/projects/1
@@ -84,6 +90,7 @@ features:
 - `source_branch` is only used on the first run (bootstrap). After that, state tracks the current versioned branch.
 - Feature order in the list determines apply order during release construction.
 - `depends_on` declares that a feature requires another feature's commits to be present. Dependency-aware ordering is planned for a future version; for now, list dependent features after their dependencies in the config.
+- `pr_sources` enables automatic PR-based feature discovery (see Section 6, Stage 3).
 
 ---
 
@@ -145,7 +152,31 @@ For each enabled feature, in config order:
    - Update `state.yaml` and `STATUS.md`.
    - **Proceed to the next feature** (conflict on one branch does not block others).
 
-Pipeline run is complete when all enabled features have been attempted.
+Pipeline run continues to Stage 3 if `pr_sources` are configured.
+
+---
+
+### Stage 3 — PR-Based Features (Bootstrap)
+
+Stage 3 only runs for **newly discovered** PRs. PRs that were already processed in a previous run are handled by Stage 2 on subsequent runs (they have a versioned branch in state and behave like regular features).
+
+If `pr_sources` is configured, the tool searches the fork repo for PRs matching each configured label using the GitHub API (`RELEASY_GITHUB_TOKEN` required). PRs already known from state are skipped.
+
+For each **new** PR:
+
+1. Create a feature branch `feature/<project>/pr-<number>/<sha8>` from the CI branch.
+2. Cherry-pick the PR's changes:
+   - **Merged PR:** `git cherry-pick -m 1 <merge_commit_sha>` — applies the diff the PR introduced.
+   - **Open PR:** fetch GitHub's auto-generated merge ref (`refs/pull/<N>/merge`) and `git cherry-pick -m 1 FETCH_HEAD`.
+   - Closed-but-not-merged PRs are skipped.
+3. **On success:** push and update state.
+4. **On conflict:** abort cherry-pick, record conflict, continue to the next PR.
+
+**Lifecycle:** On the first run, Stage 3 bootstraps a PR by cherry-picking its merge commit. On subsequent runs, the feature has a versioned branch in state and Stage 2 cherry-picks from that branch — exactly like a regular source-branch feature. This means conflict resolutions and operator fixes on the branch are preserved across rebases.
+
+**PR metadata preservation:** The original PR's title, body, URL, and number are stored in `state.yaml` alongside the feature's branch state. When `releasy release` creates release PRs, the stored title and description are reused in the new PR.
+
+PR-based features appear in `STATUS.md` and `releasy status` output with links to the original PR.
 
 ---
 
@@ -194,6 +225,14 @@ last_run:
         - src/Storages/StorageS3.cpp
     observability:
       status: disabled
+    pr-1234:
+      status: ok
+      branch_name: feature/antalya/pr-1234/abc12345
+      base_commit: abc1234567890
+      pr_url: https://github.com/Altinity/ClickHouse/pull/1234
+      pr_number: 1234
+      pr_title: "Fix S3 disk timeout handling"
+      pr_body: "Increases the default timeout for S3 operations..."
 ```
 
 ---

@@ -1,10 +1,11 @@
-"""GitHub operations: commit/push state, project board sync, and PR creation."""
+"""GitHub operations: commit/push state, project board sync, PR creation, and PR search."""
 
 from __future__ import annotations
 
 import logging
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 import requests
@@ -123,6 +124,75 @@ def create_pull_request(
     except Exception as exc:
         log.warning("Unexpected error creating PR: %s", exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# PR search by label
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PRInfo:
+    number: int
+    title: str
+    body: str
+    state: str  # "open" or "merged"
+    merge_commit_sha: str | None
+    head_sha: str
+    url: str
+
+
+def search_prs_by_label(config: Config, label: str) -> list[PRInfo]:
+    """Search the fork repo for PRs matching a label.
+
+    Returns PRs sorted by number.  Skips closed-but-not-merged PRs.
+    """
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set — cannot search PRs")
+        return []
+
+    slug = get_fork_repo_slug(config)
+    if not slug:
+        log.warning("Could not parse fork remote URL: %s", config.fork.remote)
+        return []
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        results: list[PRInfo] = []
+
+        for issue in repo.get_issues(labels=[label], state="all"):
+            if issue.pull_request is None:
+                continue
+            pr = repo.get_pull(issue.number)
+            if pr.merged:
+                pr_state = "merged"
+            elif pr.state == "open":
+                pr_state = "open"
+            else:
+                continue  # closed but not merged — skip
+
+            results.append(PRInfo(
+                number=pr.number,
+                title=pr.title,
+                body=pr.body or "",
+                state=pr_state,
+                merge_commit_sha=pr.merge_commit_sha if pr.merged else None,
+                head_sha=pr.head.sha,
+                url=pr.html_url,
+            ))
+
+        results.sort(key=lambda p: p.number)
+        return results
+    except GithubException as exc:
+        log.warning("Failed to search PRs by label '%s': %s", label, exc)
+        return []
+    except Exception as exc:
+        log.warning("Unexpected error searching PRs: %s", exc)
+        return []
 
 
 # ---------------------------------------------------------------------------

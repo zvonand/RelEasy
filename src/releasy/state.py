@@ -26,6 +26,10 @@ class FeatureState:
     branch_name: str | None = None  # versioned branch name, e.g. feature/s3-disk/abc12345
     base_commit: str | None = None  # upstream commit (via CI branch) the branch was created from
     conflict_files: list[str] = field(default_factory=list)
+    pr_url: str | None = None  # GitHub PR URL (for PR-sourced features)
+    pr_number: int | None = None  # PR number (for PR-sourced features)
+    pr_title: str | None = None  # original PR title (preserved for release PR creation)
+    pr_body: str | None = None  # original PR body (preserved for release PR creation)
 
 
 @dataclass
@@ -76,6 +80,10 @@ def load_state(state_path: Path | None = None) -> PipelineState:
             branch_name=fraw.get("branch_name"),
             base_commit=fraw.get("base_commit"),
             conflict_files=fraw.get("conflict_files", []),
+            pr_url=fraw.get("pr_url"),
+            pr_number=fraw.get("pr_number"),
+            pr_title=fraw.get("pr_title"),
+            pr_body=fraw.get("pr_body"),
         )
 
     return PipelineState(
@@ -100,6 +108,14 @@ def save_state(state: PipelineState, state_path: Path | None = None) -> None:
             entry["base_commit"] = fs.base_commit
         if fs.conflict_files:
             entry["conflict_files"] = fs.conflict_files
+        if fs.pr_url:
+            entry["pr_url"] = fs.pr_url
+        if fs.pr_number:
+            entry["pr_number"] = fs.pr_number
+        if fs.pr_title:
+            entry["pr_title"] = fs.pr_title
+        if fs.pr_body:
+            entry["pr_body"] = fs.pr_body
         features_data[fid] = entry
 
     ci_data: dict = {"status": state.ci_branch.status}

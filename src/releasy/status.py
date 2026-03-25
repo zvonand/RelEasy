@@ -51,15 +51,31 @@ def generate_status_md(config: Config, state: PipelineState) -> str:
     ci_conflicts = ", ".join(f"`{f}`" for f in ci.conflict_files) if ci.conflict_files else ""
     lines.append(f"| {ci_label} | {ci_status} | {ci_base} | {ci_conflicts} |")
 
-    # Feature branch rows
+    # Feature branch rows (source-branch and PR-based)
+    shown_ids: set[str] = set()
     for feat in config.features:
         fs = state.features.get(feat.id)
+        shown_ids.add(feat.id)
         if fs is None:
             status_str = STATUS_ICONS["disabled"] if not feat.enabled else STATUS_ICONS["pending"]
             lines.append(f"| {feat.source_branch} | {status_str} | | |")
             continue
 
         label = fs.branch_name or feat.source_branch
+        if fs.pr_url:
+            label = f"[{label}]({fs.pr_url})"
+        status_str = STATUS_ICONS.get(fs.status, fs.status)
+        base = f"`{fs.base_commit[:12]}`" if fs.base_commit else ""
+        conflicts = ", ".join(f"`{f}`" for f in fs.conflict_files) if fs.conflict_files else ""
+        lines.append(f"| {label} | {status_str} | {base} | {conflicts} |")
+
+    # PR features in state but not in config (from a previous run)
+    for fid, fs in state.features.items():
+        if fid in shown_ids:
+            continue
+        label = fs.branch_name or fid
+        if fs.pr_url:
+            label = f"[{label}]({fs.pr_url})"
         status_str = STATUS_ICONS.get(fs.status, fs.status)
         base = f"`{fs.base_commit[:12]}`" if fs.base_commit else ""
         conflicts = ", ".join(f"`{f}`" for f in fs.conflict_files) if fs.conflict_files else ""
