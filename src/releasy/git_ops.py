@@ -104,6 +104,15 @@ def stash_and_clean(repo_path: Path) -> None:
     run_git(["clean", "-fd"], repo_path, check=False)
 
 
+def is_operation_in_progress(repo_path: Path) -> bool:
+    """Check if a cherry-pick or merge is still in progress (unfinished)."""
+    git_dir = repo_path / ".git"
+    return (
+        (git_dir / "CHERRY_PICK_HEAD").exists()
+        or (git_dir / "MERGE_HEAD").exists()
+    )
+
+
 # ---------------------------------------------------------------------------
 # Branch operations
 # ---------------------------------------------------------------------------
@@ -111,7 +120,8 @@ def stash_and_clean(repo_path: Path) -> None:
 
 def create_branch_from_ref(repo_path: Path, branch_name: str, ref: str) -> None:
     """Create (or recreate) a branch from a given ref and check it out."""
-    # Delete the local branch if it already exists, so -b doesn't fail
+    # Detach HEAD first so we can delete the branch even if we're on it
+    run_git(["checkout", "--detach"], repo_path, check=False)
     run_git(["branch", "-D", branch_name], repo_path, check=False)
     run_git(["checkout", "-b", branch_name, ref], repo_path)
 
@@ -231,6 +241,46 @@ def cherry_pick_range(
         conflict_files=conflict_files,
         error_message=result.stderr.strip() if result.stderr else None,
     )
+
+
+def merge_squash_ref(
+    repo_path: Path, source_ref: str, message: str,
+) -> OperationResult:
+    """Merge a ref as a single squashed commit onto the current branch.
+
+    This applies all changes between HEAD and source_ref as one diff,
+    producing at most one conflict to resolve.
+    """
+    result = run_git(
+        ["merge", "--squash", "--no-edit", source_ref],
+        repo_path,
+        check=False,
+    )
+
+    conflict_files = get_conflict_files(repo_path)
+    if conflict_files:
+        return OperationResult(
+            success=False,
+            conflict_files=conflict_files,
+            error_message=result.stderr.strip() if result.stderr else None,
+        )
+
+    if result.returncode != 0:
+        return OperationResult(
+            success=False,
+            conflict_files=[],
+            error_message=result.stderr.strip() if result.stderr else None,
+        )
+
+    commit_result = run_git(
+        ["commit", "--no-edit", "-m", message],
+        repo_path,
+        check=False,
+    )
+    if commit_result.returncode != 0:
+        return OperationResult(success=True, conflict_files=[])
+
+    return OperationResult(success=True, conflict_files=[])
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ from rich.console import Console
 
 from releasy.config import Config, FeatureConfig
 from releasy.git_ops import (
+    branch_exists,
     cherry_pick_merge_commit,
     cherry_pick_range,
     commit_conflict_markers,
@@ -29,7 +30,7 @@ from releasy.git_ops import (
     force_push,
     get_branch_tip,
     get_short_sha,
-    branch_exists,
+    merge_squash_ref,
     stash_and_clean,
 )
 from releasy.github_ops import (
@@ -200,18 +201,27 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
         create_branch_from_ref(repo_path, new_ci_branch, onto)
 
         if n_commits > 0:
-            result = cherry_pick_range(
-                repo_path, divergence, source_tip, abort_on_conflict=False,
+            result = merge_squash_ref(
+                repo_path, source_tip,
+                f"CI commits from {config.ci.source_branch} ({n_commits} commits squashed)",
             )
             if result.success:
-                console.print(f"  [green]✓[/green] Cherry-picked {n_commits} CI commit(s)")
+                console.print(f"  [green]✓[/green] Applied {n_commits} CI commit(s) (squashed)")
             else:
-                console.print(f"  [red]✗[/red] Conflict cherry-picking CI commits!")
+                console.print(f"  [red]✗[/red] Conflict applying CI commits!")
                 for f in result.conflict_files:
                     console.print(f"    [red]•[/red] {f}")
+                commit_conflict_markers(repo_path)
+                console.print(f"  [yellow]↑[/yellow] Committed conflict markers as WIP")
+
+                if config.push:
+                    force_push(repo_path, new_ci_branch, config.fork.remote_name)
+                    console.print(f"  [green]✓[/green] Pushed [cyan]{new_ci_branch}[/cyan] (with conflicts)")
+
                 console.print(
                     f"\n  [yellow]Resolve the conflict in:[/yellow] {repo_path}"
                     f"\n  [yellow]Branch:[/yellow] {new_ci_branch}"
+                    f"\n  Then: fix markers, git add <files> && git commit --amend"
                     f"\n  Then run: [bold]releasy continue --branch {new_ci_branch}[/bold]"
                 )
                 state.ci_branch = CIBranchState(
@@ -299,18 +309,27 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
         create_branch_from_ref(repo_path, new_feat_branch, new_ci_branch)
 
         if n_feat_commits > 0:
-            result = cherry_pick_range(
-                repo_path, feat_divergence, feat_source_tip, abort_on_conflict=False,
+            result = merge_squash_ref(
+                repo_path, feat_source_tip,
+                f"{feat.id}: {feat.description} ({n_feat_commits} commits squashed)",
             )
             if result.success:
-                console.print(f"    [green]✓[/green] Cherry-picked {n_feat_commits} commit(s)")
+                console.print(f"    [green]✓[/green] Applied {n_feat_commits} commit(s) (squashed)")
             else:
                 console.print(f"    [red]✗[/red] Conflict!")
                 for f in result.conflict_files:
                     console.print(f"      [red]•[/red] {f}")
+                commit_conflict_markers(repo_path)
+                console.print(f"    [yellow]↑[/yellow] Committed conflict markers as WIP")
+
+                if config.push:
+                    force_push(repo_path, new_feat_branch, config.fork.remote_name)
+                    console.print(f"    [green]✓[/green] Pushed [cyan]{new_feat_branch}[/cyan] (with conflicts)")
+
                 console.print(
                     f"\n    [yellow]Resolve the conflict in:[/yellow] {repo_path}"
                     f"\n    [yellow]Branch:[/yellow] {new_feat_branch}"
+                    f"\n    Then: fix markers, git add <files> && git commit --amend"
                     f"\n    Then run: [bold]releasy continue --branch {feat.id}[/bold]"
                 )
                 state.features[feat.id] = FeatureState(
@@ -530,11 +549,27 @@ def _resolve_branch_target(
 
 def continue_branch(config: Config, branch_name: str) -> bool:
     """Mark a previously-conflicted branch as resolved after operator fixes it."""
+    from releasy.git_ops import is_operation_in_progress
+
     state = load_state(config.repo_dir)
     target = _resolve_branch_target(config, state, branch_name)
 
     if target is None:
         console.print(f"[red]Unknown branch or feature: {branch_name}[/red]")
+        return False
+
+    # Check the work repo for unfinished cherry-pick
+    work_dir = config.resolve_work_dir()
+    repo_path = work_dir if (work_dir / ".git").exists() else work_dir / "repo"
+    if (repo_path / ".git").exists() and is_operation_in_progress(repo_path):
+        console.print(
+            "[red]A git operation is still in progress in the work repo.[/red]\n"
+            "  Resolve conflicts, then:\n"
+            f"    cd {repo_path}\n"
+            "    git add <resolved files>\n"
+            "    git commit\n"
+            "  Then re-run this command."
+        )
         return False
 
     kind, feat = target
