@@ -50,10 +50,11 @@ class PipelineState:
         )
 
 
-def load_state(state_path: Path | None = None) -> PipelineState:
+def load_state(repo_dir: Path | None = None) -> PipelineState:
     """Load pipeline state from state.yaml, returning empty state if file doesn't exist."""
-    if state_path is None:
-        state_path = Path.cwd() / "state.yaml"
+    if repo_dir is None:
+        repo_dir = Path.cwd()
+    state_path = repo_dir / "state.yaml"
 
     if not state_path.exists():
         return PipelineState()
@@ -94,10 +95,11 @@ def load_state(state_path: Path | None = None) -> PipelineState:
     )
 
 
-def save_state(state: PipelineState, state_path: Path | None = None) -> None:
+def save_state(state: PipelineState, repo_dir: Path | None = None) -> None:
     """Persist pipeline state to state.yaml."""
-    if state_path is None:
-        state_path = Path.cwd() / "state.yaml"
+    if repo_dir is None:
+        repo_dir = Path.cwd()
+    state_path = repo_dir / "state.yaml"
 
     features_data = {}
     for fid, fs in state.features.items():

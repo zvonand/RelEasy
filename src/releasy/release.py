@@ -87,7 +87,7 @@ def build_release(
     3. Push the base branch
     4. For each feature: create a branch with squashed commit, push, open PR
     """
-    state = load_state()
+    state = load_state(config.repo_dir)
 
     # Synthesize FeatureConfig for PR-sourced features found in state
     existing_ids = {f.id for f in config.features}

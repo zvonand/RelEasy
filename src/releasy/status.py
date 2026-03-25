@@ -89,9 +89,9 @@ def generate_status_md(config: Config, state: PipelineState) -> str:
 
 
 def write_status_md(config: Config, state: PipelineState, path: Path | None = None) -> None:
-    """Write STATUS.md to disk."""
+    """Write STATUS.md to disk (next to config.yaml by default)."""
     if path is None:
-        path = Path.cwd() / "STATUS.md"
+        path = config.repo_dir / "STATUS.md"
 
     content = generate_status_md(config, state)
     with open(path, "w") as f:

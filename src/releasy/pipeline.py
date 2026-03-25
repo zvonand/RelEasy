@@ -52,10 +52,10 @@ def _carry_pr_metadata(prev_fs: FeatureState | None) -> dict:
 
 def _update_state_and_status(config: Config, state: PipelineState) -> None:
     """Persist state + STATUS.md, sync project board, and push to the tool repo."""
-    save_state(state)
+    save_state(state, config.repo_dir)
     write_status_md(config, state)
     sync_project(config, state)
-    commit_and_push_state(f"releasy: update state — onto {state.onto}")
+    commit_and_push_state(f"releasy: update state — onto {state.onto}", config.repo_dir)
 
 
 def _resolve_source_branch(
@@ -80,7 +80,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
     Stage 2: Create clean feature branches from the new CI branch, cherry-pick feature commits.
     Stage 3: Discover PRs by label, cherry-pick merge commits onto feature branches.
     """
-    prev_state = load_state()
+    prev_state = load_state(config.repo_dir)
 
     # Synthesize FeatureConfig entries for PR-sourced features from a previous run.
     # This makes Stage 2 handle them on subsequent runs (cherry-pick from previous
@@ -103,7 +103,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
         else:
             state.features[feat.id] = FeatureState(status="disabled")
 
-    save_state(state)
+    save_state(state, config.repo_dir)
 
     if work_dir is None:
         work_dir = Path(tempfile.mkdtemp(prefix="releasy-"))
@@ -407,7 +407,7 @@ def _resolve_branch_target(
 
 def continue_branch(config: Config, branch_name: str) -> bool:
     """Mark a previously-conflicted branch as resolved after operator fixes it."""
-    state = load_state()
+    state = load_state(config.repo_dir)
     target = _resolve_branch_target(config, state, branch_name)
 
     if target is None:
@@ -453,7 +453,7 @@ def continue_branch(config: Config, branch_name: str) -> bool:
 
 def skip_branch(config: Config, branch_name: str) -> bool:
     """Mark a branch as skipped for this run."""
-    state = load_state()
+    state = load_state(config.repo_dir)
     target = _resolve_branch_target(config, state, branch_name)
 
     if target is None:
@@ -486,7 +486,7 @@ def skip_branch(config: Config, branch_name: str) -> bool:
 
 def abort_run(config: Config) -> None:
     """Abort the current run, leaving all branches as-is."""
-    state = load_state()
+    state = load_state(config.repo_dir)
     console.print("[yellow]Aborting current run. All branches left as-is.[/yellow]")
     _update_state_and_status(config, state)
 
@@ -495,7 +495,7 @@ def print_status(config: Config) -> None:
     """Print the current pipeline state to stdout."""
     from rich.table import Table
 
-    state = load_state()
+    state = load_state(config.repo_dir)
 
     table = Table(title="RelEasy Branch Status")
     table.add_column("Branch", style="cyan")

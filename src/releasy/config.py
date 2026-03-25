@@ -55,6 +55,12 @@ class Config:
     features: list[FeatureConfig] = field(default_factory=list)
     pr_sources: list[PRSourceConfig] = field(default_factory=list)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
+    config_path: Path = field(default_factory=lambda: Path.cwd() / "config.yaml")
+
+    @property
+    def repo_dir(self) -> Path:
+        """Directory containing config.yaml (and state.yaml, STATUS.md)."""
+        return self.config_path.parent
 
     @property
     def enabled_features(self) -> list[FeatureConfig]:
@@ -94,6 +100,8 @@ def load_config(config_path: Path | None = None) -> Config:
     """Load and validate config from config.yaml."""
     if config_path is None:
         config_path = Path.cwd() / "config.yaml"
+
+    config_path = config_path.resolve()
 
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -152,13 +160,14 @@ def load_config(config_path: Path | None = None) -> Config:
         features=features,
         pr_sources=pr_sources,
         notifications=notifications,
+        config_path=config_path,
     )
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:
     """Persist config back to config.yaml."""
     if config_path is None:
-        config_path = Path.cwd() / "config.yaml"
+        config_path = config.config_path
 
     data: dict = {
         "upstream": {
@@ -210,6 +219,11 @@ def get_ssh_key_path() -> str | None:
     return os.environ.get("RELEASY_SSH_KEY_PATH")
 
 
-def get_repo_dir() -> Path:
-    """Get the repo root directory (where config.yaml lives)."""
+def get_repo_dir(config: Config | None = None) -> Path:
+    """Get the repo root directory (where config.yaml lives).
+
+    Prefer using config.repo_dir directly when a Config is available.
+    """
+    if config is not None:
+        return config.repo_dir
     return Path.cwd()

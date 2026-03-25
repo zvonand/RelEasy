@@ -51,25 +51,26 @@ def get_fork_repo_slug(config: Config) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def commit_and_push_state(message: str) -> bool:
+def commit_and_push_state(message: str, repo_dir: Path | None = None) -> bool:
     """Commit state.yaml and STATUS.md in the tool repo and push."""
-    cwd = Path.cwd()
+    if repo_dir is None:
+        repo_dir = Path.cwd()
     files = ["state.yaml", "STATUS.md"]
-    existing = [f for f in files if (cwd / f).exists()]
+    existing = [f for f in files if (repo_dir / f).exists()]
     if not existing:
         return False
 
     try:
-        subprocess.run(["git", "add"] + existing, cwd=cwd, check=True, capture_output=True)
+        subprocess.run(["git", "add"] + existing, cwd=repo_dir, check=True, capture_output=True)
         subprocess.run(
             ["git", "commit", "-m", message],
-            cwd=cwd,
+            cwd=repo_dir,
             check=True,
             capture_output=True,
         )
         subprocess.run(
             ["git", "push"],
-            cwd=cwd,
+            cwd=repo_dir,
             check=False,
             capture_output=True,
         )
