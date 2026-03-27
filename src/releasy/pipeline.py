@@ -32,7 +32,7 @@ from releasy.git_ops import (
     find_merge_base,
     force_push,
     get_branch_tip,
-    rebase_onto,
+    merge_squash_ref,
     ref_exists_locally,
     run_git,
     stash_and_clean,
@@ -179,7 +179,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
 
     if state.phase == "base_created":
         console.print(
-            f"\n[bold]Phase 1b:[/bold] Rebasing CI onto "
+            f"\n[bold]Phase 1b:[/bold] Squash-applying CI onto "
             f"[cyan]{base_branch}[/cyan] → [cyan]{ci_branch}[/cyan]"
         )
 
@@ -215,22 +215,27 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
             create_branch_from_ref(repo_path, ci_branch, base_branch)
 
             if n_commits > 0:
-                result = rebase_onto(repo_path, base_branch, divergence, source_tip)
+                result = merge_squash_ref(
+                    repo_path,
+                    source_tip,
+                    f"CI: {config.ci.source_branch} squash-applied onto {base_branch}",
+                )
                 if result.success:
                     run_git(["branch", "-f", ci_branch, "HEAD"], repo_path)
                     run_git(["checkout", ci_branch], repo_path)
                     applied = count_commits(repo_path, base_branch, "HEAD")
                     console.print(
-                        f"  [green]✓[/green] Rebased {applied} CI commit(s) "
-                        f"(from {n_commits} original, duplicates dropped)"
+                        f"  [green]✓[/green] Squash-applied as {applied} commit "
+                        f"(from {n_commits} original)"
                     )
                 else:
-                    console.print(f"  [red]✗[/red] Conflict rebasing CI!")
+                    console.print(f"  [red]✗[/red] Conflict applying squashed CI diff!")
                     for f in result.conflict_files:
                         console.print(f"    [red]•[/red] {f}")
                     console.print(
                         f"\n  [yellow]Resolve:[/yellow] cd {repo_path}"
-                        f"\n  [yellow]Then:[/yellow] git add <files> && git rebase --continue"
+                        f"\n  [yellow]Then:[/yellow] git add <files> && "
+                        f"git commit -m 'CI: {config.ci.source_branch} squash-applied onto {base_branch}'"
                         f"\n  [yellow]When done:[/yellow] releasy continue --branch {ci_branch}"
                     )
                     state.ci_branch = CIBranchState(
@@ -284,7 +289,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
         base_branch = state.base_branch or base_branch
 
         console.print(
-            f"\n[bold]Phase 2:[/bold] Rebasing features onto "
+            f"\n[bold]Phase 2:[/bold] Squash-applying features onto "
             f"[cyan]{base_branch}[/cyan]"
         )
 
@@ -443,16 +448,18 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
             create_branch_from_ref(repo_path, new_branch, base_branch)
 
             if n_commits > 0:
-                result = rebase_onto(
-                    repo_path, base_branch, divergence, source_tip,
+                result = merge_squash_ref(
+                    repo_path,
+                    source_tip,
+                    f"{feat.id}: {feat.description}",
                 )
                 if result.success:
                     run_git(["branch", "-f", new_branch, "HEAD"], repo_path)
                     run_git(["checkout", new_branch], repo_path)
                     applied = count_commits(repo_path, base_branch, "HEAD")
                     console.print(
-                        f"    [green]✓[/green] Rebased {applied} commit(s) "
-                        f"(from {n_commits} original, duplicates dropped)"
+                        f"    [green]✓[/green] Squash-applied as {applied} commit "
+                        f"(from {n_commits} original)"
                     )
                 else:
                     console.print(f"    [red]✗[/red] Conflict!")
@@ -461,7 +468,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
                     console.print(
                         f"\n    [yellow]Resolve:[/yellow] cd {repo_path}"
                         f"\n    [yellow]Then:[/yellow] git add <files> && "
-                        f"git rebase --continue"
+                        f"git commit -m '{feat.id}: {feat.description}'"
                         f"\n    [yellow]When done:[/yellow] "
                         f"releasy continue --branch {feat.id}"
                     )

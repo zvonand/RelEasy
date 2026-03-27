@@ -105,11 +105,13 @@ def stash_and_clean(repo_path: Path) -> None:
 
 
 def is_operation_in_progress(repo_path: Path) -> bool:
-    """Check if a cherry-pick or merge is still in progress (unfinished)."""
+    """Check if a cherry-pick, merge, or rebase is still in progress."""
     git_dir = repo_path / ".git"
     return (
         (git_dir / "CHERRY_PICK_HEAD").exists()
         or (git_dir / "MERGE_HEAD").exists()
+        or (git_dir / "rebase-merge").exists()
+        or (git_dir / "rebase-apply").exists()
     )
 
 
@@ -255,6 +257,60 @@ def cherry_pick_range(
         conflict_files=conflict_files,
         error_message=result.stderr.strip() if result.stderr else None,
     )
+
+
+def rebase_onto(
+    repo_path: Path, onto_ref: str, old_base: str, source_tip: str,
+) -> OperationResult:
+    """Rebase commits (old_base..source_tip] onto onto_ref.
+
+    The current branch should already be checked out before calling this.
+    """
+    result = run_git(
+        ["rebase", "--onto", onto_ref, old_base, source_tip],
+        repo_path,
+        check=False,
+    )
+    if result.returncode == 0:
+        return OperationResult(success=True, conflict_files=[])
+
+    conflict_files = get_conflict_files(repo_path)
+    return OperationResult(
+        success=False,
+        conflict_files=conflict_files,
+        error_message=result.stderr.strip() if result.stderr else None,
+    )
+
+
+def rebase_onto_squash(
+    repo_path: Path,
+    onto_ref: str,
+    old_base: str,
+    source_tip: str,
+    message: str,
+) -> OperationResult:
+    """Rebase commits onto onto_ref, then squash rebased commits into one.
+
+    Keeps rebase semantics (including duplicate dropping) while producing a
+    single resulting commit on top of onto_ref.
+    """
+    result = rebase_onto(repo_path, onto_ref, old_base, source_tip)
+    if not result.success:
+        return result
+
+    n_rebased = count_commits(repo_path, onto_ref, "HEAD")
+    if n_rebased <= 1:
+        return OperationResult(success=True, conflict_files=[])
+
+    run_git(["reset", "--soft", onto_ref], repo_path)
+    commit_result = run_git(["commit", "-m", message], repo_path, check=False)
+    if commit_result.returncode != 0:
+        return OperationResult(
+            success=False,
+            conflict_files=[],
+            error_message=commit_result.stderr.strip() if commit_result.stderr else None,
+        )
+    return OperationResult(success=True, conflict_files=[])
 
 
 def merge_squash_ref(
