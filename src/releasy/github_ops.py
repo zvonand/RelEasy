@@ -331,7 +331,11 @@ def _get_status_field(project_id: str) -> tuple[str, dict[str, str]] | None:
     return None
 
 
-def _find_item_by_title(project_id: str, title: str) -> str | None:
+def _find_item_by_title(project_id: str, title: str) -> tuple[str, str | None] | None:
+    """Find a project item by its draft issue title.
+
+    Returns (item_id, draft_issue_id) or None.
+    """
     query = """
     query($projectId: ID!) {
       node(id: $projectId) {
@@ -340,7 +344,7 @@ def _find_item_by_title(project_id: str, title: str) -> str | None:
             nodes {
               id
               content {
-                ... on DraftIssue { title }
+                ... on DraftIssue { id title }
               }
             }
           }
@@ -359,7 +363,7 @@ def _find_item_by_title(project_id: str, title: str) -> str | None:
     for item in items:
         content = item.get("content")
         if content and content.get("title") == title:
-            return item["id"]
+            return item["id"], content.get("id")
     return None
 
 
@@ -378,6 +382,30 @@ def _add_draft_issue(project_id: str, title: str, body: str) -> str | None:
         return data["addProjectV2DraftIssue"]["projectItem"]["id"]
     except (KeyError, TypeError):
         return None
+
+
+def _update_draft_issue(
+    project_id: str, item_id: str,
+    title: str | None = None, body: str | None = None,
+) -> bool:
+    """Update an existing draft issue's title and/or body."""
+    mutation = """
+    mutation($projectId: ID!, $itemId: ID!, $title: String, $body: String) {
+      updateProjectV2DraftIssue(input: {
+        projectId: $projectId, draftIssueId: $itemId,
+        title: $title, body: $body
+      }) {
+        draftIssue { id }
+      }
+    }
+    """
+    variables: dict = {"projectId": project_id, "itemId": item_id}
+    if title is not None:
+        variables["title"] = title
+    if body is not None:
+        variables["body"] = body
+    data = _gql(mutation, variables)
+    return data is not None
 
 
 def _set_item_field(project_id: str, item_id: str, field_id: str, option_id: str) -> bool:
@@ -414,6 +442,155 @@ def _delete_item(project_id: str, item_id: str) -> bool:
     return data is not None
 
 
+STATUS_OPTIONS = ["Ok", "Conflict", "Resolved", "Skipped", "Disabled", "Pending"]
+
+STATUS_COLORS = {
+    "Ok": "GREEN",
+    "Conflict": "RED",
+    "Resolved": "BLUE",
+    "Skipped": "YELLOW",
+    "Disabled": "GRAY",
+    "Pending": "ORANGE",
+}
+
+
+def _get_owner_id(owner: str, is_org: bool) -> str | None:
+    if is_org:
+        query = "query($login: String!) { organization(login: $login) { id } }"
+    else:
+        query = "query($login: String!) { user(login: $login) { id } }"
+    data = _gql(query, {"login": owner})
+    if not data:
+        return None
+    try:
+        key = "organization" if is_org else "user"
+        return data[key]["id"]
+    except (KeyError, TypeError):
+        return None
+
+
+def _create_project(owner_id: str, title: str) -> tuple[str, int] | None:
+    """Create a new GitHub Project v2. Returns (project_id, project_number)."""
+    mutation = """
+    mutation($ownerId: ID!, $title: String!) {
+      createProjectV2(input: {ownerId: $ownerId, title: $title}) {
+        projectV2 { id number }
+      }
+    }
+    """
+    data = _gql(mutation, {"ownerId": owner_id, "title": title})
+    if not data:
+        return None
+    try:
+        p = data["createProjectV2"]["projectV2"]
+        return p["id"], p["number"]
+    except (KeyError, TypeError):
+        return None
+
+
+def _create_single_select_field(
+    project_id: str, name: str, options: list[dict],
+) -> str | None:
+    """Create a single-select field on a project. Returns field ID."""
+    mutation = """
+    mutation($projectId: ID!, $name: String!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) {
+      createProjectV2Field(input: {
+        projectId: $projectId
+        dataType: SINGLE_SELECT
+        name: $name
+        singleSelectOptions: $options
+      }) {
+        projectV2Field { ... on ProjectV2SingleSelectField { id } }
+      }
+    }
+    """
+    data = _gql(mutation, {
+        "projectId": project_id,
+        "name": name,
+        "options": options,
+    })
+    if not data:
+        return None
+    try:
+        return data["createProjectV2Field"]["projectV2Field"]["id"]
+    except (KeyError, TypeError):
+        return None
+
+
+def setup_project(config: Config) -> str | None:
+    """Create a GitHub Project with the Status field, or verify an existing one.
+
+    If notifications.github_project is set, verifies the Status field exists.
+    If not set, creates a new project and returns the URL.
+    """
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set")
+        return None
+
+    slug = get_fork_repo_slug(config)
+    if not slug:
+        return None
+    owner = slug.split("/")[0]
+
+    project_url = config.notifications.github_project
+
+    if project_url:
+        parsed = _parse_project_url(project_url)
+        if not parsed:
+            log.warning("Could not parse project URL: %s", project_url)
+            return None
+        p_owner, p_number, is_org = parsed
+        project_id = _get_project_id(p_owner, p_number, is_org)
+        if not project_id:
+            log.warning("Could not find project: %s", project_url)
+            return None
+    else:
+        is_org = True
+        owner_id = _get_owner_id(owner, is_org)
+        if not owner_id:
+            is_org = False
+            owner_id = _get_owner_id(owner, is_org)
+        if not owner_id:
+            log.warning("Could not resolve owner ID for %s", owner)
+            return None
+
+        title = f"RelEasy: {config.project_name}"
+        result = _create_project(owner_id, title)
+        if not result:
+            log.warning("Failed to create project")
+            return None
+        project_id, p_number = result
+        if is_org:
+            project_url = f"https://github.com/orgs/{owner}/projects/{p_number}"
+        else:
+            project_url = f"https://github.com/users/{owner}/projects/{p_number}"
+
+    status_info = _get_status_field(project_id)
+    if status_info:
+        _, existing_options = status_info
+        missing = [
+            opt for opt in STATUS_OPTIONS
+            if opt.lower() not in existing_options
+        ]
+        if missing:
+            log.warning(
+                "Status field exists but missing options: %s. "
+                "Please add them manually in the project settings.",
+                ", ".join(missing),
+            )
+    else:
+        options = [
+            {"name": opt, "color": STATUS_COLORS.get(opt, "GRAY")}
+            for opt in STATUS_OPTIONS
+        ]
+        field_id = _create_single_select_field(project_id, "Status", options)
+        if not field_id:
+            log.warning("Failed to create Status field")
+
+    return project_url
+
+
 STATUS_MAP = {
     "ok": "Ok",
     "conflict": "Conflict",
@@ -422,6 +599,64 @@ STATUS_MAP = {
     "disabled": "Disabled",
     "pending": "Pending",
 }
+
+REST_API_URL = "https://api.github.com"
+
+
+def _rest_api(
+    method: str, path: str, json_data: dict | None = None,
+) -> dict | None:
+    """Make a GitHub REST API call."""
+    token = get_github_token()
+    if not token:
+        return None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    resp = requests.request(
+        method, f"{REST_API_URL}{path}",
+        json=json_data, headers=headers, timeout=30,
+    )
+    if resp.status_code not in (200, 201):
+        log.warning("REST API %s %s: %s %s", method, path, resp.status_code, resp.text)
+        return None
+    return resp.json() if resp.text else {}
+
+
+def _get_project_views(owner: str, project_number: int, is_org: bool) -> list[dict]:
+    """List existing views on a project."""
+    prefix = "orgs" if is_org else "users"
+    data = _rest_api("GET", f"/{prefix}/{owner}/projects/{project_number}/views")
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def _create_project_view(
+    owner: str, project_number: int, is_org: bool,
+    name: str, layout: str = "table",
+) -> dict | None:
+    """Create a new view (tab) on a project."""
+    prefix = "orgs" if is_org else "users"
+    return _rest_api(
+        "POST",
+        f"/{prefix}/{owner}/projects/{project_number}/views",
+        {"name": name, "layout": layout},
+    )
+
+
+def _ensure_project_view(
+    owner: str, project_number: int, is_org: bool, view_name: str,
+) -> bool:
+    """Create a view for this rebase if it doesn't exist yet."""
+    views = _get_project_views(owner, project_number, is_org)
+    for v in views:
+        if v.get("name") == view_name:
+            return True
+    result = _create_project_view(owner, project_number, is_org, view_name)
+    return result is not None
 
 
 def sync_project(config: Config, state: PipelineState) -> bool:
@@ -445,6 +680,9 @@ def sync_project(config: Config, state: PipelineState) -> bool:
     if not project_id:
         log.warning("Could not resolve project ID for %s", project_url)
         return False
+
+    if state.base_branch:
+        _ensure_project_view(owner, number, is_org, state.base_branch)
 
     status_info = _get_status_field(project_id)
     status_field_id = None
@@ -475,19 +713,23 @@ def sync_project(config: Config, state: PipelineState) -> bool:
         body_parts = [f"**Status:** {status}"]
         if state.onto:
             body_parts.append(f"**Onto:** `{state.onto}`")
+        if state.base_branch:
+            body_parts.append(f"**Base:** `{state.base_branch}`")
         if conflict_files:
             files_str = "\n".join(f"- `{f}`" for f in conflict_files)
             body_parts.append(f"**Conflict files:**\n{files_str}")
         body = "\n\n".join(body_parts)
 
-        item_id = _find_item_by_title(project_id, title)
-        if item_id:
-            _delete_item(project_id, item_id)
-
-        item_id = _add_draft_issue(project_id, title, body)
-        if not item_id:
-            log.warning("Failed to create project item for %s", title)
-            continue
+        existing = _find_item_by_title(project_id, title)
+        if existing:
+            item_id, draft_id = existing
+            if draft_id:
+                _update_draft_issue(project_id, draft_id, body=body)
+        else:
+            item_id = _add_draft_issue(project_id, title, body)
+            if not item_id:
+                log.warning("Failed to create project item for %s", title)
+                continue
 
         if status_field_id and status_options:
             mapped = STATUS_MAP.get(status, "Pending")

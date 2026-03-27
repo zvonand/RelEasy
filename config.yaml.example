@@ -87,15 +87,17 @@ features:
 # Only active when push: true.
 #
 # One-time setup:
-#   1. Create a GitHub Project (Table layout recommended)
-#   2. Edit the "Status" field → set options to exactly:
-#      Ok, Conflict, Resolved, Skipped, Disabled, Pending
-#   3. Copy the project URL below
-#   4. Ensure RELEASY_GITHUB_TOKEN has repo + project scopes
+#   1. Create a GitHub Project (or run: releasy setup-project)
+#   2. Copy the project URL below
+#   3. Ensure RELEASY_GITHUB_TOKEN has repo + project scopes
 #
-# RelEasy creates/updates draft-issue cards automatically.
-# notifications:
-#   github_project: https://github.com/orgs/Altinity/projects/1
+# Or auto-setup (creates project + Status field):
+#   releasy setup-project
+#
+# Each rebase gets its own view (tab) in the project, named after
+# the base branch (e.g. antalya-26.3). Cards are managed automatically.
+notifications:
+  github_project: https://github.com/orgs/Altinity/projects/1
 
 # ─────────────────────────────────────────────────────────────────────
 # WORKFLOW

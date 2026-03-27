@@ -280,15 +280,24 @@ Sync branch status to a GitHub Projects v2 board (optional). One-time manual set
      github_project: https://github.com/orgs/Altinity/projects/1
    ```
 
+### Auto-setup
+
+```
+releasy setup-project
+```
+
+Creates the project (if needed) and adds the Status field with the correct options. Prints the URL to add to config.
+
 ### Automatic Behavior
 
 When `push: true` and `notifications.github_project` is set, after each state change RelEasy:
+- Creates a **view (tab)** per rebase, named after the base branch (e.g. `antalya-26.3`). One project holds all rebases; each gets its own tab.
 - Creates one draft-issue card per branch (CI + each feature).
 - Sets the Status field to the pipeline state (Ok, Conflict, etc.).
 - Updates the card body with upstream commit and conflicted files.
 - On re-runs, deletes old cards and recreates with updated status.
 
-No cards need to be created manually. Project sync is skipped when `push: false`.
+No cards or views need to be created manually. Project sync is skipped when `push: false`.
 
 ---
 

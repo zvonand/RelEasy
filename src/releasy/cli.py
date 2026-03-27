@@ -125,6 +125,34 @@ def release(
         raise SystemExit(1)
 
 
+# ---------- Project setup ----------
+
+
+@cli.command(name="setup-project")
+@click.pass_context
+def setup_project_cmd(ctx: click.Context) -> None:
+    """Create or verify a GitHub Project for status tracking.
+
+    If notifications.github_project is set in config, verifies the project
+    and its Status field. Otherwise, creates a new project and prints the URL
+    to add to config.
+    """
+    from releasy.github_ops import setup_project
+
+    config = _load_config_or_exit(ctx.obj["config_path"])
+    url = setup_project(config)
+    if url:
+        click.echo(f"Project ready: {url}")
+        if not config.notifications.github_project:
+            click.echo(
+                f"\nAdd this to your config.yaml:\n\n"
+                f"notifications:\n"
+                f"  github_project: {url}\n"
+            )
+    else:
+        raise SystemExit(1)
+
+
 # ---------- Feature management ----------
 
 

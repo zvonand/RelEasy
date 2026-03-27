@@ -33,6 +33,7 @@ from releasy.git_ops import (
     force_push,
     get_branch_tip,
     rebase_onto,
+    ref_exists_locally,
     run_git,
     stash_and_clean,
 )
@@ -86,8 +87,12 @@ def _resolve_source_branch(
     return f"{fork_remote}/{config_source}"
 
 
-def _setup_repo(config: Config, work_dir: Path | None) -> Path:
-    """Set up work repo and fetch remotes."""
+def _setup_repo(config: Config, onto: str, work_dir: Path | None) -> Path:
+    """Set up work repo and fetch remotes.
+
+    Upstream is only fetched if the --onto ref isn't already available locally.
+    Origin (fork) is always fetched.
+    """
     wd = config.resolve_work_dir(work_dir)
     console.print(f"[dim]Working directory: {wd}[/dim]")
 
@@ -95,9 +100,17 @@ def _setup_repo(config: Config, work_dir: Path | None) -> Path:
     repo_path = ensure_work_repo(config, wd)
     console.print(f"[dim]Repo: {repo_path}[/dim]")
 
-    console.print(f"Fetching [cyan]{config.upstream.remote_name}[/cyan]...", end=" ")
-    fetch_remote(repo_path, config.upstream.remote_name)
-    console.print("[green]done[/green]")
+    if ref_exists_locally(repo_path, onto):
+        console.print(
+            f"[dim]{onto} found locally — skipping upstream fetch[/dim]"
+        )
+    else:
+        console.print(
+            f"Fetching [cyan]{config.upstream.remote_name}[/cyan] "
+            f"(need {onto})...", end=" ",
+        )
+        fetch_remote(repo_path, config.upstream.remote_name)
+        console.print("[green]done[/green]")
 
     console.print(f"Fetching [cyan]{config.fork.remote_name}[/cyan]...", end=" ")
     fetch_remote(repo_path, config.fork.remote_name)
@@ -111,10 +124,18 @@ def _setup_repo(config: Config, work_dir: Path | None) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _push(config: Config, repo_path: Path, branch: str) -> None:
+    """Push a branch to the fork remote, with upstream safety check."""
+    force_push(
+        repo_path, branch, config.fork.remote_name,
+        upstream_name=config.upstream.remote_name,
+    )
+
+
 def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> PipelineState:
     """Execute the phased rebase pipeline. Resumes from current state."""
     state = load_state(config.repo_dir)
-    repo_path = _setup_repo(config, work_dir)
+    repo_path = _setup_repo(config, onto, work_dir)
 
     base_branch = config.base_branch_name(onto)
     ci_branch = config.ci_branch_name(onto)
@@ -135,7 +156,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
             stash_and_clean(repo_path)
             create_branch_from_ref(repo_path, base_branch, onto)
             if config.push:
-                force_push(repo_path, base_branch, remote)
+                _push(config, repo_path, base_branch)
                 console.print(f"  [green]✓[/green] Pushed [cyan]{base_branch}[/cyan]")
             else:
                 console.print(f"  [green]✓[/green] Created locally")
@@ -222,7 +243,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
                 console.print(f"  [dim]No CI commits to apply[/dim]")
 
             if config.push:
-                force_push(repo_path, ci_branch, remote)
+                _push(config, repo_path, ci_branch)
                 console.print(f"  [green]✓[/green] Pushed [cyan]{ci_branch}[/cyan]")
 
                 ci_pr_url = create_pull_request(
@@ -351,7 +372,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
                     )
 
                 if config.push:
-                    force_push(repo_path, new_branch, remote)
+                    _push(config, repo_path, new_branch)
                     console.print(
                         f"    [green]✓[/green] Pushed [cyan]{new_branch}[/cyan]"
                     )
@@ -454,7 +475,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
                 console.print(f"    [dim]No commits to apply[/dim]")
 
             if config.push:
-                force_push(repo_path, new_branch, remote)
+                _push(config, repo_path, new_branch)
                 console.print(
                     f"    [green]✓[/green] Pushed [cyan]{new_branch}[/cyan]"
                 )

@@ -237,12 +237,23 @@ notifications:
   github_project: https://github.com/orgs/Altinity/projects/1
 ```
 
+### Alternative: auto-setup
+
+If you have a project but it's empty, or no project yet:
+
+```bash
+releasy setup-project
+```
+
+This creates the project (if needed) and adds the Status field with the correct options. It prints the URL to add to your config.
+
 ### What RelEasy does automatically
 
 After each state change (when `push: true`), RelEasy:
+- Creates a **view (tab)** for each rebase, named after the base branch (e.g. `antalya-26.3`)
 - Creates a **draft issue card** for each branch (CI + each feature)
 - Sets the **Status** field to match the pipeline state
 - Updates the card body with upstream commit, conflicted files, etc.
 - On re-runs, replaces old cards with updated ones
 
-You don't need to create any cards manually.
+One project, multiple views — each rebase gets its own tab. You don't need to create any cards or views manually.

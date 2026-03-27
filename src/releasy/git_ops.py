@@ -142,7 +142,21 @@ def branch_exists(repo_path: Path, branch: str, remote: str | None = None) -> bo
     return False
 
 
-def force_push(repo_path: Path, branch: str, remote: str) -> None:
+def ref_exists_locally(repo_path: Path, ref: str) -> bool:
+    """Check if a ref (tag, branch, SHA) is already available locally."""
+    result = run_git(["rev-parse", "--verify", ref], repo_path, check=False)
+    return result.returncode == 0
+
+
+def force_push(
+    repo_path: Path, branch: str, remote: str, *, upstream_name: str = "upstream",
+) -> None:
+    """Push a branch to a remote. Refuses to push to the upstream remote."""
+    if remote == upstream_name:
+        raise ValueError(
+            f"CRITICAL: Refusing to push to upstream remote '{remote}'. "
+            "Pushes must only target the fork."
+        )
     run_git(["push", "--force", remote, branch], repo_path)
 
 

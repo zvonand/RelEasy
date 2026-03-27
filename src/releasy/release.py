@@ -143,10 +143,13 @@ def build_release(
     repo_path = ensure_work_repo(config, work_dir)
     console.print(f"[dim]Repo: {repo_path}[/dim]")
 
-    from releasy.git_ops import fetch_remote
-    console.print(f"Fetching [cyan]{config.upstream.remote_name}[/cyan]...", end=" ")
-    fetch_remote(repo_path, config.upstream.remote_name)
-    console.print("[green]done[/green]")
+    from releasy.git_ops import fetch_remote, ref_exists_locally
+    if ref_exists_locally(repo_path, upstream_tag):
+        console.print(f"[dim]{upstream_tag} found locally — skipping upstream fetch[/dim]")
+    else:
+        console.print(f"Fetching [cyan]{config.upstream.remote_name}[/cyan]...", end=" ")
+        fetch_remote(repo_path, config.upstream.remote_name)
+        console.print("[green]done[/green]")
 
     console.print(f"Fetching [cyan]{config.fork.remote_name}[/cyan]...", end=" ")
     fetch_remote(repo_path, config.fork.remote_name)
@@ -192,7 +195,8 @@ def build_release(
     # --- Step 3: Push the base release branch ---
     if config.push:
         console.print(f"\n[bold]Pushing base branch[/bold] [cyan]{branch_name}[/cyan]")
-        force_push(repo_path, branch_name, config.fork.remote_name)
+        force_push(repo_path, branch_name, config.fork.remote_name,
+                   upstream_name=config.upstream.remote_name)
         console.print(f"  [green]✓[/green] Pushed")
     else:
         console.print(f"\n[dim]Skipping push of base branch (push not enabled)[/dim]")
@@ -270,7 +274,8 @@ def build_release(
 
         pr_url = None
         if config.push:
-            force_push(repo_path, feat_pr_branch, config.fork.remote_name)
+            force_push(repo_path, feat_pr_branch, config.fork.remote_name,
+                       upstream_name=config.upstream.remote_name)
             console.print(f"    [green]✓[/green] Pushed ({n_feat} commits squashed into 1)")
 
             original_body = fs.pr_body if fs.pr_body else None
