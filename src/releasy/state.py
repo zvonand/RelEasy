@@ -10,33 +10,37 @@ from typing import Literal
 import yaml
 
 BranchStatus = Literal["pending", "ok", "conflict", "resolved", "skipped", "disabled"]
+PipelinePhase = Literal["init", "base_created", "ci_rebased", "ci_merged", "features_done"]
 
 
 @dataclass
 class CIBranchState:
     status: BranchStatus = "pending"
-    branch_name: str | None = None  # versioned branch name, e.g. ci/antalya/abc12345
-    base_commit: str | None = None  # upstream commit the branch was created from
+    branch_name: str | None = None
+    base_commit: str | None = None
     conflict_files: list[str] = field(default_factory=list)
+    pr_url: str | None = None
 
 
 @dataclass
 class FeatureState:
     status: BranchStatus = "pending"
-    branch_name: str | None = None  # versioned branch name, e.g. feature/s3-disk/abc12345
-    base_commit: str | None = None  # upstream commit (via CI branch) the branch was created from
+    branch_name: str | None = None
+    base_commit: str | None = None
     conflict_files: list[str] = field(default_factory=list)
-    pr_url: str | None = None  # GitHub PR URL (for PR-sourced features)
-    pr_number: int | None = None  # PR number (for PR-sourced features)
-    pr_title: str | None = None  # original PR title (preserved for release PR creation)
-    pr_body: str | None = None  # original PR body (preserved for release PR creation)
-    rebase_pr_url: str | None = None  # auto-created PR targeting CI branch
+    pr_url: str | None = None  # source PR URL (for PR-sourced features)
+    pr_number: int | None = None
+    pr_title: str | None = None
+    pr_body: str | None = None
+    rebase_pr_url: str | None = None  # auto-created PR targeting base branch
 
 
 @dataclass
 class PipelineState:
     started_at: str | None = None
     onto: str | None = None
+    phase: PipelinePhase = "init"
+    base_branch: str | None = None
     ci_branch: CIBranchState = field(default_factory=CIBranchState)
     features: dict[str, FeatureState] = field(default_factory=dict)
 
@@ -73,6 +77,7 @@ def load_state(repo_dir: Path | None = None) -> PipelineState:
         branch_name=ci_raw.get("branch_name"),
         base_commit=ci_raw.get("base_commit"),
         conflict_files=ci_raw.get("conflict_files", []),
+        pr_url=ci_raw.get("pr_url"),
     )
 
     features: dict[str, FeatureState] = {}
@@ -92,6 +97,8 @@ def load_state(repo_dir: Path | None = None) -> PipelineState:
     return PipelineState(
         started_at=run.get("started_at"),
         onto=run.get("onto"),
+        phase=run.get("phase", "init"),
+        base_branch=run.get("base_branch"),
         ci_branch=ci_state,
         features=features,
     )
@@ -131,11 +138,15 @@ def save_state(state: PipelineState, repo_dir: Path | None = None) -> None:
         ci_data["base_commit"] = state.ci_branch.base_commit
     if state.ci_branch.conflict_files:
         ci_data["conflict_files"] = state.ci_branch.conflict_files
+    if state.ci_branch.pr_url:
+        ci_data["pr_url"] = state.ci_branch.pr_url
 
     data = {
         "last_run": {
             "started_at": state.started_at,
             "onto": state.onto,
+            "phase": state.phase,
+            "base_branch": state.base_branch,
             "ci_branch": ci_data,
             "features": features_data,
         }

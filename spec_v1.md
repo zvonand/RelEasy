@@ -2,11 +2,9 @@
 
 ## 1. Overview
 
-A standalone CLI tool that manages rebasing Altinity's ClickHouse fork branches onto a specified upstream commit. Instead of rebasing long-lived branches in place, it creates **versioned branches** from clean upstream commits and cherry-picks changes on top.
+A standalone CLI tool that manages rebasing a fork's branches onto a specified upstream commit/tag. Instead of rebasing long-lived branches in place, it creates a **base branch** from upstream, rebases CI and features on top via a **phased pipeline**, and optionally opens PRs.
 
-The tool manages one CI base branch and any number of feature branches, runs them through a three-stage pipeline, and reports status to a `STATUS.md` file and optionally a GitHub Project board.
-
-The tool lives in its own repository alongside its configuration and state files.
+The pipeline is **resumable**: state is persisted between runs, and each `releasy run` picks up from where the previous run stopped.
 
 ---
 
@@ -14,9 +12,10 @@ The tool lives in its own repository alongside its configuration and state files
 
 ```
 releasy/
-├── config.yaml        ← fork description, upstream URL, branch list
-├── state.yaml         ← persisted pipeline state (auto-updated by tool)
-├── STATUS.md          ← human-readable branch status table (auto-updated by tool)
+├── config.yaml        ← fork description, upstream URL, features (gitignored)
+├── config.yaml.example ← documented template
+├── state.yaml         ← persisted pipeline state (auto-managed)
+├── STATUS.md          ← human-readable branch status table (auto-managed)
 └── src/releasy/       ← tool source code
 ```
 
@@ -24,23 +23,28 @@ releasy/
 
 ## 3. Branch Naming Convention
 
-All managed branches follow the pattern `<type>/<project>/<name>/<sha8>`:
+Branch names are derived from the upstream ref:
+- Tags like `v26.3.4.234-lts` → version suffix `26.3`
+- Raw SHAs → first 8 characters
 
 | Type | Pattern | Example |
 |------|---------|---------|
-| CI | `ci/<project>/<sha8>` | `ci/antalya/abc12345` |
-| Feature | `feature/<project>/<id>/<sha8>` | `feature/antalya/exportmergetree/abc12345` |
-| PR Feature | `feature/<project>/pr-<number>/<sha8>` | `feature/antalya/pr-1234/abc12345` |
+| Base | `<project>-<version>` | `antalya-26.3` |
+| CI | `ci/<project>-<version>` | `ci/antalya-26.3` |
+| Feature | `feature/<project>-<version>/<id>` | `feature/antalya-26.3/s3-disk` |
+| PR Feature | `feature/<project>-<version>/pr-<N>` | `feature/antalya-26.3/pr-42` |
 
 - `<project>` is derived from `ci.branch_prefix` in config (e.g. `ci/antalya` → project = `antalya`)
-- `<sha8>` is the first 8 characters of the upstream commit the branch is based on
-- Old versioned branches stay on the remote as history — nothing is force-pushed or destroyed
+- Old branches stay on the remote as history — nothing is force-pushed or destroyed
 
 ---
 
 ## 4. Configuration (`config.yaml`)
 
 ```yaml
+push: false              # push branches and open PRs (default: false)
+work_dir: /path/to/repo  # path to existing clone or where to clone
+
 upstream:
   remote: https://github.com/ClickHouse/ClickHouse.git
   remote_name: upstream
@@ -50,300 +54,241 @@ fork:
   remote_name: origin
 
 ci:
-  branch_prefix: ci/antalya         # versioned branches: ci/antalya/<sha8>
-  source_branch: antalya-ci          # initial source branch for bootstrap
+  branch_prefix: ci/antalya
+  source_branch: antalya-ci    # omit or leave empty to skip CI rebase
+  if_exists: skip              # skip (default) or redo
 
 features:
   - id: s3-disk
     description: "Custom S3 disk improvements"
     source_branch: feature/antalya-s3-disk
     enabled: true
-
   - id: keeper-cfg
     description: "Keeper config extensions"
     source_branch: feature/antalya-keeper-cfg
+    depends_on: [s3-disk]
     enabled: true
 
-  - id: observability
-    description: "Observability hooks"
-    source_branch: feature/antalya-observability
-    enabled: false                  # excluded from pipeline and releases
+pr_sources:
+  - labels: ["forward-port", "v26.3"]
+    description: "Forward-ported changes"
+    merged_only: true
+    auto_pr: true
+    if_exists: skip
 
-  - id: disk-cache
-    description: "Shared disk cache layer"
-    source_branch: feature/antalya-disk-cache
-    depends_on: [s3-disk]           # applied after s3-disk (dependency ordering TBD)
-    enabled: true
-
-# PR-based features: discover PRs in the fork repo by label
-# pr_sources:
-#   - label: "forward-port"
-#     description: "Forward-ported changes"
-
-# Optional: sync status to a GitHub Project board
-# notifications:
-#   github_project: https://github.com/orgs/Altinity/projects/1
+notifications:
+  github_project: https://github.com/orgs/Altinity/projects/1
 ```
 
 **Notes:**
-- `enabled: false` excludes a feature from both the maintenance pipeline and release construction.
-- `source_branch` is only used on the first run (bootstrap). After that, state tracks the current versioned branch.
-- Feature order in the list determines apply order during release construction.
-- `depends_on` declares that a feature requires another feature's commits to be present. Dependency-aware ordering is planned for a future version; for now, list dependent features after their dependencies in the config.
-- `pr_sources` enables automatic PR-based feature discovery (see Section 6, Stage 3).
+- `push: false` (default) keeps everything local — no branches pushed, no PRs created, no project board sync.
+- `work_dir` can point to an existing git clone. If the directory has a `.git`, it's used directly (no clone).
+- `ci.source_branch` empty or omitted → CI rebase phase is skipped entirely. Useful when CI is rebased by another person and you only need features.
+- `ci.if_exists` / `pr_sources[].if_exists`: `skip` (default) leaves existing branches alone; `redo` recreates from scratch.
+- `pr_sources[].labels`: AND logic — a PR must have ALL listed labels.
+- `pr_sources[].merged_only`: skip open PRs, only process merged ones.
+- `pr_sources[].auto_pr`: auto-create a PR from the feature branch into the base branch.
+- PRs are processed in merge order (earliest merged first).
+- `enabled: false` excludes a feature from the pipeline entirely.
+- `depends_on` declares inter-feature dependencies (manual ordering in v1).
 
 ---
 
 ## 5. Authentication
 
-- **Git operations** (clone, fetch, push): SSH key. The tool uses the key available via the SSH agent, or the path set in `RELEASY_SSH_KEY_PATH`.
-- **GitHub API operations** (PR creation, project board sync): Personal Access Token set via `RELEASY_GITHUB_TOKEN`. Requires `repo` and `project` scopes.
+- **Git operations** (clone, fetch, push): SSH key via agent or `RELEASY_SSH_KEY_PATH`.
+- **GitHub API** (PR discovery, PR creation, project board): `RELEASY_GITHUB_TOKEN` with `repo` and `project` scopes.
 
 ---
 
-## 6. Pipeline: Continuous Maintenance
+## 6. Pipeline: Phased Rebase
 
 ### Invocation
 
 ```
-releasy run --onto <upstream-commit-sha>
+releasy run --onto <upstream-tag-or-sha>
 ```
 
-The operator explicitly specifies the upstream commit SHA. The tool does not auto-discover upstream HEAD.
+The pipeline runs in phases. State is saved after each phase so it can be resumed.
 
 ---
 
-### Stage 1 — Create CI Branch
+### Phase 1a — Create Base Branch
 
 1. Fetch upstream and fork remotes.
-2. Determine the source of CI commits:
-   - **First run:** use `ci.source_branch` from config; find divergence point via `git merge-base` against the `--onto` commit.
-   - **Subsequent runs:** use the previous versioned CI branch from state; the base commit is known exactly.
-3. Create a clean branch `ci/<project>/<sha8>` from `<upstream-commit-sha>`.
-4. Cherry-pick CI commits (divergence..source-tip) onto the new branch.
-5. **On success:**
-   - Push the new CI branch to fork remote.
-   - Update `state.yaml`: set `ci_branch.status = ok`, `ci_branch.branch_name`, `ci_branch.base_commit`.
-   - Update `STATUS.md`.
-   - Proceed to Stage 2.
-6. **On conflict:**
-   - Leave the branch as-is (cherry-pick is aborted).
-   - Update `state.yaml`: set `ci_branch.status = conflict`, record `conflict_files`.
-   - Update `STATUS.md`.
-   - **Halt. Do not proceed to Stage 2.**
+2. Parse the `--onto` ref to derive the version suffix (e.g. `v26.3.4.234-lts` → `26.3`).
+3. Create base branch `<project>-<version>` from the upstream ref.
+4. Push to fork (if `push: true`).
+5. Save state: `phase = base_created`.
 
 ---
 
-### Stage 2 — Create Feature Branches (Sequential)
+### Phase 1b — Rebase CI onto Base
 
-For each enabled feature, in config order:
+**Skipped** if `ci.source_branch` is empty or omitted.
 
-1. Determine the source of feature commits:
-   - **First run:** use `source_branch` from config; find divergence via `merge-base` against CI source.
-   - **Subsequent runs:** use the previous versioned feature branch from state; divergence is the old CI branch tip.
-2. Create a clean branch `feature/<project>/<id>/<sha8>` from the new CI branch.
-3. Cherry-pick feature commits onto the new branch.
-4. **On success:**
-   - Push the new feature branch to fork remote.
-   - Update `state.yaml` and `STATUS.md`.
-   - Proceed to the next feature.
-5. **On conflict:**
-   - Leave the branch as-is (cherry-pick is aborted).
-   - Update `state.yaml` and `STATUS.md`.
-   - **Proceed to the next feature** (conflict on one branch does not block others).
+1. Find CI commits: `merge-base` between `source_branch` and upstream ref.
+2. Create CI branch `ci/<project>-<version>` from the base branch.
+3. `git rebase --onto <base> <divergence> <source_tip>` — replays CI commits, automatically dropping commits already in upstream.
+4. Push and open PR: CI → base (if `push: true`).
+5. Save state: `phase = ci_rebased`.
+6. **Stop.** Print instructions to merge the CI PR before proceeding.
 
-Pipeline run continues to Stage 3 if `pr_sources` are configured.
+**On conflict:** the rebase is left in progress. User resolves, runs `git rebase --continue`, then `releasy continue --branch <ci-branch>`.
 
 ---
 
-### Stage 3 — PR-Based Features (Bootstrap)
+### Phase 2 — Rebase Features onto Base
 
-Stage 3 only runs for **newly discovered** PRs. PRs that were already processed in a previous run are handled by Stage 2 on subsequent runs (they have a versioned branch in state and behave like regular features).
+Runs when `phase = ci_rebased` (or `ci_merged`).
 
-If `pr_sources` is configured, the tool searches the fork repo for PRs matching each configured label using the GitHub API (`RELEASY_GITHUB_TOKEN` required). PRs already known from state are skipped.
+#### PR-based features
 
-For each **new** PR:
+For each `pr_source`, search for PRs matching all labels (GitHub API). For each new PR:
 
-1. Create a feature branch `feature/<project>/pr-<number>/<sha8>` from the CI branch.
-2. Cherry-pick the PR's changes:
-   - **Merged PR:** `git cherry-pick -m 1 <merge_commit_sha>` — applies the diff the PR introduced.
-   - **Open PR:** fetch GitHub's auto-generated merge ref (`refs/pull/<N>/merge`) and `git cherry-pick -m 1 FETCH_HEAD`.
-   - Closed-but-not-merged PRs are skipped.
-3. **On success:** push and update state.
-4. **On conflict:** abort cherry-pick, record conflict, continue to the next PR.
+1. Create feature branch `feature/<project>-<version>/pr-<N>` from base.
+2. Cherry-pick the merge commit (`-m 1`).
+3. On conflict: commit conflict markers as WIP, push anyway.
+4. Open PR: feature → base (if `push: true` + `auto_pr: true`).
+5. Conflict PRs include a warning banner in the PR body.
 
-**Lifecycle:** On the first run, Stage 3 bootstraps a PR by cherry-picking its merge commit. On subsequent runs, the feature has a versioned branch in state and Stage 2 cherry-picks from that branch — exactly like a regular source-branch feature. This means conflict resolutions and operator fixes on the branch are preserved across rebases.
+#### Static feature branches
 
-**PR metadata preservation:** The original PR's title, body, URL, and number are stored in `state.yaml` alongside the feature's branch state. When `releasy release` creates release PRs, the stored title and description are reused in the new PR.
+For each enabled feature with a `source_branch`:
 
-PR-based features appear in `STATUS.md` and `releasy status` output with links to the original PR.
+1. Find feature commits via `merge-base` against CI source.
+2. Create feature branch `feature/<project>-<version>/<id>` from base.
+3. `git rebase --onto <base> <divergence> <source_tip>`.
+4. Push and open PR (if `push: true` + `auto_pr: true`).
+5. On conflict: rebase left in progress for manual resolution.
+
+After all features: `phase = features_done`.
 
 ---
 
-## 7. Conflict Resolution Flow
+## 7. Conflict Resolution
 
-1. Operator sees `STATUS.md`, `releasy status`, or the GitHub Project board.
-2. Operator resolves the conflict locally:
-   - Check out the versioned branch (e.g. `feature/antalya/s3-disk/abc12345`).
-   - Cherry-pick the remaining commits, resolve conflicts, force-push.
-3. Operator signals resolution:
-   ```
-   releasy continue --branch <branch-name-or-feature-id>
-   ```
-4. Tool marks the branch `resolved` in `state.yaml`, updates `STATUS.md`.
+```
+releasy continue --branch <branch-name-or-feature-id>
+```
 
-**Skip:** if a branch is not going to be resolved in this run:
+The tool verifies no git operation is still in progress before marking resolved.
+
 ```
 releasy skip --branch <branch-name-or-feature-id>
 ```
-Marks the branch `skipped` in state. Skipped branches are excluded from release construction unless `--include-skipped` is passed.
+
+Marks a branch as skipped (excluded from releases unless `--include-skipped`).
 
 ---
 
-## 8. State (`state.yaml`)
+## 8. Safety: Upstream PR Protection
 
-Auto-updated by the tool after every operation. Committed and pushed to the tool repo after each update.
+`create_pull_request` has a **hard safeguard**: before creating any PR, it compares the fork repo slug against the upstream remote. If they match, it raises a `ValueError` and refuses. This is a structural guarantee — no code path can ever open a PR against upstream.
+
+---
+
+## 9. State (`state.yaml`)
+
+Auto-updated after every operation.
 
 ```yaml
 last_run:
   started_at: 2026-03-21T10:00:00Z
-  onto: abc1234567890
+  onto: v26.3.4.234-lts
+  phase: ci_rebased          # init | base_created | ci_rebased | ci_merged | features_done
+  base_branch: antalya-26.3
   ci_branch:
-    status: ok                  # pending | ok | conflict | resolved | skipped
-    branch_name: ci/antalya/abc12345
-    base_commit: abc1234567890
+    status: ok
+    branch_name: ci/antalya-26.3
+    base_commit: v26.3.4.234-lts
+    pr_url: https://github.com/Altinity/ClickHouse/pull/100
   features:
-    s3-disk:
+    pr-42:
       status: ok
-      branch_name: feature/antalya/s3-disk/abc12345
-      base_commit: abc1234567890
-    keeper-cfg:
+      branch_name: feature/antalya-26.3/pr-42
+      base_commit: v26.3.4.234-lts
+      pr_url: https://github.com/Altinity/ClickHouse/pull/42
+      pr_number: 42
+      pr_title: "Fix S3 disk timeout"
+      rebase_pr_url: https://github.com/Altinity/ClickHouse/pull/101
+    s3-disk:
       status: conflict
-      branch_name: feature/antalya/keeper-cfg/abc12345
-      base_commit: abc1234567890
+      branch_name: feature/antalya-26.3/s3-disk
+      base_commit: v26.3.4.234-lts
       conflict_files:
         - src/Storages/StorageS3.cpp
-    observability:
-      status: disabled
-    pr-1234:
-      status: ok
-      branch_name: feature/antalya/pr-1234/abc12345
-      base_commit: abc1234567890
-      pr_url: https://github.com/Altinity/ClickHouse/pull/1234
-      pr_number: 1234
-      pr_title: "Fix S3 disk timeout handling"
-      pr_body: "Increases the default timeout for S3 operations..."
 ```
 
 ---
 
-## 9. Status Table (`STATUS.md`)
+## 10. Status Table (`STATUS.md`)
 
-Updated after every state change. Committed and pushed to the tool repo automatically.
+Updated after every state change.
 
 ```markdown
 ## RelEasy Branch Status
 
-Last run: 2026-03-21 · Upstream commit: `abc1234567890`
+Last run: 2026-03-21 · Upstream commit: `v26.3.4.234-lts` · Phase: features_done
 
-| Branch                                    | Status      | Based On       | Source PR | Conflict Files              |
-|-------------------------------------------|-------------|----------------|-----------|---------------------------  |
-| ci/antalya/abc12345                       | ✅ ok       | `abc12345678`  |           |                             |
-| feature/antalya/s3-disk/abc12345          | ✅ ok       | `abc12345678`  |           |                             |
-| feature/antalya/keeper-cfg/abc12345       | 🔴 conflict | `abc12345678`  |           | `src/Storages/StorageS3.cpp` |
-| feature/antalya-observability             | ⏸ disabled  |                |           |                             |
-| feature/antalya/pr-1234/abc12345          | ✅ ok       | `abc12345678`  | [#1234](https://github.com/Altinity/ClickHouse/pull/1234) | |
+| Branch | Status | Based On | PR | Conflict Files |
+|--------|--------|----------|----|----------------|
+| ci/antalya-26.3 | ✅ ok | `v26.3.4.234-` | CI PR | |
+| feature/antalya-26.3/pr-42 | ✅ ok | `v26.3.4.234-` | #42 | |
+| feature/antalya-26.3/s3-disk | 🔴 conflict | `v26.3.4.234-` | | `src/Storages/StorageS3.cpp` |
 ```
-
-Status values: `✅ ok` · `🔴 conflict` · `🔵 resolved` · `⏭ skipped` · `⏸ disabled` · `⏳ pending`
 
 ---
 
-## 10. Release Branch Construction (PR-per-Feature)
-
-On-demand operation, separate from the maintenance pipeline. Creates a base release branch and opens individual PRs for each feature.
+## 11. CLI Reference
 
 ```
-releasy release --upstream-tag <tag> --name <branch-name>
-```
-
-Example:
-```
-releasy release --upstream-tag v26.1.3 --name antalya-26.1
-```
-
-**Steps:**
-1. Warn if any enabled features have status `conflict` or `skipped` (does not abort by default; add `--strict` to abort on warnings).
-2. Create branch `<name>` from the specified upstream tag.
-3. Cherry-pick CI branch commits onto the base branch (all CI commits as-is, not squashed).
-4. Push the base branch to fork remote.
-5. For each enabled (and non-skipped) feature branch in config order:
-   - Create branch `<name>/feat/<feature-id>` from the base branch.
-   - Squash all feature commits into a single commit.
-   - Cherry-pick that commit onto the feature PR branch.
-   - Commit message format: `[releasy] <feature-id>: <feature-description>`.
-   - Push the branch and open a GitHub PR targeting `<name>`.
-   - If `depends_on` is set, the PR body notes which PRs must be merged first.
-6. **On conflict for a feature:** skip that feature (other features still get PRs).
-7. Print summary with all PR URLs.
-
-**PR naming:**
-- Branch: `<release-name>/feat/<feature-id>` (e.g. `antalya-26.1/feat/s3-disk`)
-- Title: `[releasy] <feature-id>: <feature-description>`
-- Each PR contains exactly one squashed commit for clean review.
-
-**Merge order:** merge PRs in config order, respecting `depends_on` declarations.
-
-**Flags:**
-- `--strict` — abort if any enabled feature is not `ok`.
-- `--include-skipped` — include `skipped` features in release construction.
-- If `RELEASY_GITHUB_TOKEN` is not set, branches are pushed but PRs are not created (manual PR creation required).
-
----
-
-## 11. GitHub Project Integration
-
-Instead of opening GitHub issues (which pollutes the repository), RelEasy syncs branch status to a GitHub Projects v2 board.
-
-**Setup:**
-1. Create a GitHub Project (org or user level).
-2. Add a single-select **Status** field with options: `Ok`, `Conflict`, `Resolved`, `Skipped`, `Disabled`, `Pending`.
-3. Set `notifications.github_project` URL in config.
-4. Set `RELEASY_GITHUB_TOKEN` with `project` scope.
-
-RelEasy creates one draft-issue card per branch and keeps the Status field in sync after each pipeline operation.
-
-This is optional — `STATUS.md` and `releasy status` work without any GitHub integration.
-
----
-
-## 12. CLI Reference
-
-```
-# Maintenance pipeline
-releasy run --onto <sha>                # create versioned branches from upstream commit
-releasy continue --branch <name>        # mark a conflict-resolved branch
-releasy skip --branch <name>            # skip a conflicted branch for this run
-releasy abort                           # abort current run, leave all branches as-is
-releasy status                          # print current pipeline state to stdout
+# Pipeline
+releasy [--config <path>] run --onto <tag-or-sha> [--work-dir <path>]
+releasy continue --branch <name>
+releasy skip --branch <name>
+releasy abort
+releasy status
 
 # Release
-releasy release \
-  --upstream-tag <tag> \
-  --name <branch-name> \
-  [--strict] \
-  [--include-skipped]
+releasy release --upstream-tag <tag> --name <branch-name> [--strict] [--include-skipped]
 
-# Config management
-releasy feature add \
-  --id <id> \
-  --source-branch <branch> \
-  --description <desc>
-releasy feature enable  --id <id>
+# Feature management
+releasy feature add --id <id> --source-branch <branch> --description <desc>
+releasy feature enable --id <id>
 releasy feature disable --id <id>
-releasy feature remove  --id <id>
+releasy feature remove --id <id>
 releasy feature list
 ```
+
+---
+
+## 12. GitHub Project Integration
+
+Sync branch status to a GitHub Projects v2 board (optional). One-time manual setup, then RelEasy keeps it updated automatically.
+
+### Manual Setup
+
+1. **Create the project:** GitHub org → Projects → New project (Table layout recommended).
+2. **Configure the Status field:** Edit the default "Status" single-select field. Set options to exactly: `Ok`, `Conflict`, `Resolved`, `Skipped`, `Disabled`, `Pending` (case-insensitive match).
+3. **Get the URL:** e.g. `https://github.com/orgs/Altinity/projects/1` (org) or `https://github.com/users/<name>/projects/1` (personal).
+4. **Token:** `RELEASY_GITHUB_TOKEN` needs `repo` + `project` scopes (classic PAT) or "Projects" read/write (fine-grained PAT).
+5. **Config:**
+   ```yaml
+   push: true
+   notifications:
+     github_project: https://github.com/orgs/Altinity/projects/1
+   ```
+
+### Automatic Behavior
+
+When `push: true` and `notifications.github_project` is set, after each state change RelEasy:
+- Creates one draft-issue card per branch (CI + each feature).
+- Sets the Status field to the pipeline state (Ok, Conflict, etc.).
+- Updates the card body with upstream commit and conflicted files.
+- On re-runs, deletes old cards and recreates with updated status.
+
+No cards need to be created manually. Project sync is skipped when `push: false`.
 
 ---
 
@@ -352,6 +297,5 @@ releasy feature list
 - No automatic upstream commit discovery (`--onto` is always explicit).
 - No AI-assisted conflict resolution.
 - No support for multiple forks.
-- No automatic dependency-aware ordering (`depends_on` is declared but ordering is manual in v1).
+- No automatic dependency-aware ordering (`depends_on` declared but ordering is manual).
 - No build/test validation after rebase.
-- No GitHub issues (status tracked in `STATUS.md` and optionally a GitHub Project board).

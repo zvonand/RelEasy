@@ -3,10 +3,27 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+
+
+def extract_version_suffix(onto: str) -> str:
+    """Extract a version suffix from a tag or ref for branch naming.
+
+    v26.3.4.234-lts → 26.3
+    v26.2.5.45-stable → 26.2
+    Raw SHA → first 8 chars
+    """
+    m = re.match(r"v?(\d+)\.(\d+)", onto)
+    if m:
+        return f"{m.group(1)}.{m.group(2)}"
+    # Looks like a hex SHA
+    if re.fullmatch(r"[0-9a-f]{7,40}", onto):
+        return onto[:8]
+    return onto
 
 
 @dataclass
@@ -24,7 +41,7 @@ class ForkConfig:
 @dataclass
 class CIConfig:
     branch_prefix: str  # e.g. "ci/antalya" → branches become ci/antalya/<sha8>
-    source_branch: str  # initial source branch (e.g. "antalya-ci") for bootstrap
+    source_branch: str = ""  # CI source branch; empty = skip CI rebase
     if_exists: str = "skip"  # "skip" or "redo"
 
 
@@ -92,25 +109,37 @@ class Config:
         parts = self.ci.branch_prefix.split("/")
         return parts[-1] if len(parts) > 1 else parts[0]
 
-    def get_feature_by_branch(self, branch: str) -> FeatureConfig | None:
+    def get_feature_by_branch(self, branch: str, onto: str = "") -> FeatureConfig | None:
         """Match by source_branch or by versioned branch prefix."""
         for f in self.features:
-            prefix = self.feature_branch_prefix(f.id)
-            if f.source_branch == branch or branch.startswith(prefix + "/"):
+            if f.source_branch == branch:
                 return f
+            if onto:
+                prefix = self.feature_branch_prefix(f.id, onto)
+                if branch.startswith(prefix):
+                    return f
         return None
 
-    def ci_branch_name(self, short_sha: str) -> str:
-        """Build a versioned CI branch name: ci/<project>/<sha8>"""
-        return f"{self.ci.branch_prefix}/{short_sha[:8]}"
+    def base_branch_name(self, onto: str) -> str:
+        """Build the base branch name: <project>-<version>.
 
-    def feature_branch_prefix(self, feature_id: str) -> str:
-        """Build the prefix for versioned feature branches: feature/<project>/<id>"""
-        return f"feature/{self.project_name}/{feature_id}"
+        v26.3.4.234-lts → antalya-26.3
+        <sha> → antalya-<sha8>
+        """
+        suffix = extract_version_suffix(onto)
+        return f"{self.project_name}-{suffix}"
 
-    def feature_branch_name(self, feature_id: str, short_sha: str) -> str:
-        """Build a versioned feature branch name: feature/<project>/<id>/<sha8>"""
-        return f"{self.feature_branch_prefix(feature_id)}/{short_sha[:8]}"
+    def ci_branch_name(self, onto: str) -> str:
+        """Build the CI branch name: ci/<base_branch_name>"""
+        return f"ci/{self.base_branch_name(onto)}"
+
+    def feature_branch_prefix(self, feature_id: str, onto: str) -> str:
+        """Build the prefix for feature branches: feature/<base>/<id>"""
+        return f"feature/{self.base_branch_name(onto)}/{feature_id}"
+
+    def feature_branch_name(self, feature_id: str, onto: str) -> str:
+        """Build a feature branch name: feature/<base>/<id>"""
+        return f"feature/{self.base_branch_name(onto)}/{feature_id}"
 
 
 def load_config(config_path: Path | None = None) -> Config:
@@ -139,10 +168,10 @@ def load_config(config_path: Path | None = None) -> Config:
         remote_name=raw["fork"].get("remote_name", "origin"),
     )
 
-    ci_raw = raw["ci"]
+    ci_raw = raw.get("ci", {})
     ci = CIConfig(
-        branch_prefix=ci_raw["branch_prefix"],
-        source_branch=ci_raw["source_branch"],
+        branch_prefix=ci_raw.get("branch_prefix", "ci"),
+        source_branch=ci_raw.get("source_branch", ""),
         if_exists=ci_raw.get("if_exists", "skip"),
     )
 

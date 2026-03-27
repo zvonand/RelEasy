@@ -31,10 +31,9 @@ def add_feature(
         )
     )
     save_config(config)
-    prefix = config.feature_branch_prefix(feature_id)
     console.print(
         f"[green]✓[/green] Added feature [cyan]{feature_id}[/cyan] "
-        f"(source: {source_branch}, versioned: {prefix}/<sha>)"
+        f"(source: {source_branch}, branch: feature/<base>/{feature_id})"
     )
     return True
 
@@ -89,10 +88,10 @@ def list_features(config: Config) -> None:
 
     for feat in config.features:
         enabled_str = "[green]yes[/green]" if feat.enabled else "[dim]no[/dim]"
-        prefix = config.feature_branch_prefix(feat.id)
+        prefix = f"feature/<base>/{feat.id}"
         deps = ", ".join(feat.depends_on) if feat.depends_on else ""
         table.add_row(
-            feat.id, feat.source_branch, prefix + "/<sha>",
+            feat.id, feat.source_branch, prefix,
             deps, feat.description, enabled_str,
         )
 

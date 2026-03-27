@@ -1,12 +1,16 @@
+# ── Push & PR control ───────────────────────────────────────────────
 # Push branches to origin and open PRs.
 # Default is false — everything stays local until you enable this.
 # push: true
 
-# Where to clone the fork for git operations.
+# ── Work directory ──────────────────────────────────────────────────
+# Where to clone/find the fork repo for git operations.
+# If it points to an existing git repo, it will be reused (no clone).
 # If omitted, uses the current working directory.
 # Can also be overridden with --work-dir on the CLI.
-# work_dir: /tmp/releasy-work
+# work_dir: /path/to/ClickHouse
 
+# ── Upstream & Fork ─────────────────────────────────────────────────
 upstream:
   remote: https://github.com/ClickHouse/ClickHouse.git
   remote_name: upstream
@@ -15,11 +19,28 @@ fork:
   remote: https://github.com/Altinity/ClickHouse.git
   remote_name: origin
 
+# ── CI configuration ───────────────────────────────────────────────
+# branch_prefix: used to derive the project name and branch names.
+#   "ci/antalya" → project = "antalya"
+#   Base branch:    antalya-26.3      (from tag v26.3.x.y-...)
+#   CI branch:      ci/antalya-26.3
+#   Feature branch: feature/antalya-26.3/<id>
+#
+# source_branch: the branch on the fork containing CI/infra commits.
+#   If omitted or empty, CI rebase is skipped entirely — useful when
+#   someone else has already rebased CI and you only need features.
+#
+# if_exists: what to do when the branch already exists.
+#   "skip" (default) — leave existing branches alone.
+#   "redo" — recreate from scratch.
 ci:
-  branch_prefix: ci/antalya         # versioned branches: ci/antalya/<sha8>
-  source_branch: antalya-ci          # initial source (used on first run)
-  # if_exists: skip                  # skip (default) or redo — what to do if the CI branch already exists
+  branch_prefix: ci/antalya
+  source_branch: antalya-ci
+  # if_exists: skip
 
+# ── Static feature branches ────────────────────────────────────────
+# Each feature is rebased onto the base branch as a separate branch.
+# PRs can be auto-created into the base branch (if push + auto_pr).
 features:
   - id: s3-disk
     description: "Custom S3 disk improvements"
@@ -36,27 +57,71 @@ features:
     source_branch: feature/antalya-observability
     enabled: false
 
-  # Example: feature that depends on another
+  # Feature that depends on another:
   # - id: disk-cache
   #   description: "Shared disk cache layer"
   #   source_branch: feature/antalya-disk-cache
   #   depends_on: [s3-disk]
   #   enabled: true
 
-# PR-based features: discover PRs in the fork repo by labels.
-# A PR must have ALL listed labels to be included.
-# Set merged_only: true to skip open PRs.
-# Set auto_pr: true to auto-create a PR into the CI branch after cherry-pick.
+# ── PR-based features ──────────────────────────────────────────────
+# Discover PRs in the fork repo by labels (AND logic — PR must have
+# ALL listed labels). Each matching PR becomes its own feature branch.
+#
+# merged_only: true — skip open PRs, only cherry-pick merged ones.
+# auto_pr: true — auto-create a PR from the feature branch into the
+#   base branch (requires push: true).
+# if_exists: skip|redo — same as ci.if_exists but per PR source.
+#
+# PRs are processed in merge order (earliest merged first).
 # Requires RELEASY_GITHUB_TOKEN.
 # pr_sources:
 #   - labels: ["forward-port", "v26.1"]
 #     description: "Forward-ported changes"
 #     merged_only: true
 #     auto_pr: true
-#     if_exists: skip                # skip (default) or redo — what to do if the feature branch already exists
+#     if_exists: skip
 
-# Optional: sync branch status to a GitHub Project board.
-# The project needs a single-select "Status" field with options:
-#   Ok, Conflict, Resolved, Skipped, Disabled, Pending
+# ── GitHub Project board ────────────────────────────────────────────
+# Sync branch status to a GitHub Project v2 board (optional).
+# Only active when push: true.
+#
+# One-time setup:
+#   1. Create a GitHub Project (Table layout recommended)
+#   2. Edit the "Status" field → set options to exactly:
+#      Ok, Conflict, Resolved, Skipped, Disabled, Pending
+#   3. Copy the project URL below
+#   4. Ensure RELEASY_GITHUB_TOKEN has repo + project scopes
+#
+# RelEasy creates/updates draft-issue cards automatically.
 # notifications:
 #   github_project: https://github.com/orgs/Altinity/projects/1
+
+# ─────────────────────────────────────────────────────────────────────
+# WORKFLOW
+#
+# The pipeline runs in phases with state persisted between runs:
+#
+# Phase 1a — Create base branch from upstream tag/commit:
+#   releasy run --onto v26.3.4.234-lts
+#   → creates branch "antalya-26.3" from the tag
+#
+# Phase 1b — Rebase CI onto base (skipped if source_branch is empty):
+#   → creates "ci/antalya-26.3" with CI commits rebased
+#   → opens PR: ci/antalya-26.3 → antalya-26.3 (if push: true)
+#   → STOPS here. Merge the CI PR before proceeding.
+#
+# Phase 2 — Rebase features (run again after CI merged):
+#   releasy run --onto v26.3.4.234-lts
+#   → detects CI phase is done, proceeds to features
+#   → creates "feature/antalya-26.3/<id>" for each feature/PR
+#   → opens PRs into antalya-26.3 (if push + auto_pr)
+#
+# On conflict:
+#   cd <work_dir>
+#   # resolve conflicts
+#   git add <files> && git rebase --continue
+#   releasy continue --branch <name>
+#
+# Then run again to resume from where it stopped.
+# ─────────────────────────────────────────────────────────────────────

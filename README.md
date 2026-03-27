@@ -2,40 +2,49 @@
 
 CLI tool for managing fork rebases, feature branches, and release construction.
 
-RelEasy automates the process of maintaining a fork's branches against upstream. Instead of rebasing long-lived branches (which accumulates conflicts), it creates **versioned branches** from clean upstream commits and cherry-picks your changes on top.
+RelEasy automates maintaining a fork against upstream. Instead of rebasing long-lived branches (which accumulates conflicts), it creates a **base branch** from an upstream tag/commit, rebases CI and features on top, and opens PRs — all in a phased, resumable workflow.
 
 ## How It Works
 
 ```
-upstream:  A --- B --- C --- D (upstream HEAD)
-                       |
-ci/antalya/C:          C --- x --- y (CI commits cherry-picked)
-                                   |
-feature/antalya/s3-disk/C:        C --- x --- y --- f1 --- f2
+upstream:  ... --- v26.3.4.234-lts
+                         |
+antalya-26.3:            * (clean base branch)
+                         |
+ci/antalya-26.3:         * --- ci1 --- ci2 (CI rebased, PR → antalya-26.3)
+                         |
+                    [CI PR merged into antalya-26.3]
+                         |
+feature/antalya-26.3/pr-42:   * --- fix (PR → antalya-26.3)
+feature/antalya-26.3/pr-99:   * --- feat (PR → antalya-26.3)
 ```
 
-When you move to upstream commit `D`:
+### Phased Pipeline
 
-```
-ci/antalya/D:                      D --- x' --- y'
-                                               |
-feature/antalya/s3-disk/D:                    D --- x' --- y' --- f1' --- f2'
-```
+**Phase 1** — Base + CI (first `releasy run`):
+1. Create base branch `antalya-26.3` from upstream `v26.3.4.234-lts`
+2. Rebase CI commits onto base → `ci/antalya-26.3`
+3. Open PR: CI → base (if `push: true`)
+4. **Stop.** Wait for CI PR to be merged.
 
-Old branches stay on the remote as history — nothing is force-pushed or destroyed.
+**Phase 2** — Features (run again after CI merged):
+1. Rebase each feature onto base → `feature/antalya-26.3/<id>`
+2. Open PRs: each feature → base (if `push: true` + `auto_pr: true`)
 
-## Branch Naming
+On conflict at any phase, the pipeline stops with instructions. Resolve, run `releasy continue`, then `releasy run` again.
 
-All branches follow the pattern `<type>/<project>/<name>/<sha8>`:
+### Branch Naming
 
-| Type | Example | Description |
-|------|---------|-------------|
-| CI | `ci/antalya/abc12345` | CI/infra changes on top of upstream `abc12345` |
-| Feature | `feature/antalya/exportmergetree/abc12345` | Feature on top of CI branch based on `abc12345` |
-| Feature | `feature/antalya/s3-disk/abc12345` | Another feature, same upstream base |
-| PR Feature | `feature/antalya/pr-1234/abc12345` | PR #1234 cherry-picked onto CI branch |
+Tags are parsed to extract version: `v26.3.4.234-lts` → `26.3`. Raw SHAs use the first 8 chars.
 
-The `<sha8>` is the first 8 characters of the upstream commit the branch is based on.
+| Type | Pattern | Example |
+|------|---------|---------|
+| Base | `<project>-<version>` | `antalya-26.3` |
+| CI | `ci/<project>-<version>` | `ci/antalya-26.3` |
+| Feature | `feature/<project>-<version>/<id>` | `feature/antalya-26.3/s3-disk` |
+| PR Feature | `feature/<project>-<version>/pr-<N>` | `feature/antalya-26.3/pr-42` |
+
+The `<project>` name is derived from `ci.branch_prefix` (e.g. `ci/antalya` → `antalya`).
 
 ## Installation
 
@@ -45,7 +54,7 @@ pip install -e .
 
 ## Quick Start
 
-1. Copy the example config and edit it for your fork:
+1. Copy the example config and edit it:
 
 ```bash
 cp config.yaml.example config.yaml
@@ -54,112 +63,107 @@ cp config.yaml.example config.yaml
 2. Set up authentication:
 
 ```bash
-export RELEASY_GITHUB_TOKEN="ghp_..."      # for PR discovery, PR creation & Project sync
-export RELEASY_SSH_KEY_PATH="~/.ssh/id_rsa" # optional, defaults to SSH agent
+export RELEASY_GITHUB_TOKEN="ghp_..."      # for PR discovery & creation
+export RELEASY_SSH_KEY_PATH="~/.ssh/id_rsa" # optional
 ```
 
-3. Run the pipeline:
+3. Run Phase 1 (base + CI):
 
 ```bash
-releasy run --onto <upstream-commit-sha>
+releasy run --onto v26.3.4.234-lts
 ```
 
-This creates `ci/antalya/<sha8>` from the upstream commit, cherry-picks CI commits, then creates `feature/antalya/<id>/<sha8>` branches with feature commits.
+4. Merge the CI PR on GitHub, then run Phase 2 (features):
+
+```bash
+releasy run --onto v26.3.4.234-lts
+```
 
 ## Configuration
 
+See [`config.yaml.example`](config.yaml.example) for a fully documented template.
+
 ```yaml
+# Push branches and open PRs (default: false — everything stays local)
+push: true
+
+# Reuse an existing local clone
+work_dir: /path/to/ClickHouse
+
 upstream:
   remote: https://github.com/ClickHouse/ClickHouse.git
-  remote_name: upstream
 
 fork:
   remote: https://github.com/Altinity/ClickHouse.git
-  remote_name: origin
 
 ci:
-  branch_prefix: ci/antalya         # versioned branches: ci/antalya/<sha8>
-  source_branch: antalya-ci          # initial source (first run only)
+  branch_prefix: ci/antalya
+  source_branch: antalya-ci    # omit to skip CI rebase entirely
+  if_exists: redo              # skip (default) or redo
 
+# Static feature branches
 features:
   - id: s3-disk
     description: "Custom S3 disk improvements"
     source_branch: feature/antalya-s3-disk
-    enabled: true
 
-  - id: disk-cache
-    description: "Shared disk cache layer"
-    source_branch: feature/antalya-disk-cache
-    depends_on: [s3-disk]           # ordering TBD — list after dependencies for now
-    enabled: true
-
-# PR-based features: discover PRs in the fork repo by label
+# PR-based features — discovered by labels (AND logic)
 pr_sources:
-  - label: "forward-port"
-    description: "Forward-ported changes"
-
-# Optional: sync to a GitHub Project board
-notifications:
-  github_project: https://github.com/orgs/Altinity/projects/1
+  - labels: ["forward-port", "v26.3"]
+    merged_only: true
+    auto_pr: true
+    if_exists: skip
 ```
 
-- The project name (`antalya`) is derived from `ci.branch_prefix` and used in all branch names
-- `source_branch` is only used on the first run — after that, state tracks the current versioned branch
-- Feature order determines apply order during release construction
-- `enabled: false` excludes a feature from both the pipeline and release
-- `depends_on` declares inter-feature dependencies; automatic ordering is planned — for now, list features in dependency order
-- `pr_sources` discovers PRs by label in the fork repo and creates a feature branch per PR (requires `RELEASY_GITHUB_TOKEN`)
+### Key config options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `push` | Push branches and open PRs | `false` |
+| `work_dir` | Path to existing repo clone (or where to clone) | cwd |
+| `ci.source_branch` | Branch with CI commits; empty = skip CI rebase | required |
+| `ci.if_exists` | `skip` or `redo` when branch exists | `skip` |
+| `pr_sources[].labels` | Labels a PR must have (ALL required) | — |
+| `pr_sources[].merged_only` | Only include merged PRs | `false` |
+| `pr_sources[].auto_pr` | Auto-create PR into base branch | `false` |
+| `pr_sources[].if_exists` | `skip` or `redo` for feature branches | `skip` |
+
+### Environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `RELEASY_GITHUB_TOKEN` | GitHub PAT for PR discovery, PR creation, Project sync |
+| `RELEASY_SSH_KEY_PATH` | SSH key for git operations (optional, defaults to agent) |
 
 ## CLI Reference
 
-### Maintenance Pipeline
+### Pipeline
 
 ```bash
-# Run full pipeline — create versioned branches from upstream commit
-releasy run --onto <sha>
+# Run the phased pipeline
+releasy run --onto <tag-or-sha> [--work-dir <path>]
 
 # Mark a conflict-resolved branch
 releasy continue --branch <branch-or-feature-id>
 
-# Skip a conflicted branch for this run
+# Skip a conflicted branch
 releasy skip --branch <branch-or-feature-id>
 
-# Abort current run, leave all branches as-is
+# Abort current run
 releasy abort
 
-# Print current pipeline state
+# Print current state
 releasy status
 ```
 
-### Release Construction
+### Global options
 
 ```bash
-releasy release \
-  --upstream-tag <tag> \
-  --name <branch-name> \
-  [--strict] \
-  [--include-skipped]
+releasy --config <path>    # config file (default: ./config.yaml)
+releasy --version
 ```
 
-Creates a release base branch and opens one PR per feature:
-
-1. Creates `<branch-name>` from the upstream tag
-2. Cherry-picks CI commits onto the base branch (infra, no PR needed)
-3. Pushes the base branch
-4. For each enabled feature:
-   - Creates `<branch-name>/feat/<feature-id>` with a single squashed commit
-   - Opens a PR targeting the base branch
-   - PR title: `[releasy] <id>: <description>`
-
-Each feature gets its own PR for independent review and CI. Merge PRs in config order (respecting `depends_on` if set).
-
-Flags:
-- `--strict` — abort if any enabled feature is not `ok`
-- `--include-skipped` — include `skipped` features in release
-
-If `RELEASY_GITHUB_TOKEN` is not set, branches are pushed but PRs are not created (manual PR creation required).
-
-### Feature Management
+### Feature management
 
 ```bash
 releasy feature add --id <id> --source-branch <branch> --description <desc>
@@ -169,58 +173,76 @@ releasy feature remove --id <id>
 releasy feature list
 ```
 
-## Pipeline Details
+### Release construction
 
-### Stage 1 — CI Branch
-
-1. Create `ci/<project>/<sha8>` from the upstream commit
-2. Find CI commits: on first run, uses `merge-base` between `source_branch` and upstream; on subsequent runs, uses the known base from state
-3. Cherry-pick CI commits onto the clean branch
-4. Push to fork remote
-
-If cherry-pick conflicts, the pipeline halts and Stage 2 is skipped.
-
-### Stage 2 — Feature Branches
-
-For each enabled feature:
-
-1. Create `feature/<project>/<id>/<sha8>` from the new CI branch
-2. Cherry-pick feature commits from the previous versioned branch (or `source_branch` on first run)
-3. Push to fork remote
-
-Conflicts on one feature do not block others.
-
-### Stage 3 — PR-Based Features (Bootstrap)
-
-If `pr_sources` is configured, the tool searches the fork repo for PRs matching each label. Only **new** PRs are processed here — PRs from a previous run already have a versioned branch in state and are handled by Stage 2.
-
-For each new PR:
-
-1. Create `feature/<project>/pr-<number>/<sha8>` from the CI branch
-2. Cherry-pick the PR's merge commit (`-m 1`) onto the feature branch
-   - Merged PRs: use the actual merge commit SHA
-   - Open PRs: fetch GitHub's auto-generated merge ref and cherry-pick it
-3. Push to fork remote
-
-After the first run, the PR feature behaves like a regular source-branch feature — Stage 2 cherry-picks from the previous versioned branch, preserving any conflict resolutions. The original PR title and description are stored in state and reused when creating release PRs.
+```bash
+releasy release \
+  --upstream-tag <tag> \
+  --name <branch-name> \
+  [--strict] \
+  [--include-skipped]
+```
 
 ## Conflict Resolution
 
-1. Check `STATUS.md` or `releasy status` for conflicted branches
-2. Resolve the conflict locally on the versioned branch, force-push
-3. Signal resolution: `releasy continue --branch <name-or-id>`
+On conflict, the pipeline stops and tells you exactly what to do:
 
-## GitHub Project Integration
+```
+✗ Conflict rebasing CI!
+  • cmake/autogenerated_versions.txt
 
-Optionally sync branch status to a GitHub Projects v2 board:
+  Resolve: cd /path/to/repo
+  Then: git add <files> && git rebase --continue
+  When done: releasy continue --branch ci/antalya-26.3
+```
 
-1. Create a project with a single-select **Status** field: `Ok`, `Conflict`, `Resolved`, `Skipped`, `Disabled`, `Pending`
-2. Set `notifications.github_project` in config
-3. Set `RELEASY_GITHUB_TOKEN` with `project` scope
+For PR-based features, conflict markers are committed as a WIP and pushed (if push enabled), so someone can resolve them via the PR.
+
+## Safety
+
+**PRs are never opened against upstream.** A hard safeguard in the code refuses to create any PR if the target repo matches the upstream remote.
 
 ## State Files
 
-- `state.yaml` — tracks current versioned branch names, base commits, and status
-- `STATUS.md` — human-readable status table
+- `state.yaml` — pipeline phase, branch names, statuses (auto-managed)
+- `STATUS.md` — human-readable status table (auto-managed)
+- `config.yaml` — your configuration (gitignored, not committed)
 
-Both are committed and pushed to this repository after each state change.
+## GitHub Project Integration
+
+Optionally sync branch status to a GitHub Projects v2 board. This is a one-time manual setup — after that, RelEasy keeps it in sync automatically.
+
+### Setup (one-time)
+
+1. **Create the project:** Go to `https://github.com/orgs/<your-org>/projects` → **New project** → choose **Table** layout. Name it e.g. "RelEasy Rebase Status".
+
+2. **Configure the Status field:** The project has a default "Status" field. Click the field header → **Edit field** → set the options to exactly:
+   - `Ok`
+   - `Conflict`
+   - `Resolved`
+   - `Skipped`
+   - `Disabled`
+   - `Pending`
+
+3. **Get the project URL:** Copy the URL from the browser, e.g. `https://github.com/orgs/Altinity/projects/1` (for personal repos: `https://github.com/users/yourname/projects/1`).
+
+4. **Token permissions:** Your `RELEASY_GITHUB_TOKEN` needs `repo` + `project` scopes (classic PAT), or "Projects" read/write permission (fine-grained PAT).
+
+5. **Add to config:**
+
+```yaml
+push: true    # project sync only runs when push is enabled
+
+notifications:
+  github_project: https://github.com/orgs/Altinity/projects/1
+```
+
+### What RelEasy does automatically
+
+After each state change (when `push: true`), RelEasy:
+- Creates a **draft issue card** for each branch (CI + each feature)
+- Sets the **Status** field to match the pipeline state
+- Updates the card body with upstream commit, conflicted files, etc.
+- On re-runs, replaces old cards with updated ones
+
+You don't need to create any cards manually.
