@@ -54,7 +54,7 @@ def run_git(
 
 
 def ensure_work_repo(config: Config, work_dir: Path) -> Path:
-    """Ensure a local clone of the fork exists and has the right remotes.
+    """Ensure a local clone of the origin repo exists and has the right remotes.
 
     If work_dir itself is a git repo, it is used directly.
     Otherwise, a clone is created at work_dir/repo.
@@ -66,17 +66,20 @@ def ensure_work_repo(config: Config, work_dir: Path) -> Path:
         repo_path = work_dir / "repo"
 
     if not (repo_path / ".git").exists():
-        run_git(["clone", config.fork.remote, "repo"], work_dir)
-        run_git(
-            ["remote", "add", config.upstream.remote_name, config.upstream.remote],
-            repo_path,
-            check=False,
-        )
+        run_git(["clone", config.origin.remote, "repo"], work_dir)
+        if config.upstream:
+            run_git(
+                ["remote", "add", config.upstream.remote_name, config.upstream.remote],
+                repo_path,
+                check=False,
+            )
     else:
-        for rname, rurl in [
-            (config.fork.remote_name, config.fork.remote),
-            (config.upstream.remote_name, config.upstream.remote),
-        ]:
+        remotes: list[tuple[str, str]] = [
+            (config.origin.remote_name, config.origin.remote),
+        ]
+        if config.upstream:
+            remotes.append((config.upstream.remote_name, config.upstream.remote))
+        for rname, rurl in remotes:
             result = run_git(["remote", "get-url", rname], repo_path, check=False)
             if result.returncode != 0:
                 run_git(["remote", "add", rname, rurl], repo_path, check=False)
@@ -94,8 +97,9 @@ def fetch_remote(repo_path: Path, remote_name: str) -> None:
 
 
 def fetch_all(config: Config, repo_path: Path) -> None:
-    fetch_remote(repo_path, config.upstream.remote_name)
-    fetch_remote(repo_path, config.fork.remote_name)
+    if config.upstream:
+        fetch_remote(repo_path, config.upstream.remote_name)
+    fetch_remote(repo_path, config.origin.remote_name)
 
 
 def stash_and_clean(repo_path: Path) -> None:
@@ -151,13 +155,13 @@ def ref_exists_locally(repo_path: Path, ref: str) -> bool:
 
 
 def force_push(
-    repo_path: Path, branch: str, remote: str, *, upstream_name: str = "upstream",
+    repo_path: Path, branch: str, remote: str, *, upstream_name: str | None = None,
 ) -> None:
     """Push a branch to a remote. Refuses to push to the upstream remote."""
-    if remote == upstream_name:
+    if upstream_name and remote == upstream_name:
         raise ValueError(
             f"CRITICAL: Refusing to push to upstream remote '{remote}'. "
-            "Pushes must only target the fork."
+            "Pushes must only target the origin."
         )
     run_git(["push", "--force", remote, branch], repo_path)
 

@@ -38,9 +38,9 @@ def parse_remote_url(url: str) -> tuple[str, str] | None:
     return None
 
 
-def get_fork_repo_slug(config: Config) -> str | None:
-    """Return 'owner/repo' for the fork remote from config."""
-    parsed = parse_remote_url(config.fork.remote)
+def get_origin_repo_slug(config: Config) -> str | None:
+    """Return 'owner/repo' for the origin remote from config."""
+    parsed = parse_remote_url(config.origin.remote)
     if not parsed:
         return None
     return f"{parsed[0]}/{parsed[1]}"
@@ -86,13 +86,15 @@ def commit_and_push_state(message: str, repo_dir: Path | None = None) -> bool:
 
 def _assert_not_upstream(config: Config, slug: str) -> None:
     """Hard safeguard: refuse to operate against the upstream repo."""
+    if not config.upstream:
+        return
     upstream_parsed = parse_remote_url(config.upstream.remote)
     if upstream_parsed:
         upstream_slug = f"{upstream_parsed[0]}/{upstream_parsed[1]}"
         if slug == upstream_slug:
             raise ValueError(
                 f"CRITICAL: Refusing to create PR against upstream repo '{slug}'. "
-                "PRs must only target the fork."
+                "PRs must only target the origin."
             )
 
 
@@ -103,10 +105,10 @@ def create_pull_request(
     title: str,
     body: str,
 ) -> str | None:
-    """Create a pull request on the fork repo.
+    """Create a pull request on the origin repo.
 
     Args:
-        config: Config with fork remote URL.
+        config: Config with origin remote URL.
         head: Source branch name.
         base: Target branch name.
         title: PR title.
@@ -120,9 +122,9 @@ def create_pull_request(
         log.warning("RELEASY_GITHUB_TOKEN not set — cannot create PR")
         return None
 
-    slug = get_fork_repo_slug(config)
+    slug = get_origin_repo_slug(config)
     if not slug:
-        log.warning("Could not parse fork remote URL: %s", config.fork.remote)
+        log.warning("Could not parse origin remote URL: %s", config.origin.remote)
         return None
 
     _assert_not_upstream(config, slug)
@@ -157,6 +159,71 @@ class PRInfo:
     head_sha: str
     url: str
     merged_at: str | None = None  # ISO timestamp of merge
+    labels: list[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.labels is None:
+            self.labels = []
+
+
+def parse_pr_url(url: str) -> int | None:
+    """Extract the PR number from a GitHub PR URL.
+
+    Accepts URLs like https://github.com/owner/repo/pull/123
+    """
+    m = re.match(r"https://github\.com/[^/]+/[^/]+/pull/(\d+)", url)
+    return int(m.group(1)) if m else None
+
+
+def fetch_pr_by_number(
+    config: Config,
+    number: int,
+    merged_only: bool = False,
+) -> PRInfo | None:
+    """Fetch a single PR by number from the origin repo."""
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set — cannot fetch PR")
+        return None
+
+    slug = get_origin_repo_slug(config)
+    if not slug:
+        log.warning("Could not parse origin remote URL: %s", config.origin.remote)
+        return None
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        pr = repo.get_pull(number)
+
+        if pr.merged:
+            pr_state = "merged"
+        elif pr.state == "open":
+            if merged_only:
+                return None
+            pr_state = "open"
+        else:
+            return None
+
+        return PRInfo(
+            number=pr.number,
+            title=pr.title,
+            body=pr.body or "",
+            state=pr_state,
+            merge_commit_sha=pr.merge_commit_sha if pr.merged else None,
+            head_sha=pr.head.sha,
+            url=pr.html_url,
+            merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
+            labels=[lbl.name for lbl in pr.labels],
+        )
+    except GithubException as exc:
+        log.warning("Failed to fetch PR #%d: %s", number, exc)
+        return None
+    except Exception as exc:
+        log.warning("Unexpected error fetching PR #%d: %s", number, exc)
+        return None
 
 
 def search_prs_by_labels(
@@ -164,7 +231,7 @@ def search_prs_by_labels(
     labels: list[str],
     merged_only: bool = False,
 ) -> list[PRInfo]:
-    """Search the fork repo for PRs that have ALL specified labels.
+    """Search the origin repo for PRs that have ALL specified labels.
 
     Returns PRs sorted by merge date (earliest first), with open PRs last.
     Skips closed-but-not-merged PRs.
@@ -175,9 +242,9 @@ def search_prs_by_labels(
         log.warning("RELEASY_GITHUB_TOKEN not set — cannot search PRs")
         return []
 
-    slug = get_fork_repo_slug(config)
+    slug = get_origin_repo_slug(config)
     if not slug:
-        log.warning("Could not parse fork remote URL: %s", config.fork.remote)
+        log.warning("Could not parse origin remote URL: %s", config.origin.remote)
         return []
 
     if not labels:
@@ -214,6 +281,7 @@ def search_prs_by_labels(
                 head_sha=pr.head.sha,
                 url=pr.html_url,
                 merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
+                labels=[lbl.name for lbl in pr.labels],
             ))
 
         # Merged PRs first in merge order, then open PRs by number.
@@ -528,7 +596,7 @@ def setup_project(config: Config) -> str | None:
         log.warning("RELEASY_GITHUB_TOKEN not set")
         return None
 
-    slug = get_fork_repo_slug(config)
+    slug = get_origin_repo_slug(config)
     if not slug:
         return None
     owner = slug.split("/")[0]

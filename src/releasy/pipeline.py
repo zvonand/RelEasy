@@ -19,7 +19,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from releasy.config import Config, FeatureConfig
+from releasy.config import Config, FeatureConfig, PRSourceConfig
 from releasy.git_ops import (
     branch_exists,
     cherry_pick_merge_commit,
@@ -38,8 +38,11 @@ from releasy.git_ops import (
     stash_and_clean,
 )
 from releasy.github_ops import (
+    PRInfo,
     commit_and_push_state,
     create_pull_request,
+    fetch_pr_by_number,
+    parse_pr_url,
     search_prs_by_labels,
     sync_project,
 )
@@ -91,7 +94,7 @@ def _setup_repo(config: Config, onto: str, work_dir: Path | None) -> Path:
     """Set up work repo and fetch remotes.
 
     Upstream is only fetched if the --onto ref isn't already available locally.
-    Origin (fork) is always fetched.
+    Origin is always fetched.
     """
     wd = config.resolve_work_dir(work_dir)
     console.print(f"[dim]Working directory: {wd}[/dim]")
@@ -104,7 +107,7 @@ def _setup_repo(config: Config, onto: str, work_dir: Path | None) -> Path:
         console.print(
             f"[dim]{onto} found locally — skipping upstream fetch[/dim]"
         )
-    else:
+    elif config.upstream:
         console.print(
             f"Fetching [cyan]{config.upstream.remote_name}[/cyan] "
             f"(need {onto})...", end=" ",
@@ -112,8 +115,8 @@ def _setup_repo(config: Config, onto: str, work_dir: Path | None) -> Path:
         fetch_remote(repo_path, config.upstream.remote_name)
         console.print("[green]done[/green]")
 
-    console.print(f"Fetching [cyan]{config.fork.remote_name}[/cyan]...", end=" ")
-    fetch_remote(repo_path, config.fork.remote_name)
+    console.print(f"Fetching [cyan]{config.origin.remote_name}[/cyan]...", end=" ")
+    fetch_remote(repo_path, config.origin.remote_name)
     console.print("[green]done[/green]")
 
     return repo_path
@@ -125,10 +128,10 @@ def _setup_repo(config: Config, onto: str, work_dir: Path | None) -> Path:
 
 
 def _push(config: Config, repo_path: Path, branch: str) -> None:
-    """Push a branch to the fork remote, with upstream safety check."""
+    """Push a branch to the origin remote, with upstream safety check."""
     force_push(
-        repo_path, branch, config.fork.remote_name,
-        upstream_name=config.upstream.remote_name,
+        repo_path, branch, config.origin.remote_name,
+        upstream_name=config.upstream.remote_name if config.upstream else None,
     )
 
 
@@ -139,7 +142,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
 
     base_branch = config.base_branch_name(onto)
     ci_branch = config.ci_branch_name(onto)
-    remote = config.fork.remote_name
+    remote = config.origin.remote_name
 
     # ── Phase 1a: Create base branch from upstream ──────────────────────
 
@@ -201,7 +204,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
                     f"{source_ref} and {onto}"
                 )
                 console.print(
-                    f"  [dim]Hint: does '{config.ci.source_branch}' exist on the fork?[/dim]"
+                    f"  [dim]Hint: does '{config.ci.source_branch}' exist on origin?[/dim]"
                 )
                 state.ci_branch = CIBranchState(status="conflict")
                 _update_state_and_status(config, state)
@@ -293,8 +296,10 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
             f"[cyan]{base_branch}[/cyan]"
         )
 
-        # --- PR-based features ---
-        for pr_source in config.pr_sources:
+        # --- PR-based features (set arithmetic) ---
+        # Step 1: Collect PRs from all sources (union)
+        collected: dict[int, tuple[PRInfo, PRSourceConfig]] = {}
+        for pr_source in config.pr_sources.by_labels:
             labels_str = ", ".join(pr_source.labels)
             filter_str = " (merged only)" if pr_source.merged_only else ""
             console.print(
@@ -308,110 +313,173 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
                 continue
 
             console.print(f"    Found {len(prs)} PR(s)")
-            existing_ids = {f.id for f in config.features}
-
             for pr in prs:
-                feature_id = f"pr-{pr.number}"
-                if feature_id in existing_ids:
-                    continue
+                if pr.number not in collected:
+                    collected[pr.number] = (pr, pr_source)
 
-                new_branch = config.feature_branch_name(feature_id, onto)
-                feat_exists = branch_exists(repo_path, new_branch, remote)
-                if feat_exists and pr_source.if_exists == "skip":
-                    console.print(
-                        f"\n    [cyan]{new_branch}[/cyan] (PR #{pr.number}: {pr.title})"
-                        f" — already exists, skipping"
-                    )
-                    continue
+        prs_cfg = config.pr_sources
+        include_pr_numbers = {
+            n for url in prs_cfg.include_prs if (n := parse_pr_url(url)) is not None
+        }
+        exclude_pr_numbers = {
+            n for url in prs_cfg.exclude_prs if (n := parse_pr_url(url)) is not None
+        }
 
-                desc = pr.title
-                if pr_source.description:
-                    desc = f"{pr_source.description}{pr.title}"
-
-                config.features.append(FeatureConfig(
-                    id=feature_id, description=desc,
-                    source_branch="", enabled=True,
-                ))
-                existing_ids.add(feature_id)
-
+        # Step 2: Remove PRs with excluded labels (unless explicitly included)
+        if prs_cfg.exclude_labels:
+            exclude_set = set(prs_cfg.exclude_labels)
+            before = len(collected)
+            collected = {
+                num: (pr, src)
+                for num, (pr, src) in collected.items()
+                if not (set(pr.labels) & exclude_set) or num in include_pr_numbers
+            }
+            removed = before - len(collected)
+            if removed:
                 console.print(
-                    f"\n  [cyan]{new_branch}[/cyan] (PR #{pr.number}: {pr.title})"
+                    f"\n  [dim]Excluded {removed} PR(s) by label filter "
+                    f"({', '.join(prs_cfg.exclude_labels)})[/dim]"
                 )
-                console.print(f"    PR: {pr.url}  [{pr.state}]")
 
-                pr_meta = {
-                    "pr_url": pr.url, "pr_number": pr.number,
-                    "pr_title": pr.title, "pr_body": pr.body,
-                }
-
-                stash_and_clean(repo_path)
-                create_branch_from_ref(repo_path, new_branch, base_branch)
-
-                if pr.state == "merged" and pr.merge_commit_sha:
-                    cp_result = cherry_pick_merge_commit(
-                        repo_path, pr.merge_commit_sha, abort_on_conflict=False,
-                    )
+        # Step 3: Add individually included PRs
+        if include_pr_numbers:
+            default_source = config.pr_sources.by_labels[0] if config.pr_sources.by_labels else PRSourceConfig(labels=[])
+            for pr_num in sorted(include_pr_numbers):
+                if pr_num in collected:
+                    continue
+                console.print(
+                    f"\n  Fetching explicitly included PR #{pr_num}..."
+                )
+                pr_info = fetch_pr_by_number(config, pr_num)
+                if pr_info:
+                    collected[pr_num] = (pr_info, default_source)
+                    console.print(f"    [green]✓[/green] {pr_info.title}")
                 else:
-                    if not fetch_pr_ref(repo_path, remote, pr.number):
-                        console.print(
-                            f"    [red]✗[/red] Could not fetch PR #{pr.number}"
-                        )
-                        state.features[feature_id] = FeatureState(
-                            status="conflict", branch_name=new_branch,
-                            base_commit=onto, **pr_meta,
-                        )
-                        _update_state_and_status(config, state)
-                        continue
-                    cp_result = cherry_pick_merge_commit(
-                        repo_path, "FETCH_HEAD", abort_on_conflict=False,
+                    console.print(
+                        f"    [red]✗[/red] Could not fetch PR #{pr_num}"
                     )
 
-                has_conflict = not cp_result.success
+        # Step 4: Remove individually excluded PRs
+        for pr_num in exclude_pr_numbers:
+            if pr_num in collected:
+                pr_info, _ = collected.pop(pr_num)
+                console.print(
+                    f"\n  [dim]Excluded PR #{pr_num} ({pr_info.title})[/dim]"
+                )
+
+        # Sort: merged first by merge date, then open by number
+        sorted_prs = sorted(
+            collected.values(),
+            key=lambda pair: (pair[0].merged_at or "9999", pair[0].number),
+        )
+
+        if not sorted_prs:
+            console.print(f"\n  [dim]No PRs to process after filtering[/dim]")
+
+        # Process final PR set
+        existing_ids = {f.id for f in config.features}
+        for pr, pr_source in sorted_prs:
+            feature_id = f"pr-{pr.number}"
+            if feature_id in existing_ids:
+                continue
+
+            new_branch = config.feature_branch_name(feature_id, onto)
+            feat_exists = branch_exists(repo_path, new_branch, remote)
+            if feat_exists and pr_source.if_exists == "skip":
+                console.print(
+                    f"\n    [cyan]{new_branch}[/cyan] (PR #{pr.number}: {pr.title})"
+                    f" — already exists, skipping"
+                )
+                continue
+
+            desc = pr.title
+            if pr_source.description:
+                desc = f"{pr_source.description}{pr.title}"
+
+            config.features.append(FeatureConfig(
+                id=feature_id, description=desc,
+                source_branch="", enabled=True,
+            ))
+            existing_ids.add(feature_id)
+
+            console.print(
+                f"\n  [cyan]{new_branch}[/cyan] (PR #{pr.number}: {pr.title})"
+            )
+            console.print(f"    PR: {pr.url}  [{pr.state}]")
+
+            pr_meta = {
+                "pr_url": pr.url, "pr_number": pr.number,
+                "pr_title": pr.title, "pr_body": pr.body,
+            }
+
+            stash_and_clean(repo_path)
+            create_branch_from_ref(repo_path, new_branch, base_branch)
+
+            if pr.state == "merged" and pr.merge_commit_sha:
+                cp_result = cherry_pick_merge_commit(
+                    repo_path, pr.merge_commit_sha, abort_on_conflict=False,
+                )
+            else:
+                if not fetch_pr_ref(repo_path, remote, pr.number):
+                    console.print(
+                        f"    [red]✗[/red] Could not fetch PR #{pr.number}"
+                    )
+                    state.features[feature_id] = FeatureState(
+                        status="conflict", branch_name=new_branch,
+                        base_commit=onto, **pr_meta,
+                    )
+                    _update_state_and_status(config, state)
+                    continue
+                cp_result = cherry_pick_merge_commit(
+                    repo_path, "FETCH_HEAD", abort_on_conflict=False,
+                )
+
+            has_conflict = not cp_result.success
+            if has_conflict:
+                console.print(f"    [red]✗[/red] Conflict!")
+                for cf in cp_result.conflict_files:
+                    console.print(f"      [red]•[/red] {cf}")
+                commit_conflict_markers(repo_path)
+                console.print(
+                    f"    [yellow]↑[/yellow] Committed conflict markers as WIP"
+                )
+
+            if config.push:
+                _push(config, repo_path, new_branch)
+                console.print(
+                    f"    [green]✓[/green] Pushed [cyan]{new_branch}[/cyan]"
+                )
+            else:
+                console.print(f"    [dim]Skipping push[/dim]")
+
+            fs_status = "conflict" if has_conflict else "ok"
+            state.features[feature_id] = FeatureState(
+                status=fs_status, branch_name=new_branch, base_commit=onto,
+                conflict_files=cp_result.conflict_files if has_conflict else [],
+                **pr_meta,
+            )
+
+            if config.push and pr_source.auto_pr:
+                pr_title = f"[releasy] {pr.title}"
+                body_parts = []
                 if has_conflict:
-                    console.print(f"    [red]✗[/red] Conflict!")
-                    for cf in cp_result.conflict_files:
-                        console.print(f"      [red]•[/red] {cf}")
-                    commit_conflict_markers(repo_path)
-                    console.print(
-                        f"    [yellow]↑[/yellow] Committed conflict markers as WIP"
+                    body_parts.append(
+                        "> **WARNING:** Unresolved conflict markers.\n"
                     )
-
-                if config.push:
-                    _push(config, repo_path, new_branch)
-                    console.print(
-                        f"    [green]✓[/green] Pushed [cyan]{new_branch}[/cyan]"
-                    )
-                else:
-                    console.print(f"    [dim]Skipping push[/dim]")
-
-                fs_status = "conflict" if has_conflict else "ok"
-                state.features[feature_id] = FeatureState(
-                    status=fs_status, branch_name=new_branch, base_commit=onto,
-                    conflict_files=cp_result.conflict_files if has_conflict else [],
-                    **pr_meta,
+                body_parts.append(f"Cherry-picked from #{pr.number}.")
+                if pr.body:
+                    body_parts.append(f"\n---\n\n{pr.body}")
+                rebase_pr_url = create_pull_request(
+                    config, new_branch, base_branch,
+                    pr_title, "\n".join(body_parts),
                 )
-
-                if config.push and pr_source.auto_pr:
-                    pr_title = f"[releasy] {pr.title}"
-                    body_parts = []
-                    if has_conflict:
-                        body_parts.append(
-                            "> **WARNING:** Unresolved conflict markers.\n"
-                        )
-                    body_parts.append(f"Cherry-picked from #{pr.number}.")
-                    if pr.body:
-                        body_parts.append(f"\n---\n\n{pr.body}")
-                    rebase_pr_url = create_pull_request(
-                        config, new_branch, base_branch,
-                        pr_title, "\n".join(body_parts),
+                if rebase_pr_url:
+                    state.features[feature_id].rebase_pr_url = rebase_pr_url
+                    console.print(
+                        f"    [green]✓[/green] PR opened: {rebase_pr_url}"
                     )
-                    if rebase_pr_url:
-                        state.features[feature_id].rebase_pr_url = rebase_pr_url
-                        console.print(
-                            f"    [green]✓[/green] PR opened: {rebase_pr_url}"
-                        )
 
-                _update_state_and_status(config, state)
+            _update_state_and_status(config, state)
 
         # --- Static feature branches ---
         for feat in config.enabled_features:
@@ -493,7 +561,7 @@ def run_pipeline(config: Config, onto: str, work_dir: Path | None = None) -> Pip
                 status="ok", branch_name=new_branch, base_commit=onto,
             )
 
-            if config.push and any(ps.auto_pr for ps in config.pr_sources):
+            if config.push and any(ps.auto_pr for ps in config.pr_sources.by_labels):
                 pr_title = f"[releasy] {feat.id}: {feat.description}"
                 rebase_pr_url = create_pull_request(
                     config, new_branch, base_branch, pr_title,

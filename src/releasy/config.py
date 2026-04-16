@@ -33,7 +33,7 @@ class UpstreamConfig:
 
 
 @dataclass
-class ForkConfig:
+class OriginConfig:
     remote: str
     remote_name: str = "origin"
 
@@ -64,17 +64,29 @@ class PRSourceConfig:
 
 
 @dataclass
+class PRSourcesConfig:
+    """PR discovery and filtering.
+
+    Set arithmetic: union(by_labels) − exclude_labels + include_prs − exclude_prs
+    """
+    by_labels: list[PRSourceConfig] = field(default_factory=list)
+    exclude_labels: list[str] = field(default_factory=list)
+    include_prs: list[str] = field(default_factory=list)
+    exclude_prs: list[str] = field(default_factory=list)
+
+
+@dataclass
 class NotificationsConfig:
     github_project: str | None = None
 
 
 @dataclass
 class Config:
-    upstream: UpstreamConfig
-    fork: ForkConfig
+    origin: OriginConfig
     ci: CIConfig
+    upstream: UpstreamConfig | None = None
     features: list[FeatureConfig] = field(default_factory=list)
-    pr_sources: list[PRSourceConfig] = field(default_factory=list)
+    pr_sources: PRSourcesConfig = field(default_factory=PRSourcesConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     config_path: Path = field(default_factory=lambda: Path.cwd() / "config.yaml")
     work_dir: Path | None = None
@@ -158,15 +170,18 @@ def load_config(config_path: Path | None = None) -> Config:
     if not raw:
         raise ValueError("Config file is empty")
 
-    upstream = UpstreamConfig(
-        remote=raw["upstream"]["remote"],
-        remote_name=raw["upstream"].get("remote_name", "upstream"),
+    origin = OriginConfig(
+        remote=raw["origin"]["remote"],
+        remote_name=raw["origin"].get("remote_name", "origin"),
     )
 
-    fork = ForkConfig(
-        remote=raw["fork"]["remote"],
-        remote_name=raw["fork"].get("remote_name", "origin"),
-    )
+    upstream_raw = raw.get("upstream")
+    upstream = None
+    if upstream_raw:
+        upstream = UpstreamConfig(
+            remote=upstream_raw["remote"],
+            remote_name=upstream_raw.get("remote_name", "upstream"),
+        )
 
     ci_raw = raw.get("ci", {})
     ci = CIConfig(
@@ -187,20 +202,27 @@ def load_config(config_path: Path | None = None) -> Config:
             )
         )
 
-    pr_sources = []
-    for ps_raw in raw.get("pr_sources", []):
-        raw_labels = ps_raw.get("labels", [])
+    ps_raw = raw.get("pr_sources", {})
+    by_labels = []
+    for entry in ps_raw.get("by_labels", []):
+        raw_labels = entry.get("labels", [])
         if isinstance(raw_labels, str):
             raw_labels = [raw_labels]
-        pr_sources.append(
+        by_labels.append(
             PRSourceConfig(
                 labels=raw_labels,
-                description=ps_raw.get("description", ""),
-                merged_only=ps_raw.get("merged_only", False),
-                auto_pr=ps_raw.get("auto_pr", False),
-                if_exists=ps_raw.get("if_exists", "skip"),
+                description=entry.get("description", ""),
+                merged_only=entry.get("merged_only", False),
+                auto_pr=entry.get("auto_pr", False),
+                if_exists=entry.get("if_exists", "skip"),
             )
         )
+    pr_sources = PRSourcesConfig(
+        by_labels=by_labels,
+        exclude_labels=ps_raw.get("exclude_labels", []),
+        include_prs=ps_raw.get("include_prs", []),
+        exclude_prs=ps_raw.get("exclude_prs", []),
+    )
 
     notifications = NotificationsConfig(
         github_project=raw.get("notifications", {}).get("github_project"),
@@ -210,9 +232,9 @@ def load_config(config_path: Path | None = None) -> Config:
     work_dir = Path(raw_work_dir).resolve() if raw_work_dir else None
 
     return Config(
-        upstream=upstream,
-        fork=fork,
+        origin=origin,
         ci=ci,
+        upstream=upstream,
         features=features,
         pr_sources=pr_sources,
         notifications=notifications,
@@ -228,57 +250,71 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         config_path = config.config_path
 
     data: dict = {
-        "upstream": {
+        "origin": {
+            "remote": config.origin.remote,
+            "remote_name": config.origin.remote_name,
+        },
+    }
+
+    if config.upstream:
+        data["upstream"] = {
             "remote": config.upstream.remote,
             "remote_name": config.upstream.remote_name,
-        },
-        "fork": {
-            "remote": config.fork.remote,
-            "remote_name": config.fork.remote_name,
-        },
-        "ci": {
+        }
+
+    data["ci"] = {
+        k: v
+        for k, v in {
+            "branch_prefix": config.ci.branch_prefix,
+            "source_branch": config.ci.source_branch,
+            "if_exists": config.ci.if_exists if config.ci.if_exists != "skip" else None,
+        }.items()
+        if v is not None
+    }
+
+    data["features"] = [
+        {
             k: v
             for k, v in {
-                "branch_prefix": config.ci.branch_prefix,
-                "source_branch": config.ci.source_branch,
-                "if_exists": config.ci.if_exists if config.ci.if_exists != "skip" else None,
+                "id": f.id,
+                "description": f.description,
+                "source_branch": f.source_branch,
+                "enabled": f.enabled,
+                "depends_on": f.depends_on or None,
             }.items()
             if v is not None
-        },
-        "features": [
-            {
-                k: v
-                for k, v in {
-                    "id": f.id,
-                    "description": f.description,
-                    "source_branch": f.source_branch,
-                    "enabled": f.enabled,
-                    "depends_on": f.depends_on or None,
-                }.items()
-                if v is not None
-            }
-            for f in config.features
-        ],
-    }
+        }
+        for f in config.features
+    ]
 
     if config.work_dir:
         data["work_dir"] = str(config.work_dir)
 
-    if config.pr_sources:
-        data["pr_sources"] = [
-            {
-                k: v
-                for k, v in {
-                    "labels": ps.labels,
-                    "description": ps.description or None,
-                    "merged_only": ps.merged_only or None,
-                    "auto_pr": ps.auto_pr or None,
-                    "if_exists": ps.if_exists if ps.if_exists != "skip" else None,
-                }.items()
-                if v is not None
-            }
-            for ps in config.pr_sources
-        ]
+    ps = config.pr_sources
+    if ps.by_labels or ps.exclude_labels or ps.include_prs or ps.exclude_prs:
+        ps_data: dict = {}
+        if ps.by_labels:
+            ps_data["by_labels"] = [
+                {
+                    k: v
+                    for k, v in {
+                        "labels": entry.labels,
+                        "description": entry.description or None,
+                        "merged_only": entry.merged_only or None,
+                        "auto_pr": entry.auto_pr or None,
+                        "if_exists": entry.if_exists if entry.if_exists != "skip" else None,
+                    }.items()
+                    if v is not None
+                }
+                for entry in ps.by_labels
+            ]
+        if ps.exclude_labels:
+            ps_data["exclude_labels"] = ps.exclude_labels
+        if ps.include_prs:
+            ps_data["include_prs"] = ps.include_prs
+        if ps.exclude_prs:
+            ps_data["exclude_prs"] = ps.exclude_prs
+        data["pr_sources"] = ps_data
 
     if config.notifications.github_project:
         data["notifications"] = {"github_project": config.notifications.github_project}

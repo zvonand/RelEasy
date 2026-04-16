@@ -4,20 +4,24 @@
 # push: true
 
 # ── Work directory ──────────────────────────────────────────────────
-# Where to clone/find the fork repo for git operations.
+# Where to clone/find the origin repo for git operations.
 # If it points to an existing git repo, it will be reused (no clone).
 # If omitted, uses the current working directory.
 # Can also be overridden with --work-dir on the CLI.
 # work_dir: /path/to/ClickHouse
 
-# ── Upstream & Fork ─────────────────────────────────────────────────
+# ── Origin (required) ──────────────────────────────────────────────
+# The fork / repo you work against. This is mandatory.
+origin:
+  remote: https://github.com/Altinity/ClickHouse.git
+  remote_name: origin
+
+# ── Upstream (optional) ────────────────────────────────────────────
+# The upstream repo. Omit this section entirely if you're forward-porting
+# or back-porting within your own fork and there's no separate upstream.
 upstream:
   remote: https://github.com/ClickHouse/ClickHouse.git
   remote_name: upstream
-
-fork:
-  remote: https://github.com/Altinity/ClickHouse.git
-  remote_name: origin
 
 # ── CI configuration ───────────────────────────────────────────────
 # branch_prefix: used to derive the project name and branch names.
@@ -26,7 +30,7 @@ fork:
 #   CI branch:      ci/antalya-26.3
 #   Feature branch: feature/antalya-26.3/<id>
 #
-# source_branch: the branch on the fork containing CI/infra commits.
+# source_branch: the branch on the origin containing CI/infra commits.
 #   If omitted or empty, CI rebase is skipped entirely — useful when
 #   someone else has already rebased CI and you only need features.
 #
@@ -64,23 +68,50 @@ features:
   #   depends_on: [s3-disk]
   #   enabled: true
 
-# ── PR-based features ──────────────────────────────────────────────
-# Discover PRs in the fork repo by labels (AND logic — PR must have
-# ALL listed labels). Each matching PR becomes its own feature branch.
+# ── PR sources ────────────────────────────────────────────────────
+# Discover, include, and exclude PRs from the origin repo.
+# Each matching PR becomes its own feature branch.
+# Requires RELEASY_GITHUB_TOKEN.
 #
-# merged_only: true — skip open PRs, only cherry-pick merged ones.
-# auto_pr: true — auto-create a PR from the feature branch into the
-#   base branch (requires push: true).
-# if_exists: skip|redo — same as ci.if_exists but per PR source.
+# Set arithmetic (evaluated in order):
+#
+#   union(by_labels) − exclude_labels + include_prs − exclude_prs
+#
+# by_labels — label-based discovery. Each entry uses AND logic (PR
+#   must carry ALL listed labels). Multiple entries are unioned.
+#   Per-entry options:
+#     merged_only: true — skip open PRs, only cherry-pick merged ones.
+#     auto_pr: true — auto-create a PR into the base branch (needs push: true).
+#     if_exists: skip|redo — same as ci.if_exists but per label group.
+#     description: prefix prepended to the PR title for the feature name.
+#
+# exclude_labels — drop any PR carrying at least one of these labels,
+#   even if it matched a by_labels entry.
+#
+# include_prs — always include these PRs by URL, even if they don't
+#   match any labels or carry an excluded label.
+#
+# exclude_prs — always exclude these PRs by URL. Final override —
+#   a PR listed here is never processed.
 #
 # PRs are processed in merge order (earliest merged first).
-# Requires RELEASY_GITHUB_TOKEN.
+#
 # pr_sources:
-#   - labels: ["forward-port", "v26.1"]
-#     description: "Forward-ported changes"
-#     merged_only: true
-#     auto_pr: true
-#     if_exists: skip
+#   by_labels:
+#     - labels: ["forward-port", "v26.1"]
+#       description: "Forward-ported changes"
+#       merged_only: true
+#       auto_pr: true
+#       if_exists: skip
+#
+#   exclude_labels: ["do-not-port", "wontfix"]
+#
+#   include_prs:
+#     - https://github.com/Altinity/ClickHouse/pull/123
+#     - https://github.com/Altinity/ClickHouse/pull/456
+#
+#   exclude_prs:
+#     - https://github.com/Altinity/ClickHouse/pull/789
 
 # ── GitHub Project board ────────────────────────────────────────────
 # Sync branch status to a GitHub Project v2 board (optional).

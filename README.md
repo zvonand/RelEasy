@@ -2,7 +2,7 @@
 
 CLI tool for managing fork rebases, feature branches, and release construction.
 
-RelEasy automates maintaining a fork against upstream. Instead of rebasing long-lived branches (which accumulates conflicts), it creates a **base branch** from an upstream tag/commit, rebases CI and features on top, and opens PRs — all in a phased, resumable workflow.
+RelEasy automates maintaining a repo (typically a fork) against an optional upstream. Instead of rebasing long-lived branches (which accumulates conflicts), it creates a **base branch** from a tag/commit, rebases CI and features on top, and opens PRs — all in a phased, resumable workflow.
 
 ## How It Works
 
@@ -90,11 +90,13 @@ push: true
 # Reuse an existing local clone
 work_dir: /path/to/ClickHouse
 
+# Origin (required) — the repo you work against
+origin:
+  remote: https://github.com/Altinity/ClickHouse.git
+
+# Upstream (optional) — omit if porting within your own repo
 upstream:
   remote: https://github.com/ClickHouse/ClickHouse.git
-
-fork:
-  remote: https://github.com/Altinity/ClickHouse.git
 
 ci:
   branch_prefix: ci/antalya
@@ -107,12 +109,21 @@ features:
     description: "Custom S3 disk improvements"
     source_branch: feature/antalya-s3-disk
 
-# PR-based features — discovered by labels (AND logic)
+# PR discovery and filtering
+# Set arithmetic: union(by_labels) − exclude_labels + include_prs − exclude_prs
 pr_sources:
-  - labels: ["forward-port", "v26.3"]
-    merged_only: true
-    auto_pr: true
-    if_exists: skip
+  by_labels:
+    - labels: ["forward-port", "v26.3"]
+      merged_only: true
+      auto_pr: true
+
+  exclude_labels: ["do-not-port"]
+
+  include_prs:
+    - https://github.com/Altinity/ClickHouse/pull/123
+
+  exclude_prs:
+    - https://github.com/Altinity/ClickHouse/pull/789
 ```
 
 ### Key config options
@@ -121,12 +132,16 @@ pr_sources:
 |--------|-------------|---------|
 | `push` | Push branches and open PRs | `false` |
 | `work_dir` | Path to existing repo clone (or where to clone) | cwd |
-| `ci.source_branch` | Branch with CI commits; empty = skip CI rebase | required |
+| `origin.remote` | Origin repo URL (required) | — |
+| `upstream.remote` | Upstream repo URL (optional) | — |
+| `ci.source_branch` | Branch with CI commits; empty = skip CI rebase | — |
 | `ci.if_exists` | `skip` or `redo` when branch exists | `skip` |
-| `pr_sources[].labels` | Labels a PR must have (ALL required) | — |
-| `pr_sources[].merged_only` | Only include merged PRs | `false` |
-| `pr_sources[].auto_pr` | Auto-create PR into base branch | `false` |
-| `pr_sources[].if_exists` | `skip` or `redo` for feature branches | `skip` |
+| `pr_sources.by_labels[].labels` | Labels a PR must have (AND logic) | — |
+| `pr_sources.by_labels[].merged_only` | Only include merged PRs | `false` |
+| `pr_sources.by_labels[].auto_pr` | Auto-create PR into base branch | `false` |
+| `pr_sources.exclude_labels` | Drop PRs carrying any of these labels | `[]` |
+| `pr_sources.include_prs` | Always include these PRs (by URL) | `[]` |
+| `pr_sources.exclude_prs` | Always exclude these PRs (by URL) | `[]` |
 
 ### Environment variables
 
@@ -200,7 +215,7 @@ For PR-based features, conflict markers are committed as a WIP and pushed (if pu
 
 ## Safety
 
-**PRs are never opened against upstream.** A hard safeguard in the code refuses to create any PR if the target repo matches the upstream remote.
+**PRs are never opened against upstream.** When an upstream is configured, a hard safeguard in the code refuses to create any PR if the target repo matches the upstream remote.
 
 ## State Files
 

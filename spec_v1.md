@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-A standalone CLI tool that manages rebasing a fork's branches onto a specified upstream commit/tag. Instead of rebasing long-lived branches in place, it creates a **base branch** from upstream, rebases CI and features on top via a **phased pipeline**, and optionally opens PRs.
+A standalone CLI tool that manages rebasing branches onto a specified commit/tag. Instead of rebasing long-lived branches in place, it creates a **base branch** from the target ref, rebases CI and features on top via a **phased pipeline**, and optionally opens PRs. Works with a fork against an upstream, or within a single repo for forward-porting/back-porting.
 
 The pipeline is **resumable**: state is persisted between runs, and each `releasy run` picks up from where the previous run stopped.
 
@@ -12,7 +12,7 @@ The pipeline is **resumable**: state is persisted between runs, and each `releas
 
 ```
 releasy/
-├── config.yaml        ← fork description, upstream URL, features (gitignored)
+├── config.yaml        ← origin/upstream URLs, features, PR sources (gitignored)
 ├── config.yaml.example ← documented template
 ├── state.yaml         ← persisted pipeline state (auto-managed)
 ├── STATUS.md          ← human-readable branch status table (auto-managed)
@@ -45,13 +45,15 @@ Branch names are derived from the upstream ref:
 push: false              # push branches and open PRs (default: false)
 work_dir: /path/to/repo  # path to existing clone or where to clone
 
+# Origin (required) — the repo you work against
+origin:
+  remote: https://github.com/Altinity/ClickHouse.git
+  remote_name: origin
+
+# Upstream (optional) — omit entirely if porting within origin
 upstream:
   remote: https://github.com/ClickHouse/ClickHouse.git
   remote_name: upstream
-
-fork:
-  remote: https://github.com/Altinity/ClickHouse.git
-  remote_name: origin
 
 ci:
   branch_prefix: ci/antalya
@@ -69,12 +71,23 @@ features:
     depends_on: [s3-disk]
     enabled: true
 
+# PR discovery and filtering
+# Set arithmetic: union(by_labels) − exclude_labels + include_prs − exclude_prs
 pr_sources:
-  - labels: ["forward-port", "v26.3"]
-    description: "Forward-ported changes"
-    merged_only: true
-    auto_pr: true
-    if_exists: skip
+  by_labels:
+    - labels: ["forward-port", "v26.3"]
+      description: "Forward-ported changes"
+      merged_only: true
+      auto_pr: true
+      if_exists: skip
+
+  exclude_labels: ["do-not-port"]
+
+  include_prs:
+    - https://github.com/Altinity/ClickHouse/pull/123
+
+  exclude_prs:
+    - https://github.com/Altinity/ClickHouse/pull/789
 
 notifications:
   github_project: https://github.com/orgs/Altinity/projects/1
@@ -83,11 +96,14 @@ notifications:
 **Notes:**
 - `push: false` (default) keeps everything local — no branches pushed, no PRs created, no project board sync.
 - `work_dir` can point to an existing git clone. If the directory has a `.git`, it's used directly (no clone).
-- `ci.source_branch` empty or omitted → CI rebase phase is skipped entirely. Useful when CI is rebased by another person and you only need features.
-- `ci.if_exists` / `pr_sources[].if_exists`: `skip` (default) leaves existing branches alone; `redo` recreates from scratch.
-- `pr_sources[].labels`: AND logic — a PR must have ALL listed labels.
-- `pr_sources[].merged_only`: skip open PRs, only process merged ones.
-- `pr_sources[].auto_pr`: auto-create a PR from the feature branch into the base branch.
+- `origin` is required — the repo where branches are pushed and PRs are created.
+- `upstream` is optional — omit it when forward-porting or back-porting within your own repo.
+- `ci.source_branch` empty or omitted → CI rebase phase is skipped entirely.
+- `ci.if_exists` / `by_labels[].if_exists`: `skip` (default) leaves existing branches alone; `redo` recreates from scratch.
+- `pr_sources.by_labels[].labels`: AND logic — a PR must have ALL listed labels. Multiple `by_labels` entries are unioned.
+- `pr_sources.exclude_labels`: any PR carrying at least one of these labels is dropped (unless it appears in `include_prs`).
+- `pr_sources.include_prs`: always include these PRs by URL, regardless of labels.
+- `pr_sources.exclude_prs`: always exclude these PRs by URL — final override.
 - PRs are processed in merge order (earliest merged first).
 - `enabled: false` excludes a feature from the pipeline entirely.
 - `depends_on` declares inter-feature dependencies (manual ordering in v1).
@@ -115,10 +131,10 @@ The pipeline runs in phases. State is saved after each phase so it can be resume
 
 ### Phase 1a — Create Base Branch
 
-1. Fetch upstream and fork remotes.
+1. Fetch upstream (if configured) and origin remotes.
 2. Parse the `--onto` ref to derive the version suffix (e.g. `v26.3.4.234-lts` → `26.3`).
-3. Create base branch `<project>-<version>` from the upstream ref.
-4. Push to fork (if `push: true`).
+3. Create base branch `<project>-<version>` from the target ref.
+4. Push to origin (if `push: true`).
 5. Save state: `phase = base_created`.
 
 ---
@@ -144,7 +160,14 @@ Runs when `phase = ci_rebased` (or `ci_merged`).
 
 #### PR-based features
 
-For each `pr_source`, search for PRs matching all labels (GitHub API). For each new PR:
+PRs are collected and filtered using set arithmetic:
+
+1. **Collect:** For each `by_labels` entry, search GitHub for PRs matching all labels (Issues API, AND logic). Union the results.
+2. **Exclude by label:** Remove any PR carrying at least one `exclude_labels` label (unless it's in `include_prs`).
+3. **Include individual PRs:** Fetch any `include_prs` URLs not already in the set.
+4. **Exclude individual PRs:** Remove any `exclude_prs` URLs — final override.
+
+For each PR in the filtered set:
 
 1. Create feature branch `feature/<project>-<version>/pr-<N>` from base.
 2. Cherry-pick the merge commit (`-m 1`).
@@ -184,7 +207,7 @@ Marks a branch as skipped (excluded from releases unless `--include-skipped`).
 
 ## 8. Safety: Upstream PR Protection
 
-`create_pull_request` has a **hard safeguard**: before creating any PR, it compares the fork repo slug against the upstream remote. If they match, it raises a `ValueError` and refuses. This is a structural guarantee — no code path can ever open a PR against upstream.
+When an upstream is configured, `create_pull_request` has a **hard safeguard**: before creating any PR, it compares the origin repo slug against the upstream remote. If they match, it raises a `ValueError` and refuses. When no upstream is configured, this check is skipped (origin is the only repo).
 
 ---
 

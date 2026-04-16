@@ -146,13 +146,13 @@ def build_release(
     from releasy.git_ops import fetch_remote, ref_exists_locally
     if ref_exists_locally(repo_path, upstream_tag):
         console.print(f"[dim]{upstream_tag} found locally — skipping upstream fetch[/dim]")
-    else:
+    elif config.upstream:
         console.print(f"Fetching [cyan]{config.upstream.remote_name}[/cyan]...", end=" ")
         fetch_remote(repo_path, config.upstream.remote_name)
         console.print("[green]done[/green]")
 
-    console.print(f"Fetching [cyan]{config.fork.remote_name}[/cyan]...", end=" ")
-    fetch_remote(repo_path, config.fork.remote_name)
+    console.print(f"Fetching [cyan]{config.origin.remote_name}[/cyan]...", end=" ")
+    fetch_remote(repo_path, config.origin.remote_name)
     console.print("[green]done[/green]")
 
     # --- Step 1: Create release base branch from upstream tag ---
@@ -176,7 +176,7 @@ def build_release(
             f"\n[bold]Applying CI commits[/bold] from [cyan]{ci_state.branch_name}[/cyan]"
         )
         ci_tip = get_branch_tip(
-            repo_path, f"{config.fork.remote_name}/{ci_state.branch_name}"
+            repo_path, f"{config.origin.remote_name}/{ci_state.branch_name}"
         )
         n_ci = count_commits(repo_path, ci_state.base_commit, ci_tip)
         if n_ci > 0:
@@ -195,8 +195,8 @@ def build_release(
     # --- Step 3: Push the base release branch ---
     if config.push:
         console.print(f"\n[bold]Pushing base branch[/bold] [cyan]{branch_name}[/cyan]")
-        force_push(repo_path, branch_name, config.fork.remote_name,
-                   upstream_name=config.upstream.remote_name)
+        force_push(repo_path, branch_name, config.origin.remote_name,
+                   upstream_name=config.upstream.remote_name if config.upstream else None)
         console.print(f"  [green]✓[/green] Pushed")
     else:
         console.print(f"\n[dim]Skipping push of base branch (push not enabled)[/dim]")
@@ -215,13 +215,13 @@ def build_release(
         feat_pr_branch = _feature_pr_branch(branch_name, feat.id)
         console.print(f"\n  [cyan]{feat_pr_branch}[/cyan] ({feat.id}: {feat.description})")
 
-        feat_remote_ref = f"{config.fork.remote_name}/{fs.branch_name}"
+        feat_remote_ref = f"{config.origin.remote_name}/{fs.branch_name}"
         feat_tip = get_branch_tip(repo_path, feat_remote_ref)
 
         # Feature-only commits: everything on the feature branch after the CI branch tip
         ci_at_feat_time = get_branch_tip(
             repo_path,
-            f"{config.fork.remote_name}/{ci_state.branch_name}"
+            f"{config.origin.remote_name}/{ci_state.branch_name}"
             if ci_state.branch_name
             else fs.base_commit,
         )
@@ -274,8 +274,8 @@ def build_release(
 
         pr_url = None
         if config.push:
-            force_push(repo_path, feat_pr_branch, config.fork.remote_name,
-                       upstream_name=config.upstream.remote_name)
+            force_push(repo_path, feat_pr_branch, config.origin.remote_name,
+                       upstream_name=config.upstream.remote_name if config.upstream else None)
             console.print(f"    [green]✓[/green] Pushed ({n_feat} commits squashed into 1)")
 
             original_body = fs.pr_body if fs.pr_body else None
