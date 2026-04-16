@@ -1,6 +1,6 @@
 """Release branch construction — PR-per-feature workflow.
 
-Creates a base release branch (upstream tag + CI commits), then for each
+Creates a base release branch directly from an upstream tag, then for each
 enabled feature creates a separate branch with a single squashed commit
 and opens a GitHub PR targeting the release branch.
 """
@@ -15,11 +15,9 @@ from releasy.config import Config, FeatureConfig
 from releasy.git_ops import (
     get_conflict_files,
     run_git,
-    cherry_pick_range,
     count_commits,
     create_branch_from_ref,
     ensure_work_repo,
-    fetch_all,
     force_push,
     get_branch_tip,
     resolve_ref,
@@ -82,13 +80,12 @@ def build_release(
 
     Steps:
     1. Pre-flight checks on feature status
-    2. Create release base branch from upstream tag + CI commits
+    2. Create release base branch directly from upstream tag
     3. Push the base branch
     4. For each feature: create a branch with squashed commit, push, open PR
     """
     state = load_state(config.repo_dir)
 
-    # Synthesize FeatureConfig for PR-sourced features found in state
     existing_ids = {f.id for f in config.features}
     for fid, fs in state.features.items():
         if fs.pr_number and fid not in existing_ids:
@@ -99,7 +96,6 @@ def build_release(
                 enabled=True,
             ))
 
-    # --- Pre-flight checks ---
     warnings = []
     for feat in config.enabled_features:
         fs = state.features.get(feat.id)
@@ -135,11 +131,10 @@ def build_release(
             continue
         features_to_include.append(feat)
 
-    # --- Set up working repo ---
     work_dir = config.resolve_work_dir(work_dir)
     console.print(f"[dim]Working directory: {work_dir}[/dim]")
 
-    console.print(f"[dim]Setting up repository...[/dim]")
+    console.print("[dim]Setting up repository...[/dim]")
     repo_path = ensure_work_repo(config, work_dir)
     console.print(f"[dim]Repo: {repo_path}[/dim]")
 
@@ -155,7 +150,6 @@ def build_release(
     fetch_remote(repo_path, config.origin.remote_name)
     console.print("[green]done[/green]")
 
-    # --- Step 1: Create release base branch from upstream tag ---
     console.print(
         f"\n[bold]Creating release branch[/bold] [cyan]{branch_name}[/cyan] "
         f"from tag [yellow]{upstream_tag}[/yellow]"
@@ -169,42 +163,19 @@ def build_release(
     create_branch_from_ref(repo_path, branch_name, tag_sha)
     console.print(f"  [green]✓[/green] Branch created at {tag_sha[:12]}")
 
-    # --- Step 2: Apply CI commits to the base branch ---
-    ci_state = state.ci_branch
-    if ci_state.branch_name and ci_state.base_commit:
-        console.print(
-            f"\n[bold]Applying CI commits[/bold] from [cyan]{ci_state.branch_name}[/cyan]"
-        )
-        ci_tip = get_branch_tip(
-            repo_path, f"{config.origin.remote_name}/{ci_state.branch_name}"
-        )
-        n_ci = count_commits(repo_path, ci_state.base_commit, ci_tip)
-        if n_ci > 0:
-            result = cherry_pick_range(repo_path, ci_state.base_commit, ci_tip)
-            if not result.success:
-                console.print(f"  [red]✗[/red] Conflict applying CI commits!")
-                for f in result.conflict_files:
-                    console.print(f"    [red]•[/red] {f}")
-                return False
-            console.print(f"  [green]✓[/green] Applied {n_ci} CI commit(s)")
-        else:
-            console.print(f"  [dim]No CI commits to apply[/dim]")
-    else:
-        console.print(f"\n[dim]No CI branch state — skipping CI commits[/dim]")
-
-    # --- Step 3: Push the base release branch ---
     if config.push:
         console.print(f"\n[bold]Pushing base branch[/bold] [cyan]{branch_name}[/cyan]")
-        force_push(repo_path, branch_name, config.origin.remote_name,
-                   upstream_name=config.upstream.remote_name if config.upstream else None)
-        console.print(f"  [green]✓[/green] Pushed")
+        force_push(
+            repo_path, branch_name, config.origin.remote_name,
+            upstream_name=config.upstream.remote_name if config.upstream else None,
+        )
+        console.print("  [green]✓[/green] Pushed")
     else:
-        console.print(f"\n[dim]Skipping push of base branch (push not enabled)[/dim]")
+        console.print("\n[dim]Skipping push of base branch (push not enabled)[/dim]")
 
-    # --- Step 4: Per-feature branches and PRs ---
-    console.print(f"\n[bold]Creating per-feature branches and PRs[/bold]")
+    console.print("\n[bold]Creating per-feature branches and PRs[/bold]")
 
-    pr_results: list[tuple[str, str, str | None]] = []  # (feature_id, branch, pr_url)
+    pr_results: list[tuple[str, str, str | None]] = []
 
     for feat in features_to_include:
         fs = state.features.get(feat.id)
@@ -218,30 +189,22 @@ def build_release(
         feat_remote_ref = f"{config.origin.remote_name}/{fs.branch_name}"
         feat_tip = get_branch_tip(repo_path, feat_remote_ref)
 
-        # Feature-only commits: everything on the feature branch after the CI branch tip
-        ci_at_feat_time = get_branch_tip(
-            repo_path,
-            f"{config.origin.remote_name}/{ci_state.branch_name}"
-            if ci_state.branch_name
-            else fs.base_commit,
-        )
-
-        n_feat = count_commits(repo_path, ci_at_feat_time, feat_tip)
+        # Feature-only commits: everything on the feature branch after
+        # the recorded base_commit.
+        n_feat = count_commits(repo_path, fs.base_commit, feat_tip)
         if n_feat == 0:
-            console.print(f"    [dim]No unique commits — skipping[/dim]")
+            console.print("    [dim]No unique commits — skipping[/dim]")
             continue
 
-        # Create the PR branch from the release base
         stash_and_clean(repo_path)
         create_branch_from_ref(repo_path, feat_pr_branch, branch_name)
 
-        # Squash feature commits on a temp branch, then cherry-pick the single commit
         tmp = f"_releasy_squash_{feat.id}"
         run_git(["checkout", "-b", tmp, feat_tip], repo_path, check=False)
 
         squash_result = squash_commits(
             repo_path,
-            ci_at_feat_time,
+            fs.base_commit,
             f"[releasy] {feat.id}: {feat.description}",
         )
 
@@ -257,13 +220,12 @@ def build_release(
 
         squashed_sha = get_branch_tip(repo_path, "HEAD")
 
-        # Cherry-pick the squashed commit onto the PR branch
         run_git(["checkout", feat_pr_branch], repo_path)
         cp = run_git(["cherry-pick", squashed_sha], repo_path, check=False)
         run_git(["branch", "-D", tmp], repo_path, check=False)
 
         if cp.returncode != 0:
-            console.print(f"    [red]✗[/red] Conflict applying squashed feature!")
+            console.print("    [red]✗[/red] Conflict applying squashed feature!")
             for f in get_conflict_files(repo_path):
                 console.print(f"      [red]•[/red] {f}")
             run_git(["cherry-pick", "--abort"], repo_path, check=False)
@@ -274,8 +236,10 @@ def build_release(
 
         pr_url = None
         if config.push:
-            force_push(repo_path, feat_pr_branch, config.origin.remote_name,
-                       upstream_name=config.upstream.remote_name if config.upstream else None)
+            force_push(
+                repo_path, feat_pr_branch, config.origin.remote_name,
+                upstream_name=config.upstream.remote_name if config.upstream else None,
+            )
             console.print(f"    [green]✓[/green] Pushed ({n_feat} commits squashed into 1)")
 
             original_body = fs.pr_body if fs.pr_body else None
@@ -287,24 +251,22 @@ def build_release(
                 console.print(f"    [green]✓[/green] PR opened: {pr_url}")
             else:
                 console.print(
-                    f"    [yellow]![/yellow] Branch pushed but PR not created "
-                    f"(set RELEASY_GITHUB_TOKEN to enable)"
+                    "    [yellow]![/yellow] Branch pushed but PR not created "
+                    "(set RELEASY_GITHUB_TOKEN to enable)"
                 )
         else:
-            console.print(f"    [dim]Skipping push (push not enabled)[/dim]")
+            console.print("    [dim]Skipping push (push not enabled)[/dim]")
 
         pr_results.append((feat.id, feat_pr_branch, pr_url))
 
-        # Return to base branch for the next iteration
         stash_and_clean(repo_path)
         run_git(["checkout", branch_name], repo_path)
 
-    # --- Summary ---
     console.print(f"\n[bold]Release summary for [cyan]{branch_name}[/cyan][/bold]")
-    console.print(f"  Base: {upstream_tag} + CI commits")
+    console.print(f"  Base: {upstream_tag}")
 
     if pr_results:
-        console.print(f"  Feature PRs:")
+        console.print("  Feature PRs:")
         for feat_id, pr_branch, pr_url in pr_results:
             if pr_url:
                 console.print(f"    [green]✓[/green] {feat_id}: {pr_url}")
@@ -322,6 +284,6 @@ def build_release(
                 "merge PRs in the order listed."
             )
     else:
-        console.print(f"  [dim]No feature PRs created[/dim]")
+        console.print("  [dim]No feature PRs created[/dim]")
 
     return True

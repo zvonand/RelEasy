@@ -39,19 +39,12 @@ class OriginConfig:
 
 
 @dataclass
-class CIConfig:
-    branch_prefix: str  # e.g. "ci/antalya" → branches become ci/antalya/<sha8>
-    source_branch: str = ""  # CI source branch; empty = skip CI rebase
-    if_exists: str = "skip"  # "skip" or "redo"
-
-
-@dataclass
 class FeatureConfig:
     id: str
     description: str
     source_branch: str  # existing branch where feature commits live
     enabled: bool = True
-    depends_on: list[str] = field(default_factory=list)  # feature IDs this depends on (ordering TBD)
+    depends_on: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -80,14 +73,39 @@ class NotificationsConfig:
     github_project: str | None = None
 
 
+def _default_allowed_tools() -> list[str]:
+    return [
+        "Read", "Edit", "Write", "Glob", "Grep",
+        "Bash(git:*)", "Bash(gh:*)", "Bash(cd:*)",
+        "Bash(ninja:*)", "Bash(cmake:*)", "Bash(make:*)",
+        "Bash(ls:*)", "Bash(cat:*)", "Bash(rg:*)",
+    ]
+
+
+@dataclass
+class AIResolveConfig:
+    """Claude-driven conflict resolver configuration."""
+    enabled: bool = False
+    command: str = "claude"
+    prompt_file: str = "prompts/resolve_conflict.md"
+    allowed_tools: list[str] = field(default_factory=_default_allowed_tools)
+    max_iterations: int = 5
+    timeout_seconds: int = 7200  # 2h
+    build_command: str = "cd build && ninja"
+    label: str = "ai-resolved"
+    label_color: str = "8B5CF6"
+    extra_args: list[str] = field(default_factory=list)
+
+
 @dataclass
 class Config:
     origin: OriginConfig
-    ci: CIConfig
+    project: str  # short project identifier, e.g. "antalya"
     upstream: UpstreamConfig | None = None
     features: list[FeatureConfig] = field(default_factory=list)
     pr_sources: PRSourcesConfig = field(default_factory=PRSourcesConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
+    ai_resolve: AIResolveConfig = field(default_factory=AIResolveConfig)
     config_path: Path = field(default_factory=lambda: Path.cwd() / "config.yaml")
     work_dir: Path | None = None
     push: bool = False
@@ -117,9 +135,7 @@ class Config:
 
     @property
     def project_name(self) -> str:
-        """Extract project name from CI branch prefix (e.g. 'ci/antalya' → 'antalya')."""
-        parts = self.ci.branch_prefix.split("/")
-        return parts[-1] if len(parts) > 1 else parts[0]
+        return self.project
 
     def get_feature_by_branch(self, branch: str, onto: str = "") -> FeatureConfig | None:
         """Match by source_branch or by versioned branch prefix."""
@@ -140,10 +156,6 @@ class Config:
         """
         suffix = extract_version_suffix(onto)
         return f"{self.project_name}-{suffix}"
-
-    def ci_branch_name(self, onto: str) -> str:
-        """Build the CI branch name: ci/<base_branch_name>"""
-        return f"ci/{self.base_branch_name(onto)}"
 
     def feature_branch_prefix(self, feature_id: str, onto: str) -> str:
         """Build the prefix for feature branches: feature/<base>/<id>"""
@@ -183,12 +195,12 @@ def load_config(config_path: Path | None = None) -> Config:
             remote_name=upstream_raw.get("remote_name", "upstream"),
         )
 
-    ci_raw = raw.get("ci", {})
-    ci = CIConfig(
-        branch_prefix=ci_raw.get("branch_prefix", "ci"),
-        source_branch=ci_raw.get("source_branch", ""),
-        if_exists=ci_raw.get("if_exists", "skip"),
-    )
+    project = raw.get("project")
+    if not project:
+        raise ValueError(
+            "Config must set 'project' (e.g. 'antalya'). "
+            "This is used to name the base and port branches."
+        )
 
     features = []
     for feat_raw in raw.get("features", []):
@@ -228,16 +240,31 @@ def load_config(config_path: Path | None = None) -> Config:
         github_project=raw.get("notifications", {}).get("github_project"),
     )
 
+    ai_raw = raw.get("ai_resolve", {}) or {}
+    ai_resolve = AIResolveConfig(
+        enabled=ai_raw.get("enabled", False),
+        command=ai_raw.get("command", "claude"),
+        prompt_file=ai_raw.get("prompt_file", "prompts/resolve_conflict.md"),
+        allowed_tools=ai_raw.get("allowed_tools") or _default_allowed_tools(),
+        max_iterations=int(ai_raw.get("max_iterations", 5)),
+        timeout_seconds=int(ai_raw.get("timeout_seconds", 7200)),
+        build_command=ai_raw.get("build_command", "cd build && ninja"),
+        label=ai_raw.get("label", "ai-resolved"),
+        label_color=ai_raw.get("label_color", "8B5CF6"),
+        extra_args=ai_raw.get("extra_args", []) or [],
+    )
+
     raw_work_dir = raw.get("work_dir")
     work_dir = Path(raw_work_dir).resolve() if raw_work_dir else None
 
     return Config(
         origin=origin,
-        ci=ci,
+        project=project,
         upstream=upstream,
         features=features,
         pr_sources=pr_sources,
         notifications=notifications,
+        ai_resolve=ai_resolve,
         config_path=config_path,
         work_dir=work_dir,
         push=raw.get("push", False),
@@ -254,6 +281,7 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
             "remote": config.origin.remote,
             "remote_name": config.origin.remote_name,
         },
+        "project": config.project,
     }
 
     if config.upstream:
@@ -261,16 +289,6 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
             "remote": config.upstream.remote,
             "remote_name": config.upstream.remote_name,
         }
-
-    data["ci"] = {
-        k: v
-        for k, v in {
-            "branch_prefix": config.ci.branch_prefix,
-            "source_branch": config.ci.source_branch,
-            "if_exists": config.ci.if_exists if config.ci.if_exists != "skip" else None,
-        }.items()
-        if v is not None
-    }
 
     data["features"] = [
         {
@@ -318,6 +336,32 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
 
     if config.notifications.github_project:
         data["notifications"] = {"github_project": config.notifications.github_project}
+
+    ai = config.ai_resolve
+    ai_defaults = AIResolveConfig()
+    ai_data: dict = {}
+    if ai.enabled != ai_defaults.enabled:
+        ai_data["enabled"] = ai.enabled
+    if ai.command != ai_defaults.command:
+        ai_data["command"] = ai.command
+    if ai.prompt_file != ai_defaults.prompt_file:
+        ai_data["prompt_file"] = ai.prompt_file
+    if ai.allowed_tools != _default_allowed_tools():
+        ai_data["allowed_tools"] = ai.allowed_tools
+    if ai.max_iterations != ai_defaults.max_iterations:
+        ai_data["max_iterations"] = ai.max_iterations
+    if ai.timeout_seconds != ai_defaults.timeout_seconds:
+        ai_data["timeout_seconds"] = ai.timeout_seconds
+    if ai.build_command != ai_defaults.build_command:
+        ai_data["build_command"] = ai.build_command
+    if ai.label != ai_defaults.label:
+        ai_data["label"] = ai.label
+    if ai.label_color != ai_defaults.label_color:
+        ai_data["label_color"] = ai.label_color
+    if ai.extra_args:
+        ai_data["extra_args"] = ai.extra_args
+    if ai_data:
+        data["ai_resolve"] = ai_data
 
     if config.push:
         data["push"] = True

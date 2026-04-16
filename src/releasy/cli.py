@@ -35,20 +35,30 @@ def cli(ctx: click.Context, config_path: str | None) -> None:
 
 
 @cli.command()
-@click.option("--onto", required=True, help="Upstream commit SHA to rebase onto")
+@click.option("--onto", required=True, help="Upstream ref/tag used to name the base branch")
 @click.option("--work-dir", default=None, help="Working directory for git operations")
+@click.option(
+    "--resolve-conflicts/--no-resolve-conflicts",
+    default=True,
+    help="Invoke the AI resolver on conflicts (requires ai_resolve.enabled in config). "
+         "Default: on.",
+)
 @click.pass_context
-def run(ctx: click.Context, onto: str, work_dir: str | None) -> None:
-    """Run the full pipeline onto a specified upstream commit."""
+def run(
+    ctx: click.Context,
+    onto: str,
+    work_dir: str | None,
+    resolve_conflicts: bool,
+) -> None:
+    """Port PRs onto the already-existing base branch (origin/<project>-<version>)."""
     from releasy.pipeline import run_pipeline
 
     config = _load_config_or_exit(ctx.obj["config_path"])
     wd = Path(work_dir) if work_dir else None
-    state = run_pipeline(config, onto, wd)
+    state = run_pipeline(config, onto, wd, resolve_conflicts=resolve_conflicts)
 
-    has_conflicts = (
-        state.ci_branch.status == "conflict"
-        or any(fs.status == "conflict" for fs in state.features.values())
+    has_conflicts = any(
+        fs.status == "conflict" for fs in state.features.values()
     )
     if has_conflicts:
         raise SystemExit(1)

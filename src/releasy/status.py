@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 from releasy.config import Config
-from releasy.state import PipelineState
+from releasy.state import FeatureState, PipelineState
 
 
 STATUS_ICONS: dict[str, str] = {
@@ -35,48 +35,46 @@ def generate_status_md(config: Config, state: PipelineState) -> str:
     onto = state.onto or "N/A"
 
     lines = [
-        "## RelEasy Branch Status",
+        "## RelEasy Port Status",
         "",
         f"Last run: {run_date} \u00b7 Upstream commit: `{onto}`",
         "",
-        "| Branch | Status | Based On | Source PR | Conflict Files |",
-        "|--------|--------|----------|----------|----------------|",
+        "| Branch | Status | AI | Based On | Source PR | Conflict Files |",
+        "|--------|--------|----|----------|-----------|----------------|",
     ]
 
-    def _feature_row(label: str, fs: "FeatureState | None", status_str: str) -> str:
+    def _ai_cell(fs: FeatureState | None) -> str:
+        if not fs or not fs.ai_resolved:
+            return ""
+        iters = f" ({fs.ai_iterations}\u00d7)" if fs.ai_iterations else ""
+        return f"\U0001f916 ai-resolved{iters}"
+
+    def _feature_row(label: str, fs: FeatureState | None, status_str: str) -> str:
         if fs is None:
-            return f"| {label} | {status_str} | | | |"
+            return f"| {label} | {status_str} | | | | |"
         base = f"`{fs.base_commit[:12]}`" if fs.base_commit else ""
         source_pr = ""
         if fs.pr_url:
             pr_label = f"#{fs.pr_number}" if fs.pr_number else "PR"
             source_pr = f"[{pr_label}]({fs.pr_url})"
         conflicts = ", ".join(f"`{f}`" for f in fs.conflict_files) if fs.conflict_files else ""
-        return f"| {label} | {status_str} | {base} | {source_pr} | {conflicts} |"
+        return (
+            f"| {label} | {status_str} | {_ai_cell(fs)} | {base} | {source_pr} | {conflicts} |"
+        )
 
-    # CI branch row
-    ci = state.ci_branch
-    ci_label = ci.branch_name or config.ci.branch_prefix
-    ci_status = STATUS_ICONS.get(ci.status, ci.status)
-    ci_base = f"`{ci.base_commit[:12]}`" if ci.base_commit else ""
-    ci_conflicts = ", ".join(f"`{f}`" for f in ci.conflict_files) if ci.conflict_files else ""
-    lines.append(f"| {ci_label} | {ci_status} | {ci_base} | | {ci_conflicts} |")
-
-    # Feature branch rows (source-branch and PR-based)
     shown_ids: set[str] = set()
     for feat in config.features:
         fs = state.features.get(feat.id)
         shown_ids.add(feat.id)
         if fs is None:
             status_str = STATUS_ICONS["disabled"] if not feat.enabled else STATUS_ICONS["pending"]
-            lines.append(_feature_row(feat.source_branch, None, status_str))
+            lines.append(_feature_row(feat.source_branch or feat.id, None, status_str))
             continue
 
-        label = fs.branch_name or feat.source_branch
+        label = fs.branch_name or feat.source_branch or feat.id
         status_str = STATUS_ICONS.get(fs.status, fs.status)
         lines.append(_feature_row(label, fs, status_str))
 
-    # PR features in state but not in config (from a previous run)
     for fid, fs in state.features.items():
         if fid in shown_ids:
             continue

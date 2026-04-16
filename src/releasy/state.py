@@ -10,16 +10,7 @@ from typing import Literal
 import yaml
 
 BranchStatus = Literal["pending", "ok", "conflict", "resolved", "skipped", "disabled"]
-PipelinePhase = Literal["init", "base_created", "ci_rebased", "ci_merged", "features_done"]
-
-
-@dataclass
-class CIBranchState:
-    status: BranchStatus = "pending"
-    branch_name: str | None = None
-    base_commit: str | None = None
-    conflict_files: list[str] = field(default_factory=list)
-    pr_url: str | None = None
+PipelinePhase = Literal["init", "ports_done"]
 
 
 @dataclass
@@ -33,6 +24,8 @@ class FeatureState:
     pr_title: str | None = None
     pr_body: str | None = None
     rebase_pr_url: str | None = None  # auto-created PR targeting base branch
+    ai_resolved: bool = False
+    ai_iterations: int | None = None
 
 
 @dataclass
@@ -41,7 +34,6 @@ class PipelineState:
     onto: str | None = None
     phase: PipelinePhase = "init"
     base_branch: str | None = None
-    ci_branch: CIBranchState = field(default_factory=CIBranchState)
     features: dict[str, FeatureState] = field(default_factory=dict)
 
     def set_started(self, onto: str) -> None:
@@ -71,14 +63,6 @@ def load_state(repo_dir: Path | None = None) -> PipelineState:
         return PipelineState()
 
     run = raw["last_run"]
-    ci_raw = run.get("ci_branch", {})
-    ci_state = CIBranchState(
-        status=ci_raw.get("status", "pending"),
-        branch_name=ci_raw.get("branch_name"),
-        base_commit=ci_raw.get("base_commit"),
-        conflict_files=ci_raw.get("conflict_files", []),
-        pr_url=ci_raw.get("pr_url"),
-    )
 
     features: dict[str, FeatureState] = {}
     for fid, fraw in run.get("features", {}).items():
@@ -92,14 +76,19 @@ def load_state(repo_dir: Path | None = None) -> PipelineState:
             pr_title=fraw.get("pr_title"),
             pr_body=fraw.get("pr_body"),
             rebase_pr_url=fraw.get("rebase_pr_url"),
+            ai_resolved=fraw.get("ai_resolved", False),
+            ai_iterations=fraw.get("ai_iterations"),
         )
+
+    phase = run.get("phase", "init")
+    if phase not in ("init", "ports_done"):
+        phase = "init"
 
     return PipelineState(
         started_at=run.get("started_at"),
         onto=run.get("onto"),
-        phase=run.get("phase", "init"),
+        phase=phase,
         base_branch=run.get("base_branch"),
-        ci_branch=ci_state,
         features=features,
     )
 
@@ -129,17 +118,11 @@ def save_state(state: PipelineState, repo_dir: Path | None = None) -> None:
             entry["pr_body"] = fs.pr_body
         if fs.rebase_pr_url:
             entry["rebase_pr_url"] = fs.rebase_pr_url
+        if fs.ai_resolved:
+            entry["ai_resolved"] = True
+        if fs.ai_iterations is not None:
+            entry["ai_iterations"] = fs.ai_iterations
         features_data[fid] = entry
-
-    ci_data: dict = {"status": state.ci_branch.status}
-    if state.ci_branch.branch_name:
-        ci_data["branch_name"] = state.ci_branch.branch_name
-    if state.ci_branch.base_commit:
-        ci_data["base_commit"] = state.ci_branch.base_commit
-    if state.ci_branch.conflict_files:
-        ci_data["conflict_files"] = state.ci_branch.conflict_files
-    if state.ci_branch.pr_url:
-        ci_data["pr_url"] = state.ci_branch.pr_url
 
     data = {
         "last_run": {
@@ -147,7 +130,6 @@ def save_state(state: PipelineState, repo_dir: Path | None = None) -> None:
             "onto": state.onto,
             "phase": state.phase,
             "base_branch": state.base_branch,
-            "ci_branch": ci_data,
             "features": features_data,
         }
     }

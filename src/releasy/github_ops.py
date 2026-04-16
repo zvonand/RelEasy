@@ -296,6 +296,126 @@ def search_prs_by_labels(
 
 
 # ---------------------------------------------------------------------------
+# Labels + PR lookup helpers (REST)
+# ---------------------------------------------------------------------------
+
+
+def ensure_label(
+    config: Config,
+    name: str,
+    color: str = "8B5CF6",
+    description: str = "",
+) -> bool:
+    """Ensure a label exists on the origin repo. Idempotent.
+
+    Returns True if the label exists (pre-existing or freshly created).
+    """
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set \u2014 cannot ensure label %s", name)
+        return False
+
+    slug = get_origin_repo_slug(config)
+    if not slug:
+        return False
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        try:
+            repo.get_label(name)
+            return True
+        except GithubException as exc:
+            if exc.status != 404:
+                log.warning("Failed to check label %s: %s", name, exc)
+                return False
+        try:
+            repo.create_label(name=name, color=color, description=description)
+            return True
+        except GithubException as exc:
+            # 422 == already exists (race); treat as success.
+            if exc.status == 422:
+                return True
+            log.warning("Failed to create label %s: %s", name, exc)
+            return False
+    except Exception as exc:
+        log.warning("Unexpected error ensuring label %s: %s", name, exc)
+        return False
+
+
+def add_label_to_pr(config: Config, pr_number: int, label: str) -> bool:
+    """Attach a label to a pull request. Idempotent on repeated calls."""
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set \u2014 cannot label PR #%d", pr_number)
+        return False
+
+    slug = get_origin_repo_slug(config)
+    if not slug:
+        return False
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        issue = repo.get_issue(pr_number)
+        issue.add_to_labels(label)
+        return True
+    except GithubException as exc:
+        log.warning("Failed to label PR #%d with %s: %s", pr_number, label, exc)
+        return False
+    except Exception as exc:
+        log.warning("Unexpected error labelling PR #%d: %s", pr_number, exc)
+        return False
+
+
+def find_pr_for_branch(
+    config: Config, head_branch: str, base: str | None = None,
+) -> PRInfo | None:
+    """Find the most recent open PR from ``head_branch`` (optionally \u2192 base)."""
+    token = get_github_token()
+    if not token:
+        return None
+
+    slug = get_origin_repo_slug(config)
+    if not slug:
+        return None
+
+    owner = slug.split("/")[0]
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        kwargs: dict = {"state": "open", "head": f"{owner}:{head_branch}"}
+        if base:
+            kwargs["base"] = base
+        for pr in repo.get_pulls(**kwargs):
+            return PRInfo(
+                number=pr.number,
+                title=pr.title,
+                body=pr.body or "",
+                state="open" if not pr.merged else "merged",
+                merge_commit_sha=pr.merge_commit_sha if pr.merged else None,
+                head_sha=pr.head.sha,
+                url=pr.html_url,
+                merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
+                labels=[lbl.name for lbl in pr.labels],
+            )
+        return None
+    except GithubException as exc:
+        log.warning("Failed to look up PR for branch %s: %s", head_branch, exc)
+        return None
+    except Exception as exc:
+        log.warning("Unexpected error looking up PR for branch %s: %s", head_branch, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # GitHub Projects v2 integration (GraphQL API)
 # ---------------------------------------------------------------------------
 
@@ -759,13 +879,6 @@ def sync_project(config: Config, state: PipelineState) -> bool:
         status_field_id, status_options = status_info
 
     branches: list[tuple[str, str, list[str]]] = []
-
-    ci_label = state.ci_branch.branch_name or config.ci.branch_prefix
-    branches.append((
-        ci_label,
-        state.ci_branch.status,
-        state.ci_branch.conflict_files,
-    ))
 
     for feat in config.features:
         fs = state.features.get(feat.id)
