@@ -35,7 +35,12 @@ def cli(ctx: click.Context, config_path: str | None) -> None:
 
 
 @cli.command()
-@click.option("--onto", required=True, help="Upstream ref/tag used to name the base branch")
+@click.option(
+    "--onto",
+    default=None,
+    help="Upstream ref/tag used to derive the base branch name "
+         "(<project>-<version>). Not needed when 'target_branch' is set in config.",
+)
 @click.option("--work-dir", default=None, help="Working directory for git operations")
 @click.option(
     "--resolve-conflicts/--no-resolve-conflicts",
@@ -46,14 +51,22 @@ def cli(ctx: click.Context, config_path: str | None) -> None:
 @click.pass_context
 def run(
     ctx: click.Context,
-    onto: str,
+    onto: str | None,
     work_dir: str | None,
     resolve_conflicts: bool,
 ) -> None:
-    """Port PRs onto the already-existing base branch (origin/<project>-<version>)."""
+    """Port PRs onto the already-existing base branch."""
     from releasy.pipeline import run_pipeline
 
     config = _load_config_or_exit(ctx.obj["config_path"])
+
+    if not onto:
+        if not config.target_branch:
+            raise click.ClickException(
+                "Either pass --onto <ref> or set 'target_branch:' in config.yaml."
+            )
+        onto = config.target_branch
+
     wd = Path(work_dir) if work_dir else None
     state = run_pipeline(config, onto, wd, resolve_conflicts=resolve_conflicts)
 
@@ -65,15 +78,27 @@ def run(
 
 
 @cli.command(name="continue")
-@click.option("--branch", required=True, help="Branch name or feature ID to mark as resolved")
+@click.option(
+    "--branch",
+    default=None,
+    help="Branch or feature ID to mark resolved. If omitted, processes "
+         "every port in state: pushes + opens PRs for resolved ones, "
+         "highlights any still-unresolved conflicts.",
+)
+@click.option("--work-dir", default=None, help="Working directory for git operations")
 @click.pass_context
-def continue_cmd(ctx: click.Context, branch: str) -> None:
-    """Mark a conflict-resolved branch and update state."""
-    from releasy.pipeline import continue_branch
+def continue_cmd(ctx: click.Context, branch: str | None, work_dir: str | None) -> None:
+    """Continue after manual conflict resolution."""
+    from releasy.pipeline import continue_all, continue_branch
 
     config = _load_config_or_exit(ctx.obj["config_path"])
-    if not continue_branch(config, branch):
-        raise SystemExit(1)
+    wd = Path(work_dir) if work_dir else None
+    if branch:
+        if not continue_branch(config, branch):
+            raise SystemExit(1)
+    else:
+        if not continue_all(config, wd):
+            raise SystemExit(1)
 
 
 @cli.command()

@@ -19,10 +19,16 @@ class FeatureState:
     branch_name: str | None = None
     base_commit: str | None = None
     conflict_files: list[str] = field(default_factory=list)
-    pr_url: str | None = None  # source PR URL (for PR-sourced features)
+    # Source PR meta. For singleton features, the *_url / *_number / *_title
+    # fields hold the one and only PR. For sequential PR groups, they hold
+    # the FIRST PR (for backward-compat with display code), and the
+    # ``pr_numbers`` / ``pr_urls`` lists hold every PR in cherry-pick order.
+    pr_url: str | None = None
     pr_number: int | None = None
     pr_title: str | None = None
     pr_body: str | None = None
+    pr_numbers: list[int] = field(default_factory=list)
+    pr_urls: list[str] = field(default_factory=list)
     rebase_pr_url: str | None = None  # auto-created PR targeting base branch
     ai_resolved: bool = False
     ai_iterations: int | None = None
@@ -75,6 +81,8 @@ def load_state(repo_dir: Path | None = None) -> PipelineState:
             pr_number=fraw.get("pr_number"),
             pr_title=fraw.get("pr_title"),
             pr_body=fraw.get("pr_body"),
+            pr_numbers=fraw.get("pr_numbers", []) or [],
+            pr_urls=fraw.get("pr_urls", []) or [],
             rebase_pr_url=fraw.get("rebase_pr_url"),
             ai_resolved=fraw.get("ai_resolved", False),
             ai_iterations=fraw.get("ai_iterations"),
@@ -116,6 +124,10 @@ def save_state(state: PipelineState, repo_dir: Path | None = None) -> None:
             entry["pr_title"] = fs.pr_title
         if fs.pr_body:
             entry["pr_body"] = fs.pr_body
+        if fs.pr_numbers and len(fs.pr_numbers) > 1:
+            entry["pr_numbers"] = fs.pr_numbers
+        if fs.pr_urls and len(fs.pr_urls) > 1:
+            entry["pr_urls"] = fs.pr_urls
         if fs.rebase_pr_url:
             entry["rebase_pr_url"] = fs.rebase_pr_url
         if fs.ai_resolved:

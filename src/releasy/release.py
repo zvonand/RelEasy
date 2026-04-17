@@ -135,7 +135,7 @@ def build_release(
     console.print(f"[dim]Working directory: {work_dir}[/dim]")
 
     console.print("[dim]Setting up repository...[/dim]")
-    repo_path = ensure_work_repo(config, work_dir)
+    repo_path, _freshly_cloned = ensure_work_repo(config, work_dir)
     console.print(f"[dim]Repo: {repo_path}[/dim]")
 
     from releasy.git_ops import fetch_remote, ref_exists_locally
@@ -248,7 +248,10 @@ def build_release(
             pr_url = create_pull_request(config, feat_pr_branch, branch_name, pr_title, pr_body)
 
             if pr_url:
-                console.print(f"    [green]✓[/green] PR opened: {pr_url}")
+                console.print(
+                    f"    [green]✓[/green] PR opened: "
+                    f"[link={pr_url}]{pr_url}[/link]"
+                )
             else:
                 console.print(
                     "    [yellow]![/yellow] Branch pushed but PR not created "

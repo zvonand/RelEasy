@@ -3,6 +3,20 @@
 # Default is false — everything stays local until you enable this.
 # push: true
 
+# ── Conflict handling ───────────────────────────────────────────────
+# When a cherry-pick conflicts and the AI resolver doesn't (or can't)
+# fix it:
+#   false (default) — stop the pipeline, leave the working tree dirty
+#                     with the in-progress cherry-pick so you can resolve
+#                     it manually. After resolving, run:
+#                       git add -A && git cherry-pick --continue
+#                       releasy continue --branch <branch>
+#                       releasy run     # to resume with remaining PRs
+#   true            — commit conflict markers as a WIP, push, and open a
+#                     "needs resolution" PR. Lets the pipeline continue
+#                     to the next PR.
+# wip_commit_on_conflict: false
+
 # ── Work directory ──────────────────────────────────────────────────
 # Where to clone/find the origin repo for git operations.
 # If it points to an existing git repo, it will be reused (no clone).
@@ -22,6 +36,24 @@ origin:
 upstream:
   remote: https://github.com/ClickHouse/ClickHouse.git
   remote_name: upstream
+
+# ── Project & target branch ────────────────────────────────────────
+# Short project identifier — used to name port branches as
+#   feature/<base>/<feature-id>
+project: antalya
+
+# The base/target branch PRs are opened into. Two ways to set it:
+#
+#   1. Explicit (recommended): set 'target_branch' here. --onto becomes
+#      optional and you don't need a tag-based name derivation.
+#
+#   2. Derived: leave 'target_branch' unset and pass --onto <ref> on
+#      the CLI. The base branch is then '<project>-<version>', where
+#      <version> is parsed from --onto (e.g. v26.3.4.234-lts → 26.3,
+#      yielding 'antalya-26.3').
+#
+# The base branch must already exist on origin before running.
+target_branch: antalya-26.3
 
 # ── CI configuration ───────────────────────────────────────────────
 # branch_prefix: used to derive the project name and branch names.
@@ -82,7 +114,7 @@ features:
 #   Per-entry options:
 #     merged_only: true — skip open PRs, only cherry-pick merged ones.
 #     auto_pr: true — auto-create a PR into the base branch (needs push: true).
-#     if_exists: skip|redo — same as ci.if_exists but per label group.
+#     if_exists: skip|recreate — overrides pr_sources.if_exists for this group.
 #     description: prefix prepended to the PR title for the feature name.
 #
 # exclude_labels — drop any PR carrying at least one of these labels,
@@ -94,15 +126,30 @@ features:
 # exclude_prs — always exclude these PRs by URL. Final override —
 #   a PR listed here is never processed.
 #
+# if_exists — what to do with stale local state from a previous run:
+#     "skip" (default) — leave the local branch alone, don't re-process.
+#                        Also: refuse to start if a cherry-pick / merge /
+#                        rebase is still in progress in the work dir.
+#     "recreate"       — delete the local branch and rebuild it from the
+#                        base branch. Also: if a cherry-pick / merge /
+#                        rebase is in progress at startup, abort it
+#                        (`git cherry-pick --abort` + reset --hard +
+#                        clean -fd) and start fresh.
+#
+# Note: if the branch already exists on the remote it is ALWAYS skipped,
+# regardless of this setting. Resolve those manually so you don't
+# clobber someone else's work.
+#
 # PRs are processed in merge order (earliest merged first).
 #
 # pr_sources:
+#   if_exists: skip
 #   by_labels:
 #     - labels: ["forward-port", "v26.1"]
 #       description: "Forward-ported changes"
 #       merged_only: true
 #       auto_pr: true
-#       if_exists: skip
+#       # if_exists: recreate    # override per-group
 #
 #   exclude_labels: ["do-not-port", "wontfix"]
 #
@@ -112,6 +159,33 @@ features:
 #
 #   exclude_prs:
 #     - https://github.com/Altinity/ClickHouse/pull/789
+#
+#   # Sequential PR groups: cherry-pick multiple PRs onto a SINGLE port
+#   # branch (in listed order) and open ONE combined PR for the whole
+#   # group. Use this when PR #B depends on PR #A and they should land
+#   # together. The group `id` becomes the feature id and the branch
+#   # name (feature/<base>/<id>). Each PR can appear in at most ONE
+#   # group; PRs in groups are removed from the singleton stream.
+#   #
+#   # `exclude_prs` and `exclude_labels` still drop individual PRs from
+#   # a group; if a group ends up empty it is skipped with a warning.
+#   #
+#   # AI conflict resolution works per cherry-pick step inside a group:
+#   # if any PR in the group conflicts, Claude resolves+builds+commits
+#   # locally, then the next PR in the group is cherry-picked. Each PR
+#   # produces one commit on the branch (with a `Source-PR: #N` trailer
+#   # for clean attribution). After all PRs are applied, RelEasy pushes
+#   # the branch and opens ONE combined PR; if any step needed AI, the
+#   # PR is tagged `ai_resolve.label`.
+#   groups:
+#     - id: iceberg-rest-catalog
+#       description: "Iceberg REST catalog support"
+#       prs:
+#         - https://github.com/Altinity/ClickHouse/pull/1500   # base change
+#         - https://github.com/Altinity/ClickHouse/pull/1512   # follow-up
+#         - https://github.com/Altinity/ClickHouse/pull/1530   # final fix
+#       # auto_pr: true       # default; set false to skip combined PR
+#       # if_exists: skip     # override the global pr_sources.if_exists
 
 # ── GitHub Project board ────────────────────────────────────────────
 # Sync branch status to a GitHub Project v2 board (optional).

@@ -160,10 +160,22 @@ class PRInfo:
     url: str
     merged_at: str | None = None  # ISO timestamp of merge
     labels: list[str] = None  # type: ignore[assignment]
+    author: str | None = None  # GitHub login of the PR author
 
     def __post_init__(self) -> None:
         if self.labels is None:
             self.labels = []
+
+
+def _pr_author(pr) -> str | None:  # noqa: ANN001 — PyGithub PullRequest
+    """Best-effort extraction of the author's GitHub login."""
+    try:
+        user = pr.user
+        if user is not None and getattr(user, "login", None):
+            return user.login
+    except Exception:  # pragma: no cover — network / permissions
+        pass
+    return None
 
 
 def parse_pr_url(url: str) -> int | None:
@@ -217,6 +229,7 @@ def fetch_pr_by_number(
             url=pr.html_url,
             merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
             labels=[lbl.name for lbl in pr.labels],
+            author=_pr_author(pr),
         )
     except GithubException as exc:
         log.warning("Failed to fetch PR #%d: %s", number, exc)
@@ -282,6 +295,7 @@ def search_prs_by_labels(
                 url=pr.html_url,
                 merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
                 labels=[lbl.name for lbl in pr.labels],
+                author=_pr_author(pr),
             ))
 
         # Merged PRs first in merge order, then open PRs by number.
@@ -405,6 +419,7 @@ def find_pr_for_branch(
                 url=pr.html_url,
                 merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
                 labels=[lbl.name for lbl in pr.labels],
+                author=_pr_author(pr),
             )
         return None
     except GithubException as exc:
@@ -483,7 +498,8 @@ def _get_project_id(owner: str, number: int, is_org: bool) -> str | None:
         return None
 
 
-def _get_status_field(project_id: str) -> tuple[str, dict[str, str]] | None:
+def _get_status_field(project_id: str) -> tuple[str, dict[str, str], list[dict]] | None:
+    """Return (field_id, {lowercase_name: option_id}, [raw_options]) or None."""
     query = """
     query($projectId: ID!) {
       node(id: $projectId) {
@@ -493,7 +509,7 @@ def _get_status_field(project_id: str) -> tuple[str, dict[str, str]] | None:
               ... on ProjectV2SingleSelectField {
                 id
                 name
-                options { id name }
+                options { id name color description }
               }
             }
           }
@@ -511,11 +527,12 @@ def _get_status_field(project_id: str) -> tuple[str, dict[str, str]] | None:
 
     for field_node in field_nodes:
         if field_node.get("name", "").lower() == "status":
+            raw_options = field_node.get("options", [])
             options = {
                 opt["name"].lower(): opt["id"]
-                for opt in field_node.get("options", [])
+                for opt in raw_options
             }
-            return field_node["id"], options
+            return field_node["id"], options, raw_options
     return None
 
 
@@ -705,6 +722,24 @@ def _create_single_select_field(
         return None
 
 
+def _update_single_select_options(
+    field_id: str, options: list[dict],
+) -> bool:
+    """Replace all options on an existing single-select field."""
+    mutation = """
+    mutation($fieldId: ID!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) {
+      updateProjectV2Field(input: {
+        fieldId: $fieldId
+        singleSelectOptions: $options
+      }) {
+        projectV2Field { ... on ProjectV2SingleSelectField { id } }
+      }
+    }
+    """
+    data = _gql(mutation, {"fieldId": field_id, "options": options})
+    return data is not None
+
+
 def setup_project(config: Config) -> str | None:
     """Create a GitHub Project with the Status field, or verify an existing one.
 
@@ -756,20 +791,41 @@ def setup_project(config: Config) -> str | None:
 
     status_info = _get_status_field(project_id)
     if status_info:
-        _, existing_options = status_info
+        field_id, existing_options, raw_options = status_info
         missing = [
             opt for opt in STATUS_OPTIONS
             if opt.lower() not in existing_options
         ]
         if missing:
-            log.warning(
-                "Status field exists but missing options: %s. "
-                "Please add them manually in the project settings.",
-                ", ".join(missing),
-            )
+            merged = [
+                {
+                    "name": o["name"],
+                    "color": o.get("color", "GRAY"),
+                    "description": o.get("description") or "",
+                }
+                for o in raw_options
+            ]
+            for opt in missing:
+                merged.append({
+                    "name": opt,
+                    "color": STATUS_COLORS.get(opt, "GRAY"),
+                    "description": "",
+                })
+            if _update_single_select_options(field_id, merged):
+                log.info("Added missing Status options: %s", ", ".join(missing))
+            else:
+                log.warning(
+                    "Failed to add missing Status options: %s. "
+                    "Add them manually in the project settings.",
+                    ", ".join(missing),
+                )
     else:
         options = [
-            {"name": opt, "color": STATUS_COLORS.get(opt, "GRAY")}
+            {
+                "name": opt,
+                "color": STATUS_COLORS.get(opt, "GRAY"),
+                "description": "",
+            }
             for opt in STATUS_OPTIONS
         ]
         field_id = _create_single_select_field(project_id, "Status", options)
@@ -793,11 +849,17 @@ REST_API_URL = "https://api.github.com"
 
 def _rest_api(
     method: str, path: str, json_data: dict | None = None,
-) -> dict | None:
-    """Make a GitHub REST API call."""
+    *, expected_statuses: tuple[int, ...] = (200, 201),
+    log_on_error: bool = True,
+) -> tuple[int, dict | list | None]:
+    """Make a GitHub REST API call.
+
+    Returns ``(status_code, json_body_or_None)``. Emits a warning on
+    unexpected status codes unless ``log_on_error`` is False.
+    """
     token = get_github_token()
     if not token:
-        return None
+        return 0, None
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
@@ -807,16 +869,54 @@ def _rest_api(
         method, f"{REST_API_URL}{path}",
         json=json_data, headers=headers, timeout=30,
     )
-    if resp.status_code not in (200, 201):
-        log.warning("REST API %s %s: %s %s", method, path, resp.status_code, resp.text)
-        return None
-    return resp.json() if resp.text else {}
+    if resp.status_code not in expected_statuses:
+        if log_on_error:
+            log.warning(
+                "REST API %s %s: %s %s",
+                method, path, resp.status_code, resp.text,
+            )
+        return resp.status_code, None
+    try:
+        return resp.status_code, (resp.json() if resp.text else None)
+    except ValueError:
+        return resp.status_code, None
+
+
+# Projects Classic uses the REST `/projects/{n}/views` endpoint; Projects V2
+# (the only kind still being created) serves that URL as 404. We probe once
+# per run, cache the result, and stop spamming the log for V2 projects.
+_PROJECT_IS_V2: set[tuple[str, int]] = set()
+
+
+def _project_v2_marker(owner: str, project_number: int) -> tuple[str, int]:
+    return (owner.lower(), int(project_number))
 
 
 def _get_project_views(owner: str, project_number: int, is_org: bool) -> list[dict]:
-    """List existing views on a project."""
+    """List existing views on a Projects Classic project. Empty list for V2."""
+    marker = _project_v2_marker(owner, project_number)
+    if marker in _PROJECT_IS_V2:
+        return []
     prefix = "orgs" if is_org else "users"
-    data = _rest_api("GET", f"/{prefix}/{owner}/projects/{project_number}/views")
+    status, data = _rest_api(
+        "GET",
+        f"/{prefix}/{owner}/projects/{project_number}/views",
+        log_on_error=False,
+    )
+    if status == 404:
+        _PROJECT_IS_V2.add(marker)
+        log.info(
+            "Project %s/#%d appears to be a Projects V2 board; "
+            "REST view management is unavailable. Skipping view creation.",
+            owner, project_number,
+        )
+        return []
+    if status not in (200,):
+        log.warning(
+            "GET /%s/%s/projects/%d/views: %s",
+            prefix, owner, project_number, status,
+        )
+        return []
     if isinstance(data, list):
         return data
     return []
@@ -826,20 +926,42 @@ def _create_project_view(
     owner: str, project_number: int, is_org: bool,
     name: str, layout: str = "table",
 ) -> dict | None:
-    """Create a new view (tab) on a project."""
+    """Create a new view (tab) on a Projects Classic project.
+
+    No-op for Projects V2 (already detected by _get_project_views).
+    """
+    marker = _project_v2_marker(owner, project_number)
+    if marker in _PROJECT_IS_V2:
+        return None
     prefix = "orgs" if is_org else "users"
-    return _rest_api(
+    status, data = _rest_api(
         "POST",
         f"/{prefix}/{owner}/projects/{project_number}/views",
         {"name": name, "layout": layout},
+        log_on_error=False,
     )
+    if status == 404:
+        _PROJECT_IS_V2.add(marker)
+        return None
+    if status not in (200, 201):
+        log.warning(
+            "POST /%s/%s/projects/%d/views: %s",
+            prefix, owner, project_number, status,
+        )
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _ensure_project_view(
     owner: str, project_number: int, is_org: bool, view_name: str,
 ) -> bool:
     """Create a view for this rebase if it doesn't exist yet."""
+    marker = _project_v2_marker(owner, project_number)
+    if marker in _PROJECT_IS_V2:
+        return False
     views = _get_project_views(owner, project_number, is_org)
+    if marker in _PROJECT_IS_V2:
+        return False
     for v in views:
         if v.get("name") == view_name:
             return True
@@ -876,7 +998,7 @@ def sync_project(config: Config, state: PipelineState) -> bool:
     status_field_id = None
     status_options: dict[str, str] = {}
     if status_info:
-        status_field_id, status_options = status_info
+        status_field_id, status_options, _ = status_info
 
     branches: list[tuple[str, str, list[str]]] = []
 

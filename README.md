@@ -4,6 +4,18 @@ CLI tool for managing fork rebases, feature branches, and release construction.
 
 RelEasy automates maintaining a repo (typically a fork) against an optional upstream. Instead of rebasing long-lived branches (which accumulates conflicts), it creates a **base branch** from a tag/commit, rebases CI and features on top, and opens PRs — all in a phased, resumable workflow.
 
+## TL;DR
+
+```bash
+export RELEASY_GITHUB_TOKEN="ghp_..."
+
+# With target_branch set in config.yaml:
+releasy run
+
+# Or, deriving the base branch from a tag:
+releasy run --onto v26.3.4.234-lts
+```
+
 ## How It Works
 
 ```
@@ -35,16 +47,16 @@ On conflict at any phase, the pipeline stops with instructions. Resolve, run `re
 
 ### Branch Naming
 
-Tags are parsed to extract version: `v26.3.4.234-lts` → `26.3`. Raw SHAs use the first 8 chars.
+The base/target branch is taken from `target_branch` in config when set;
+otherwise it's derived from `<project>-<version>`, where `<version>` is parsed
+from `--onto` (e.g. `v26.3.4.234-lts` → `26.3`; raw SHAs use the first 8 chars).
 
 | Type | Pattern | Example |
 |------|---------|---------|
-| Base | `<project>-<version>` | `antalya-26.3` |
-| CI | `ci/<project>-<version>` | `ci/antalya-26.3` |
-| Feature | `feature/<project>-<version>/<id>` | `feature/antalya-26.3/s3-disk` |
-| PR Feature | `feature/<project>-<version>/pr-<N>` | `feature/antalya-26.3/pr-42` |
-
-The `<project>` name is derived from `ci.branch_prefix` (e.g. `ci/antalya` → `antalya`).
+| Base | `target_branch` or `<project>-<version>` | `antalya-26.3` |
+| CI | `ci/<base>` | `ci/antalya-26.3` |
+| Feature | `feature/<base>/<id>` | `feature/antalya-26.3/s3-disk` |
+| PR Feature | `feature/<base>/pr-<N>` | `feature/antalya-26.3/pr-42` |
 
 ## Installation
 
@@ -70,14 +82,14 @@ export RELEASY_SSH_KEY_PATH="~/.ssh/id_rsa" # optional
 3. Run Phase 1 (base + CI):
 
 ```bash
+# Using an explicit target_branch in config:
+releasy run
+
+# Or, deriving the base branch from a tag:
 releasy run --onto v26.3.4.234-lts
 ```
 
-4. Merge the CI PR on GitHub, then run Phase 2 (features):
-
-```bash
-releasy run --onto v26.3.4.234-lts
-```
+4. Merge the CI PR on GitHub, then run Phase 2 (features) the same way.
 
 ## Configuration
 
@@ -98,10 +110,17 @@ origin:
 upstream:
   remote: https://github.com/ClickHouse/ClickHouse.git
 
+# Project name (used for derived branch names)
+project: antalya
+
+# Target/base branch PRs are opened into.
+# When set, --onto becomes optional on the CLI.
+target_branch: antalya-26.3
+
 ci:
   branch_prefix: ci/antalya
   source_branch: antalya-ci    # omit to skip CI rebase entirely
-  if_exists: redo              # skip (default) or redo
+  if_exists: recreate          # skip (default) or recreate
 
 # Static feature branches
 features:
@@ -124,6 +143,18 @@ pr_sources:
 
   exclude_prs:
     - https://github.com/Altinity/ClickHouse/pull/789
+
+  # Sequential PR groups: cherry-pick multiple PRs onto ONE branch and
+  # open ONE combined PR. Use when later PRs depend on earlier ones.
+  # AI conflict resolution runs per cherry-pick step (resolve+build+
+  # commit locally); push and combined PR happen once after the last step.
+  groups:
+    - id: iceberg-rest
+      description: "Iceberg REST catalog support"
+      prs:
+        - https://github.com/Altinity/ClickHouse/pull/1500
+        - https://github.com/Altinity/ClickHouse/pull/1512
+        - https://github.com/Altinity/ClickHouse/pull/1530
 ```
 
 ### Key config options
@@ -134,14 +165,24 @@ pr_sources:
 | `work_dir` | Path to existing repo clone (or where to clone) | cwd |
 | `origin.remote` | Origin repo URL (required) | — |
 | `upstream.remote` | Upstream repo URL (optional) | — |
+| `project` | Short project identifier (used in derived branch names) | — |
+| `target_branch` | Explicit base branch; makes `--onto` optional | derived |
+| `wip_commit_on_conflict` | On unresolved conflict: `true` = commit markers as WIP and continue; `false` = stop and leave for manual fix | `false` |
 | `ci.source_branch` | Branch with CI commits; empty = skip CI rebase | — |
-| `ci.if_exists` | `skip` or `redo` when branch exists | `skip` |
+| `ci.if_exists` | `skip` or `recreate` when branch exists | `skip` |
 | `pr_sources.by_labels[].labels` | Labels a PR must have (AND logic) | — |
 | `pr_sources.by_labels[].merged_only` | Only include merged PRs | `false` |
 | `pr_sources.by_labels[].auto_pr` | Auto-create PR into base branch | `false` |
+| `pr_sources.by_labels[].if_exists` | Override `pr_sources.if_exists` per group | inherits |
 | `pr_sources.exclude_labels` | Drop PRs carrying any of these labels | `[]` |
 | `pr_sources.include_prs` | Always include these PRs (by URL) | `[]` |
 | `pr_sources.exclude_prs` | Always exclude these PRs (by URL) | `[]` |
+| `pr_sources.groups[].id` | Group id; becomes feature id and branch name (`feature/<base>/<id>`) | — |
+| `pr_sources.groups[].prs` | Ordered list of PR URLs to cherry-pick onto a single branch and combine into one PR | — |
+| `pr_sources.groups[].description` | Title text for the combined PR | id |
+| `pr_sources.groups[].auto_pr` | Open a combined PR for the group | `true` |
+| `pr_sources.groups[].if_exists` | Override `pr_sources.if_exists` per group | inherits |
+| `pr_sources.if_exists` | When a port branch exists *locally only*: `skip` or `recreate`. Also: with `recreate`, an in-progress cherry-pick / merge / rebase at startup is auto-aborted; with `skip` the pipeline halts. Branches that already exist on the remote are always skipped. | `skip` |
 
 ### Environment variables
 
@@ -155,11 +196,14 @@ pr_sources:
 ### Pipeline
 
 ```bash
-# Run the phased pipeline
-releasy run --onto <tag-or-sha> [--work-dir <path>]
+# Run the phased pipeline (--onto optional when target_branch is in config)
+releasy run [--onto <tag-or-sha>] [--work-dir <path>]
 
-# Mark a conflict-resolved branch
-releasy continue --branch <branch-or-feature-id>
+# Continue after manual conflict resolution.
+# - No args: process every port in state (push + open PRs for resolved
+#   ones, highlight any still-unresolved).
+# - --branch <name>: just mark that one branch as resolved.
+releasy continue [--branch <branch-or-feature-id>]
 
 # Skip a conflicted branch
 releasy skip --branch <branch-or-feature-id>
@@ -200,18 +244,40 @@ releasy release \
 
 ## Conflict Resolution
 
-On conflict, the pipeline stops and tells you exactly what to do:
+When a cherry-pick conflicts and the AI resolver doesn't fix it (or is
+disabled), the pipeline **stops on the first unresolved conflict** and leaves
+the working tree in the conflicted state so you can resolve it manually:
 
 ```
-✗ Conflict rebasing CI!
-  • cmake/autogenerated_versions.txt
+✗ Conflict!
+  • src/Access/AccessControl.h
+  • src/Access/Authentication.cpp
 
-  Resolve: cd /path/to/repo
-  Then: git add <files> && git rebase --continue
-  When done: releasy continue --branch ci/antalya-26.3
+Pipeline stopped on unresolved conflict.
+Branch feature/antalya-26.3/pr-1430 left with conflict markers
+and an in-progress cherry-pick.
+
+To resolve manually:
+  cd /path/to/repo
+  # edit the conflicted files, then:
+  git add -A && git cherry-pick --continue
+  releasy continue
+  releasy run    # to continue with remaining PRs
 ```
 
-For PR-based features, conflict markers are committed as a WIP and pushed (if push enabled), so someone can resolve them via the PR.
+`releasy continue` (no args) walks every port in state and:
+
+- **`ok` / `skipped` / `disabled`** — leaves them alone.
+- **`conflict`, now resolved** (clean tree, commit beyond base) — marks
+  resolved, pushes, opens the PR.
+- **`conflict`, still unresolved** — highlights it with the conflicting
+  files and the `cd … && git status` hint, then moves on. Re-run
+  `releasy continue` after fixing.
+- **`resolved` without a PR yet** — pushes and opens the PR.
+
+If you'd rather have releasy auto-commit conflict markers as a WIP, push
+them, and open a "needs resolution" PR (the old behavior), set
+`wip_commit_on_conflict: true` in `config.yaml`.
 
 ## Safety
 

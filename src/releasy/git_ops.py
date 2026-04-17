@@ -53,20 +53,24 @@ def run_git(
 # ---------------------------------------------------------------------------
 
 
-def ensure_work_repo(config: Config, work_dir: Path) -> Path:
+def ensure_work_repo(config: Config, work_dir: Path) -> tuple[Path, bool]:
     """Ensure a local clone of the origin repo exists and has the right remotes.
 
     If work_dir itself is a git repo, it is used directly.
     Otherwise, a clone is created at work_dir/repo.
-    Returns the repo path.
+
+    Returns ``(repo_path, freshly_cloned)``.
     """
     if (work_dir / ".git").exists():
         repo_path = work_dir
     else:
         repo_path = work_dir / "repo"
 
+    freshly_cloned = False
     if not (repo_path / ".git").exists():
+        work_dir.mkdir(parents=True, exist_ok=True)
         run_git(["clone", config.origin.remote, "repo"], work_dir)
+        freshly_cloned = True
         if config.upstream:
             run_git(
                 ["remote", "add", config.upstream.remote_name, config.upstream.remote],
@@ -84,7 +88,15 @@ def ensure_work_repo(config: Config, work_dir: Path) -> Path:
             if result.returncode != 0:
                 run_git(["remote", "add", rname, rurl], repo_path, check=False)
 
-    return repo_path
+    return repo_path, freshly_cloned
+
+
+def update_submodules(repo_path: Path, jobs: int = 8) -> None:
+    """Initialise and update all submodules recursively."""
+    run_git(
+        ["submodule", "update", "--init", "--recursive", "--jobs", str(jobs)],
+        repo_path,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +131,30 @@ def is_operation_in_progress(repo_path: Path) -> bool:
     )
 
 
+def abort_in_progress_op(repo_path: Path) -> str | None:
+    """Abort whichever git operation is currently in progress, if any.
+
+    Returns the operation kind (``"cherry-pick"`` / ``"merge"`` /
+    ``"rebase"``) when something was aborted, or ``None`` if the working
+    tree was already clean.
+    """
+    git_dir = repo_path / ".git"
+    if (git_dir / "CHERRY_PICK_HEAD").exists():
+        run_git(["cherry-pick", "--abort"], repo_path, check=False)
+        kind = "cherry-pick"
+    elif (git_dir / "MERGE_HEAD").exists():
+        run_git(["merge", "--abort"], repo_path, check=False)
+        kind = "merge"
+    elif (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists():
+        run_git(["rebase", "--abort"], repo_path, check=False)
+        kind = "rebase"
+    else:
+        return None
+    run_git(["reset", "--hard", "HEAD"], repo_path, check=False)
+    run_git(["clean", "-fd"], repo_path, check=False)
+    return kind
+
+
 # ---------------------------------------------------------------------------
 # Branch operations
 # ---------------------------------------------------------------------------
@@ -146,6 +182,23 @@ def branch_exists(repo_path: Path, branch: str, remote: str | None = None) -> bo
         if result.returncode == 0:
             return True
     return False
+
+
+def local_branch_exists(repo_path: Path, branch: str) -> bool:
+    """Check if the branch exists locally (refs/heads/<branch>)."""
+    result = run_git(
+        ["rev-parse", "--verify", f"refs/heads/{branch}"], repo_path, check=False,
+    )
+    return result.returncode == 0
+
+
+def remote_branch_exists(repo_path: Path, branch: str, remote: str) -> bool:
+    """Check if the branch exists on the given remote (refs/remotes/<remote>/<branch>)."""
+    result = run_git(
+        ["rev-parse", "--verify", f"refs/remotes/{remote}/{branch}"],
+        repo_path, check=False,
+    )
+    return result.returncode == 0
 
 
 def ref_exists_locally(repo_path: Path, ref: str) -> bool:
@@ -399,6 +452,20 @@ def cherry_pick_merge_commit(
         conflict_files=conflict_files,
         error_message=result.stderr.strip() if result.stderr else None,
     )
+
+
+def append_commit_trailer(repo_path: Path, key: str, value: str) -> bool:
+    """Append a ``Key: value`` trailer to HEAD's commit message.
+
+    Uses ``git commit --amend --no-edit --trailer`` (Git 2.32+). Returns
+    True on success.
+    """
+    result = run_git(
+        ["commit", "--amend", "--no-edit", "--trailer", f"{key}: {value}"],
+        repo_path,
+        check=False,
+    )
+    return result.returncode == 0
 
 
 def commit_conflict_markers(repo_path: Path) -> bool:

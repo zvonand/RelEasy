@@ -23,18 +23,19 @@ releasy/
 
 ## 3. Branch Naming Convention
 
-Branch names are derived from the upstream ref:
+The base/target branch is taken from `target_branch` in config when set;
+otherwise it's derived as `<project>-<version>` from the upstream ref:
 - Tags like `v26.3.4.234-lts` → version suffix `26.3`
 - Raw SHAs → first 8 characters
 
 | Type | Pattern | Example |
 |------|---------|---------|
-| Base | `<project>-<version>` | `antalya-26.3` |
-| CI | `ci/<project>-<version>` | `ci/antalya-26.3` |
-| Feature | `feature/<project>-<version>/<id>` | `feature/antalya-26.3/s3-disk` |
-| PR Feature | `feature/<project>-<version>/pr-<N>` | `feature/antalya-26.3/pr-42` |
+| Base | `target_branch` or `<project>-<version>` | `antalya-26.3` |
+| CI | `ci/<base>` | `ci/antalya-26.3` |
+| Feature | `feature/<base>/<id>` | `feature/antalya-26.3/s3-disk` |
+| PR Feature | `feature/<base>/pr-<N>` | `feature/antalya-26.3/pr-42` |
 
-- `<project>` is derived from `ci.branch_prefix` in config (e.g. `ci/antalya` → project = `antalya`)
+- `<project>` is taken from the top-level `project:` config key
 - Old branches stay on the remote as history — nothing is force-pushed or destroyed
 
 ---
@@ -55,10 +56,18 @@ upstream:
   remote: https://github.com/ClickHouse/ClickHouse.git
   remote_name: upstream
 
+# Project identifier — used for derived branch names
+project: antalya
+
+# Target/base branch PRs are opened into.
+# When set, --onto becomes optional on the CLI.
+# When unset, the base branch is derived as <project>-<version-from-onto>.
+target_branch: antalya-26.3
+
 ci:
   branch_prefix: ci/antalya
   source_branch: antalya-ci    # omit or leave empty to skip CI rebase
-  if_exists: skip              # skip (default) or redo
+  if_exists: skip              # skip (default) or recreate
 
 features:
   - id: s3-disk
@@ -89,6 +98,17 @@ pr_sources:
   exclude_prs:
     - https://github.com/Altinity/ClickHouse/pull/789
 
+  # Sequential PR groups: cherry-pick multiple PRs onto ONE branch in
+  # listed order and open ONE combined PR. Use when later PRs depend on
+  # earlier ones.
+  groups:
+    - id: iceberg-rest
+      description: "Iceberg REST catalog support"
+      prs:
+        - https://github.com/Altinity/ClickHouse/pull/1500
+        - https://github.com/Altinity/ClickHouse/pull/1512
+        - https://github.com/Altinity/ClickHouse/pull/1530
+
 notifications:
   github_project: https://github.com/orgs/Altinity/projects/1
 ```
@@ -104,7 +124,8 @@ notifications:
 - `pr_sources.exclude_labels`: any PR carrying at least one of these labels is dropped (unless it appears in `include_prs`).
 - `pr_sources.include_prs`: always include these PRs by URL, regardless of labels.
 - `pr_sources.exclude_prs`: always exclude these PRs by URL — final override.
-- PRs are processed in merge order (earliest merged first).
+- `pr_sources.groups`: each group is one *unit of work* — its PRs are cherry-picked, in listed order, onto a single port branch named `feature/<base>/<id>`, and (when `auto_pr` and `push`) result in ONE combined PR. A PR may appear in at most one group; PRs claimed by a group are removed from the standalone stream. `exclude_prs` and `exclude_labels` still drop individual PRs from a group; an emptied group is skipped with a warning. AI conflict resolution runs per cherry-pick step (resolve + build + commit, locally only); RelEasy pushes the branch and opens the combined PR after all steps succeed and tags the PR with `ai_resolve.label` if any step needed AI.
+- PRs are processed in merge order (earliest merged first); groups sort by their earliest constituent merge time.
 - `enabled: false` excludes a feature from the pipeline entirely.
 - `depends_on` declares inter-feature dependencies (manual ordering in v1).
 
@@ -122,18 +143,22 @@ notifications:
 ### Invocation
 
 ```
-releasy run --onto <upstream-tag-or-sha>
+releasy run [--onto <upstream-tag-or-sha>]
 ```
 
-The pipeline runs in phases. State is saved after each phase so it can be resumed.
+`--onto` is optional when `target_branch` is set in config. The pipeline runs
+in phases. State is saved after each phase so it can be resumed.
 
 ---
 
 ### Phase 1a — Create Base Branch
 
 1. Fetch upstream (if configured) and origin remotes.
-2. Parse the `--onto` ref to derive the version suffix (e.g. `v26.3.4.234-lts` → `26.3`).
-3. Create base branch `<project>-<version>` from the target ref.
+2. Determine the base branch name:
+   - If `target_branch` is set in config, use it as-is.
+   - Otherwise, parse `--onto` to derive `<project>-<version>` (e.g.
+     `v26.3.4.234-lts` → `antalya-26.3`).
+3. Create the base branch from the target ref (when not already on origin).
 4. Push to origin (if `push: true`).
 5. Save state: `phase = base_created`.
 
@@ -166,14 +191,16 @@ PRs are collected and filtered using set arithmetic:
 2. **Exclude by label:** Remove any PR carrying at least one `exclude_labels` label (unless it's in `include_prs`).
 3. **Include individual PRs:** Fetch any `include_prs` URLs not already in the set.
 4. **Exclude individual PRs:** Remove any `exclude_prs` URLs — final override.
+5. **Materialise groups:** For each `pr_sources.groups[]`, fetch its PRs (subject to `exclude_prs` / `exclude_labels`). PRs claimed by a group are removed from the singleton stream and processed as one feature unit.
 
-For each PR in the filtered set:
+A *feature unit* is either a single PR or a sequential PR group. For each unit (sorted by earliest merge time):
 
-1. Create feature branch `feature/<project>-<version>/pr-<N>` from base.
-2. Cherry-pick the merge commit (`-m 1`).
-3. On conflict: commit conflict markers as WIP, push anyway.
-4. Open PR: feature → base (if `push: true` + `auto_pr: true`).
-5. Conflict PRs include a warning banner in the PR body.
+1. Create feature branch `feature/<project>-<version>/<id>` from base. The id is `pr-<N>` for singletons or the group `id` for groups.
+2. Cherry-pick each PR's merge commit (`-m 1`) in listed order.
+3. On a clean run: push and (if `push` + `auto_pr`) open ONE PR. Group PRs include a body listing every constituent PR.
+4. On conflict (singleton or any step inside a group): try AI resolve in *step mode* — Claude resolves the conflict, builds, and commits locally; RelEasy then continues with the next cherry-pick (or finalises the unit). On AI failure: halt for manual resolution (or commit WIP markers + push if `wip_commit_on_conflict: true`).
+5. Each cherry-pick produces ONE commit (`git cherry-pick -m 1 --no-edit`; AI build-fix iterations only `--amend` that same commit). For groups, RelEasy appends a `Source-PR: #<N> (<url>)` trailer to each commit so the combined PR's commit list is self-attributing.
+6. After all PRs in a unit are applied (clean or AI-resolved), push the branch and (when `auto_pr` + `push`) open ONE PR. If any step used AI, the PR title gets the `ai-resolved:` prefix and the PR is tagged with `ai_resolve.label`.
 
 #### Static feature branches
 
@@ -267,7 +294,7 @@ Last run: 2026-03-21 · Upstream commit: `v26.3.4.234-lts` · Phase: features_do
 
 ```
 # Pipeline
-releasy [--config <path>] run --onto <tag-or-sha> [--work-dir <path>]
+releasy [--config <path>] run [--onto <tag-or-sha>] [--work-dir <path>]
 releasy continue --branch <name>
 releasy skip --branch <name>
 releasy abort
