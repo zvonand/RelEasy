@@ -148,6 +148,16 @@ class Config:
     # it, releasy can either leave the working tree dirty (default) so you
     # resolve manually, or commit the conflict markers as a WIP and push.
     wip_commit_on_conflict: bool = False
+    # When a PR for the port branch already exists on GitHub:
+    #   false (default) — leave it exactly as-is; don't try to create a new
+    #                     one and don't touch its title/body.
+    #   true            — reuse that PR but overwrite its title and body with
+    #                     what releasy would have set (source PR references,
+    #                     combined group body, ai-resolved prefix, …). Useful
+    #                     when the source PRs' descriptions changed or you
+    #                     tweaked the body format and want the rebase PR to
+    #                     reflect it.
+    update_existing_prs: bool = False
     features: list[FeatureConfig] = field(default_factory=list)
     pr_sources: PRSourcesConfig = field(default_factory=PRSourcesConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
@@ -368,6 +378,7 @@ def load_config(config_path: Path | None = None) -> Config:
         upstream=upstream,
         target_branch=raw.get("target_branch") or None,
         wip_commit_on_conflict=bool(raw.get("wip_commit_on_conflict", False)),
+        update_existing_prs=bool(raw.get("update_existing_prs", False)),
         features=features,
         pr_sources=pr_sources,
         notifications=notifications,
@@ -402,6 +413,9 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
 
     if config.wip_commit_on_conflict:
         data["wip_commit_on_conflict"] = True
+
+    if config.update_existing_prs:
+        data["update_existing_prs"] = True
 
     data["features"] = [
         {

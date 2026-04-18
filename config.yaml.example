@@ -17,6 +17,20 @@
 #                     to the next PR.
 # wip_commit_on_conflict: false
 
+# ── Existing-PR behaviour ───────────────────────────────────────────
+# When a PR for the port branch already exists on GitHub:
+#   false (default) — leave it exactly as-is. Don't try to create a new
+#                     one (avoids GitHub 422s) and don't touch its
+#                     title/body/labels. You can still edit the PR
+#                     manually on GitHub.
+#   true            — reuse the same PR but overwrite its title and body
+#                     with what releasy would have set (source-PR refs,
+#                     combined group body, ai-resolved prefix, …). Handy
+#                     when upstream PR descriptions changed or you
+#                     tweaked the body format and want the rebase PR to
+#                     reflect it.
+# update_existing_prs: false
+
 # ── Work directory ──────────────────────────────────────────────────
 # Where to clone/find the origin repo for git operations.
 # If it points to an existing git repo, it will be reused (no clone).
@@ -54,25 +68,6 @@ project: antalya
 #
 # The base branch must already exist on origin before running.
 target_branch: antalya-26.3
-
-# ── CI configuration ───────────────────────────────────────────────
-# branch_prefix: used to derive the project name and branch names.
-#   "ci/antalya" → project = "antalya"
-#   Base branch:    antalya-26.3      (from tag v26.3.x.y-...)
-#   CI branch:      ci/antalya-26.3
-#   Feature branch: feature/antalya-26.3/<id>
-#
-# source_branch: the branch on the origin containing CI/infra commits.
-#   If omitted or empty, CI rebase is skipped entirely — useful when
-#   someone else has already rebased CI and you only need features.
-#
-# if_exists: what to do when the branch already exists.
-#   "skip" (default) — leave existing branches alone.
-#   "redo" — recreate from scratch.
-ci:
-  branch_prefix: ci/antalya
-  source_branch: antalya-ci
-  # if_exists: skip
 
 # ── Static feature branches ────────────────────────────────────────
 # Each feature is rebased onto the base branch as a separate branch.
@@ -207,27 +202,18 @@ notifications:
 # ─────────────────────────────────────────────────────────────────────
 # WORKFLOW
 #
-# The pipeline runs in phases with state persisted between runs:
+# The base branch must already exist on origin. The pipeline then ports
+# each discovered PR / feature onto it:
 #
-# Phase 1a — Create base branch from upstream tag/commit:
-#   releasy run --onto v26.3.4.234-lts
-#   → creates branch "antalya-26.3" from the tag
-#
-# Phase 1b — Rebase CI onto base (skipped if source_branch is empty):
-#   → creates "ci/antalya-26.3" with CI commits rebased
-#   → opens PR: ci/antalya-26.3 → antalya-26.3 (if push: true)
-#   → STOPS here. Merge the CI PR before proceeding.
-#
-# Phase 2 — Rebase features (run again after CI merged):
-#   releasy run --onto v26.3.4.234-lts
-#   → detects CI phase is done, proceeds to features
-#   → creates "feature/antalya-26.3/<id>" for each feature/PR
+#   releasy run --onto v26.3.4.234-lts   # (or just: releasy run, when
+#                                        #  target_branch is set above)
+#   → creates "feature/antalya-26.3/<id>" for each PR / feature
 #   → opens PRs into antalya-26.3 (if push + auto_pr)
 #
 # On conflict:
 #   cd <work_dir>
 #   # resolve conflicts
-#   git add <files> && git rebase --continue
+#   git add <files> && git cherry-pick --continue
 #   releasy continue --branch <name>
 #
 # Then run again to resume from where it stopped.

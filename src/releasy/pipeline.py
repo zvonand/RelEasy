@@ -45,6 +45,7 @@ from releasy.github_ops import (
     parse_pr_url,
     search_prs_by_labels,
     sync_project,
+    update_pull_request,
 )
 from releasy.state import FeatureState, PipelineState, load_state, save_state
 from releasy.status import write_status_md
@@ -226,6 +227,60 @@ def _build_group_units(
     return units, claimed
 
 
+def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
+    """Drop singleton state entries for PRs now claimed by a ``pr_sources.group``.
+
+    When a PR that used to be ported as its own feature (``pr-<N>``) is
+    moved into a group entry in ``pr_sources.groups``, the group becomes the
+    unit of work (``feature/<base>/<group-id>``) and the old singleton state
+    entry is stale. Left alone, ``continue`` would keep pushing it and opening
+    a duplicate PR alongside the group's combined PR.
+
+    This helper removes those stale singleton entries from state. Any branches
+    / PRs they already produced are left on GitHub — the user decides whether
+    to close them.
+
+    Returns True if any entry was removed (so the caller can persist state).
+    """
+    group_pr_numbers: set[int] = set()
+    group_feature_ids: set[str] = set()
+    for group in config.pr_sources.groups:
+        group_feature_ids.add(group.id)
+        for url in group.prs:
+            num = parse_pr_url(url)
+            if num is not None:
+                group_pr_numbers.add(num)
+
+    if not group_pr_numbers:
+        return False
+
+    stale: list[tuple[str, FeatureState]] = []
+    for fid, fs in state.features.items():
+        if fid in group_feature_ids:
+            continue  # the group's own state entry
+        if len(fs.pr_numbers) > 1:
+            continue  # a different multi-PR unit
+        if fs.pr_number is None:
+            continue
+        if fs.pr_number in group_pr_numbers:
+            stale.append((fid, fs))
+
+    for fid, fs in stale:
+        extra = ""
+        if fs.rebase_pr_url:
+            extra = (
+                f" — open rebase PR {fs.rebase_pr_url} left untouched; "
+                "close it manually if superseded by the group PR"
+            )
+        console.print(
+            f"  [yellow]⚠[/yellow] Dropping stale singleton "
+            f"[cyan]{fid}[/cyan] (PR #{fs.pr_number} is now in a group){extra}"
+        )
+        del state.features[fid]
+
+    return bool(stale)
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
@@ -243,6 +298,7 @@ def run_pipeline(
     runs when both this flag and ``config.ai_resolve.enabled`` are true.
     """
     state = load_state(config.repo_dir)
+    _prune_superseded_singletons(config, state)
     repo_path = _setup_repo(config, work_dir, config.base_branch_name(onto))
 
     if is_operation_in_progress(repo_path):
@@ -867,22 +923,14 @@ def _finish_clean_unit(
         title = _unit_title(unit)
         if ai_used:
             title = title.replace("[releasy]", "[releasy] ai-resolved:", 1)
-        rebase_pr_url = create_pull_request(
+        rebase_pr_url, outcome = _ensure_pr_for_branch(
             config, new_branch, base_branch, title, _unit_body(unit),
         )
+        _log_pr_action(outcome, rebase_pr_url)
         if rebase_pr_url:
             state.features[unit.feature_id].rebase_pr_url = rebase_pr_url
-            console.print(
-                f"    [green]✓[/green] PR opened: [link={rebase_pr_url}]"
-                f"{rebase_pr_url}[/link]"
-            )
             if ai_used:
                 _apply_ai_label_to_pr(config, rebase_pr_url)
-        else:
-            console.print(
-                "    [yellow]![/yellow] Branch pushed but PR not created "
-                "(see warnings above)"
-            )
     elif config.push and ai_used:
         # Branch pushed but no auto_pr — try to label any pre-existing PR.
         existing = find_pr_for_branch(config, new_branch, base_branch)
@@ -891,6 +939,66 @@ def _finish_clean_unit(
             state.features[unit.feature_id].rebase_pr_url = existing.url
 
     _update_state_and_status(config, state)
+
+
+def _ensure_pr_for_branch(
+    config: Config,
+    branch: str,
+    base_branch: str,
+    title: str,
+    body: str,
+) -> tuple[str | None, str]:
+    """Create a PR for ``branch`` or reuse / update an existing one.
+
+    Behaviour:
+      - If GitHub already has an open PR from ``branch`` → ``base_branch``:
+          * with ``update_existing_prs: true`` in config, edit its title
+            and body to match what releasy would have set, then return
+            ``(url, "updated")``.
+          * otherwise return ``(url, "reused")`` without touching the PR.
+      - If no matching PR is open, create a new one and return
+        ``(url, "created")``. On creation failure returns ``(None, "failed")``.
+    """
+    existing = find_pr_for_branch(config, branch, base_branch)
+    if existing:
+        if config.update_existing_prs:
+            ok = update_pull_request(
+                config, existing.number, title=title, body=body,
+            )
+            if ok:
+                return existing.url, "updated"
+            return existing.url, "reused"
+        return existing.url, "reused"
+
+    url = create_pull_request(config, branch, base_branch, title, body)
+    if url:
+        return url, "created"
+    return None, "failed"
+
+
+def _log_pr_action(outcome: str, url: str | None) -> None:
+    """Pretty-print the result of ``_ensure_pr_for_branch``."""
+    if outcome == "created" and url:
+        console.print(
+            f"    [green]✓[/green] PR opened: [link={url}]{url}[/link]"
+        )
+    elif outcome == "updated" and url:
+        console.print(
+            f"    [green]✓[/green] PR updated: [link={url}]{url}[/link]"
+        )
+    elif outcome == "reused" and url:
+        console.print(
+            f"    [dim]PR already open — left as-is: "
+            f"[link={url}]{url}[/link] "
+            f"(set [cyan]update_existing_prs: true[/cyan] to overwrite "
+            f"title/body)[/dim]"
+        )
+    else:
+        console.print(
+            "    [yellow]![/yellow] Branch pushed but PR not created "
+            "(see warnings above — common causes: PR already exists but "
+            "was closed, or head/base have no difference)"
+        )
 
 
 def _apply_ai_label_to_pr(
@@ -1104,20 +1212,39 @@ def _open_pr_for_resolved(
         _push(config, repo_path, branch)
         console.print(f"    [green]✓[/green] Pushed [cyan]{branch}[/cyan]")
 
-    if fs.rebase_pr_url:
-        console.print(
-            f"    [dim]PR already opened: {fs.rebase_pr_url}[/dim]"
-        )
-        return
+    title_src = fs.pr_title or branch
+    body_parts: list[str] = []
+    pr_numbers = fs.pr_numbers or ([fs.pr_number] if fs.pr_number else [])
+    if pr_numbers:
+        source_refs = ", ".join(f"#{n}" for n in pr_numbers)
+        body_parts.append(f"Cherry-picked from {source_refs}.")
+    if fs.pr_body:
+        body_parts.append(f"\n---\n\n{fs.pr_body}")
+    title = f"[releasy] {title_src}"
+    body = "\n".join(body_parts) or branch
 
-    existing = find_pr_for_branch(config, branch, base_branch)
-    if existing:
-        fs.rebase_pr_url = existing.url
-        state.features[_feature_id_from_branch(state, branch)] = fs
-        console.print(
-            f"    [dim]PR already exists on GitHub — reusing: "
-            f"[link={existing.url}]{existing.url}[/link][/dim]"
-        )
+    if fs.rebase_pr_url:
+        if config.update_existing_prs:
+            pr_num = _pr_number_from_url(fs.rebase_pr_url)
+            if pr_num is not None and update_pull_request(
+                config, pr_num, title=title, body=body,
+            ):
+                console.print(
+                    f"    [green]✓[/green] PR updated: "
+                    f"[link={fs.rebase_pr_url}]{fs.rebase_pr_url}[/link]"
+                )
+            else:
+                console.print(
+                    f"    [yellow]![/yellow] Could not update PR "
+                    f"{fs.rebase_pr_url}"
+                )
+        else:
+            console.print(
+                f"    [dim]PR already opened — left as-is: "
+                f"[link={fs.rebase_pr_url}]{fs.rebase_pr_url}[/link] "
+                f"(set [cyan]update_existing_prs: true[/cyan] to overwrite "
+                f"title/body)[/dim]"
+            )
         return
 
     remote_base = f"{config.origin.remote_name}/{base_branch}"
@@ -1141,31 +1268,21 @@ def _open_pr_for_resolved(
             )
             return
 
-    title_src = fs.pr_title or branch
-    body_parts = []
-    pr_numbers = fs.pr_numbers or ([fs.pr_number] if fs.pr_number else [])
-    if pr_numbers:
-        source_refs = ", ".join(f"#{n}" for n in pr_numbers)
-        body_parts.append(f"Cherry-picked from {source_refs}.")
-    if fs.pr_body:
-        body_parts.append(f"\n---\n\n{fs.pr_body}")
-
-    pr_url = create_pull_request(
-        config, branch, base_branch,
-        f"[releasy] {title_src}", "\n".join(body_parts) or branch,
+    pr_url, outcome = _ensure_pr_for_branch(
+        config, branch, base_branch, title, body,
     )
+    _log_pr_action(outcome, pr_url)
     if pr_url:
         fs.rebase_pr_url = pr_url
         state.features[_feature_id_from_branch(state, branch)] = fs
-        console.print(
-            f"    [green]✓[/green] PR opened: [link={pr_url}]{pr_url}[/link]"
-        )
-    else:
-        console.print(
-            "    [yellow]![/yellow] Branch pushed but PR not created "
-            "(see warnings above — common causes: PR already exists but "
-            "was closed, or head/base have no difference)"
-        )
+
+
+def _pr_number_from_url(url: str) -> int | None:
+    """Parse the trailing ``/pull/<N>`` segment of a PR URL."""
+    try:
+        return int(url.rstrip("/").rsplit("/", 1)[-1])
+    except (ValueError, IndexError):
+        return None
 
 
 def _feature_id_from_branch(state: PipelineState, branch: str) -> str:
@@ -1190,6 +1307,9 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
             "[yellow]No features in state. Run 'releasy run' first.[/yellow]"
         )
         return False
+
+    if _prune_superseded_singletons(config, state):
+        _update_state_and_status(config, state)
 
     repo_path = _setup_repo(config, work_dir, state.base_branch)
 

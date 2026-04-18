@@ -2,7 +2,7 @@
 
 CLI tool for managing fork rebases, feature branches, and release construction.
 
-RelEasy automates maintaining a repo (typically a fork) against an optional upstream. Instead of rebasing long-lived branches (which accumulates conflicts), it creates a **base branch** from a tag/commit, rebases CI and features on top, and opens PRs — all in a phased, resumable workflow.
+RelEasy automates maintaining a repo (typically a fork) against an optional upstream. Instead of rebasing long-lived branches (which accumulates conflicts), it ports features and PRs onto a stable **base branch** (a tag/commit you pin to) and opens PRs — all in a resumable workflow.
 
 ## TL;DR
 
@@ -21,29 +21,22 @@ releasy run --onto v26.3.4.234-lts
 ```
 upstream:  ... --- v26.3.4.234-lts
                          |
-antalya-26.3:            * (clean base branch)
-                         |
-ci/antalya-26.3:         * --- ci1 --- ci2 (CI rebased, PR → antalya-26.3)
-                         |
-                    [CI PR merged into antalya-26.3]
+antalya-26.3:            * (stable base branch, already on origin)
                          |
 feature/antalya-26.3/pr-42:   * --- fix (PR → antalya-26.3)
 feature/antalya-26.3/pr-99:   * --- feat (PR → antalya-26.3)
 ```
 
-### Phased Pipeline
+### Pipeline
 
-**Phase 1** — Base + CI (first `releasy run`):
-1. Create base branch `antalya-26.3` from upstream `v26.3.4.234-lts`
-2. Rebase CI commits onto base → `ci/antalya-26.3`
-3. Open PR: CI → base (if `push: true`)
-4. **Stop.** Wait for CI PR to be merged.
+Given an existing base branch on origin, `releasy run`:
 
-**Phase 2** — Features (run again after CI merged):
-1. Rebase each feature onto base → `feature/antalya-26.3/<id>`
-2. Open PRs: each feature → base (if `push: true` + `auto_pr: true`)
+1. Discovers PRs from `pr_sources` (labels, explicit include/exclude lists, groups).
+2. For each PR / group, creates a port branch `feature/<base>/<id>` from the base.
+3. Cherry-picks the PR merge commit(s) onto the port branch.
+4. Pushes and opens a PR into the base (if `push: true` and `auto_pr: true`).
 
-On conflict at any phase, the pipeline stops with instructions. Resolve, run `releasy continue`, then `releasy run` again.
+On conflict, the pipeline stops with instructions. Resolve, run `releasy continue`, then `releasy run` again to resume with the remaining PRs.
 
 ### Branch Naming
 
@@ -54,7 +47,6 @@ from `--onto` (e.g. `v26.3.4.234-lts` → `26.3`; raw SHAs use the first 8 chars
 | Type | Pattern | Example |
 |------|---------|---------|
 | Base | `target_branch` or `<project>-<version>` | `antalya-26.3` |
-| CI | `ci/<base>` | `ci/antalya-26.3` |
 | Feature | `feature/<base>/<id>` | `feature/antalya-26.3/s3-disk` |
 | PR Feature | `feature/<base>/pr-<N>` | `feature/antalya-26.3/pr-42` |
 
@@ -79,7 +71,7 @@ export RELEASY_GITHUB_TOKEN="ghp_..."      # for PR discovery & creation
 export RELEASY_SSH_KEY_PATH="~/.ssh/id_rsa" # optional
 ```
 
-3. Run Phase 1 (base + CI):
+3. Run the pipeline:
 
 ```bash
 # Using an explicit target_branch in config:
@@ -88,8 +80,6 @@ releasy run
 # Or, deriving the base branch from a tag:
 releasy run --onto v26.3.4.234-lts
 ```
-
-4. Merge the CI PR on GitHub, then run Phase 2 (features) the same way.
 
 ## Configuration
 
@@ -116,11 +106,6 @@ project: antalya
 # Target/base branch PRs are opened into.
 # When set, --onto becomes optional on the CLI.
 target_branch: antalya-26.3
-
-ci:
-  branch_prefix: ci/antalya
-  source_branch: antalya-ci    # omit to skip CI rebase entirely
-  if_exists: recreate          # skip (default) or recreate
 
 # Static feature branches
 features:
@@ -168,8 +153,7 @@ pr_sources:
 | `project` | Short project identifier (used in derived branch names) | — |
 | `target_branch` | Explicit base branch; makes `--onto` optional | derived |
 | `wip_commit_on_conflict` | On unresolved conflict: `true` = commit markers as WIP and continue; `false` = stop and leave for manual fix | `false` |
-| `ci.source_branch` | Branch with CI commits; empty = skip CI rebase | — |
-| `ci.if_exists` | `skip` or `recreate` when branch exists | `skip` |
+| `update_existing_prs` | When a PR already exists for a port branch: `true` = reuse it and overwrite its title/body; `false` = leave it exactly as-is | `false` |
 | `pr_sources.by_labels[].labels` | Labels a PR must have (AND logic) | — |
 | `pr_sources.by_labels[].merged_only` | Only include merged PRs | `false` |
 | `pr_sources.by_labels[].auto_pr` | Auto-create PR into base branch | `false` |
@@ -332,7 +316,7 @@ This creates the project (if needed) and adds the Status field with the correct 
 
 After each state change (when `push: true`), RelEasy:
 - Creates a **view (tab)** for each rebase, named after the base branch (e.g. `antalya-26.3`)
-- Creates a **draft issue card** for each branch (CI + each feature)
+- Creates a **draft issue card** for each port branch
 - Sets the **Status** field to match the pipeline state
 - Updates the card body with upstream commit, conflicted files, etc.
 - On re-runs, replaces old cards with updated ones

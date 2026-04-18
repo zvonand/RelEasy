@@ -144,6 +144,53 @@ def create_pull_request(
         return None
 
 
+def update_pull_request(
+    config: Config,
+    pr_number: int,
+    title: str | None = None,
+    body: str | None = None,
+) -> bool:
+    """Edit the title and/or body of an existing PR on the origin repo.
+
+    Returns True on success, False on failure. A ``None`` argument means
+    "leave that field alone".
+    """
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set — cannot update PR")
+        return False
+
+    slug = get_origin_repo_slug(config)
+    if not slug:
+        log.warning("Could not parse origin remote URL: %s", config.origin.remote)
+        return False
+
+    _assert_not_upstream(config, slug)
+
+    kwargs: dict = {}
+    if title is not None:
+        kwargs["title"] = title
+    if body is not None:
+        kwargs["body"] = body
+    if not kwargs:
+        return True
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        pr = repo.get_pull(pr_number)
+        pr.edit(**kwargs)
+        return True
+    except GithubException as exc:
+        log.warning("Failed to update PR #%d: %s", pr_number, exc)
+        return False
+    except Exception as exc:
+        log.warning("Unexpected error updating PR #%d: %s", pr_number, exc)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # PR search by label
 # ---------------------------------------------------------------------------

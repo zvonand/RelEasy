@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-A standalone CLI tool that manages rebasing branches onto a specified commit/tag. Instead of rebasing long-lived branches in place, it creates a **base branch** from the target ref, rebases CI and features on top via a **phased pipeline**, and optionally opens PRs. Works with a fork against an upstream, or within a single repo for forward-porting/back-porting.
+A standalone CLI tool that ports features and PRs onto a stable **base branch** on origin. Rather than rebasing long-lived branches in place, each feature / PR is cherry-picked onto its own port branch (`feature/<base>/<id>`) and optionally opened as a PR. Works with a fork against an upstream, or within a single repo for forward-porting/back-porting.
 
 The pipeline is **resumable**: state is persisted between runs, and each `releasy run` picks up from where the previous run stopped.
 
@@ -31,7 +31,6 @@ otherwise it's derived as `<project>-<version>` from the upstream ref:
 | Type | Pattern | Example |
 |------|---------|---------|
 | Base | `target_branch` or `<project>-<version>` | `antalya-26.3` |
-| CI | `ci/<base>` | `ci/antalya-26.3` |
 | Feature | `feature/<base>/<id>` | `feature/antalya-26.3/s3-disk` |
 | PR Feature | `feature/<base>/pr-<N>` | `feature/antalya-26.3/pr-42` |
 
@@ -63,11 +62,6 @@ project: antalya
 # When set, --onto becomes optional on the CLI.
 # When unset, the base branch is derived as <project>-<version-from-onto>.
 target_branch: antalya-26.3
-
-ci:
-  branch_prefix: ci/antalya
-  source_branch: antalya-ci    # omit or leave empty to skip CI rebase
-  if_exists: skip              # skip (default) or recreate
 
 features:
   - id: s3-disk
@@ -118,8 +112,7 @@ notifications:
 - `work_dir` can point to an existing git clone. If the directory has a `.git`, it's used directly (no clone).
 - `origin` is required — the repo where branches are pushed and PRs are created.
 - `upstream` is optional — omit it when forward-porting or back-porting within your own repo.
-- `ci.source_branch` empty or omitted → CI rebase phase is skipped entirely.
-- `ci.if_exists` / `by_labels[].if_exists`: `skip` (default) leaves existing branches alone; `redo` recreates from scratch.
+- `pr_sources.*.if_exists`: `skip` (default) leaves existing port branches alone; `recreate` rebuilds them from scratch.
 - `pr_sources.by_labels[].labels`: AND logic — a PR must have ALL listed labels. Multiple `by_labels` entries are unioned.
 - `pr_sources.exclude_labels`: any PR carrying at least one of these labels is dropped (unless it appears in `include_prs`).
 - `pr_sources.include_prs`: always include these PRs by URL, regardless of labels.
@@ -138,7 +131,7 @@ notifications:
 
 ---
 
-## 6. Pipeline: Phased Rebase
+## 6. Pipeline
 
 ### Invocation
 
@@ -146,42 +139,13 @@ notifications:
 releasy run [--onto <upstream-tag-or-sha>]
 ```
 
-`--onto` is optional when `target_branch` is set in config. The pipeline runs
-in phases. State is saved after each phase so it can be resumed.
+`--onto` is optional when `target_branch` is set in config. The base branch
+must already exist on origin; the pipeline verifies this and then ports each
+PR / feature onto it. State is saved after each port so the run is resumable.
 
 ---
 
-### Phase 1a — Create Base Branch
-
-1. Fetch upstream (if configured) and origin remotes.
-2. Determine the base branch name:
-   - If `target_branch` is set in config, use it as-is.
-   - Otherwise, parse `--onto` to derive `<project>-<version>` (e.g.
-     `v26.3.4.234-lts` → `antalya-26.3`).
-3. Create the base branch from the target ref (when not already on origin).
-4. Push to origin (if `push: true`).
-5. Save state: `phase = base_created`.
-
----
-
-### Phase 1b — Rebase CI onto Base
-
-**Skipped** if `ci.source_branch` is empty or omitted.
-
-1. Find CI commits: `merge-base` between `source_branch` and upstream ref.
-2. Create CI branch `ci/<project>-<version>` from the base branch.
-3. `git rebase --onto <base> <divergence> <source_tip>` — replays CI commits, automatically dropping commits already in upstream.
-4. Push and open PR: CI → base (if `push: true`).
-5. Save state: `phase = ci_rebased`.
-6. **Stop.** Print instructions to merge the CI PR before proceeding.
-
-**On conflict:** the rebase is left in progress. User resolves, runs `git rebase --continue`, then `releasy continue --branch <ci-branch>`.
-
----
-
-### Phase 2 — Rebase Features onto Base
-
-Runs when `phase = ci_rebased` (or `ci_merged`).
+### Port PRs onto Base
 
 #### PR-based features
 
@@ -202,17 +166,7 @@ A *feature unit* is either a single PR or a sequential PR group. For each unit (
 5. Each cherry-pick produces ONE commit (`git cherry-pick -m 1 --no-edit`; AI build-fix iterations only `--amend` that same commit). For groups, RelEasy appends a `Source-PR: #<N> (<url>)` trailer to each commit so the combined PR's commit list is self-attributing.
 6. After all PRs in a unit are applied (clean or AI-resolved), push the branch and (when `auto_pr` + `push`) open ONE PR. If any step used AI, the PR title gets the `ai-resolved:` prefix and the PR is tagged with `ai_resolve.label`.
 
-#### Static feature branches
-
-For each enabled feature with a `source_branch`:
-
-1. Find feature commits via `merge-base` against CI source.
-2. Create feature branch `feature/<project>-<version>/<id>` from base.
-3. `git rebase --onto <base> <divergence> <source_tip>`.
-4. Push and open PR (if `push: true` + `auto_pr: true`).
-5. On conflict: rebase left in progress for manual resolution.
-
-After all features: `phase = features_done`.
+After all units: `phase = ports_done`.
 
 ---
 
@@ -246,13 +200,8 @@ Auto-updated after every operation.
 last_run:
   started_at: 2026-03-21T10:00:00Z
   onto: v26.3.4.234-lts
-  phase: ci_rebased          # init | base_created | ci_rebased | ci_merged | features_done
+  phase: ports_done          # init | ports_done
   base_branch: antalya-26.3
-  ci_branch:
-    status: ok
-    branch_name: ci/antalya-26.3
-    base_commit: v26.3.4.234-lts
-    pr_url: https://github.com/Altinity/ClickHouse/pull/100
   features:
     pr-42:
       status: ok
@@ -279,11 +228,10 @@ Updated after every state change.
 ```markdown
 ## RelEasy Branch Status
 
-Last run: 2026-03-21 · Upstream commit: `v26.3.4.234-lts` · Phase: features_done
+Last run: 2026-03-21 · Upstream commit: `v26.3.4.234-lts` · Phase: ports_done
 
 | Branch | Status | Based On | PR | Conflict Files |
 |--------|--------|----------|----|----------------|
-| ci/antalya-26.3 | ✅ ok | `v26.3.4.234-` | CI PR | |
 | feature/antalya-26.3/pr-42 | ✅ ok | `v26.3.4.234-` | #42 | |
 | feature/antalya-26.3/s3-disk | 🔴 conflict | `v26.3.4.234-` | | `src/Storages/StorageS3.cpp` |
 ```
@@ -342,7 +290,7 @@ Creates the project (if needed) and adds the Status field with the correct optio
 
 When `push: true` and `notifications.github_project` is set, after each state change RelEasy:
 - Creates a **view (tab)** per rebase, named after the base branch (e.g. `antalya-26.3`). One project holds all rebases; each gets its own tab.
-- Creates one draft-issue card per branch (CI + each feature).
+- Creates one draft-issue card per port branch.
 - Sets the Status field to the pipeline state (Ok, Conflict, etc.).
 - Updates the card body with upstream commit and conflicted files.
 - On re-runs, deletes old cards and recreates with updated status.
