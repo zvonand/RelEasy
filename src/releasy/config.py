@@ -75,13 +75,23 @@ class PRGroupConfig:
 class PRSourcesConfig:
     """PR discovery and filtering.
 
-    Set arithmetic: union(by_labels) − exclude_labels + include_prs − exclude_prs
+    Set arithmetic:
+        union(by_labels)
+        − exclude_labels − exclude_authors
+        ∩ (include_authors when set)
+        + include_prs
+        − exclude_prs
 
     ``groups`` are evaluated independently: every PR listed in any group is
     ported as part of that group (one combined PR per group), regardless of
-    label matches. ``exclude_prs`` and ``exclude_labels`` still drop
-    individual PRs from a group; if a group ends up empty, it is dropped
-    with a warning.
+    label matches. ``exclude_prs``, ``exclude_labels``, ``include_authors``
+    and ``exclude_authors`` still drop individual PRs from a group; if a
+    group ends up empty, it is dropped with a warning.
+
+    ``include_authors`` (when non-empty) restricts discovered PRs to those
+    authored by one of the listed GitHub logins. ``exclude_authors`` drops
+    PRs by the listed authors. Author comparisons are case-insensitive.
+    Both filters are bypassed for PRs explicitly listed in ``include_prs``.
 
     ``auto_pr`` is a single global switch: when true (the default), every
     pushed port branch (singleton, by-labels, include_prs, or group) gets a
@@ -92,6 +102,8 @@ class PRSourcesConfig:
     exclude_labels: list[str] = field(default_factory=list)
     include_prs: list[str] = field(default_factory=list)
     exclude_prs: list[str] = field(default_factory=list)
+    include_authors: list[str] = field(default_factory=list)
+    exclude_authors: list[str] = field(default_factory=list)
     groups: list[PRGroupConfig] = field(default_factory=list)
     # Default behavior when a port branch already exists. Applied to PRs from
     # ``include_prs`` and to any ``by_labels`` / ``groups`` entry that omits
@@ -101,9 +113,91 @@ class PRSourcesConfig:
     auto_pr: bool = True
 
 
+def _default_assignee_dev_options() -> list[str]:
+    """Single-select options for the project's ``Assignee Dev`` field.
+
+    These are display labels (preferring each contributor's GitHub
+    "name" over the bare login), kept here as a sensible team default.
+    Users can override the list in ``notifications.assignee_dev_options``
+    in ``config.yaml`` to add / remove team members. Whatever ends up in
+    config also drives the option set RelEasy provisions on the GitHub
+    Project board on first ``releasy setup-project`` run.
+    """
+    return [
+        "Andrey Zvonov",
+        "Anton Ivashkin",
+        "Arthur Passos",
+        "DQ",
+        "Ilya Golshtein",
+        "Mikhail Koviazin",
+        "Vasily Nemkov",
+    ]
+
+
+def _default_assignee_qa_options() -> list[str]:
+    """Single-select options for the project's ``Assignee QA`` field.
+
+    ``Verified by Dev`` is a special meta-option meaning "no separate QA
+    pass needed — the developer self-verified". It is intentionally not a
+    real person.
+    """
+    return [
+        "Alsu Giliazova",
+        "Carlos",
+        "Davit Mnatobishvili",
+        "strtgbb",
+        "vzakaznikov",
+        "Verified by Dev",
+    ]
+
+
+def _default_assignee_dev_login_map() -> dict[str, str]:
+    """GitHub login → ``Assignee Dev`` option label.
+
+    Used by ``sync_project`` to seed the field with the source PR's
+    author when a card is first created. Lookups are case-insensitive,
+    but the original casing is preserved in this dict so it round-trips
+    cleanly through ``config.yaml`` (``Enmk`` stays ``Enmk`` rather
+    than being rewritten to ``enmk`` on every save). Logins that don't
+    appear here leave the field empty for manual assignment.
+    """
+    return {
+        "zvonand": "Andrey Zvonov",
+        "ianton-ru": "Anton Ivashkin",
+        "arthurpassos": "Arthur Passos",
+        "il9ue": "DQ",
+        "ilejn": "Ilya Golshtein",
+        "mkmkme": "Mikhail Koviazin",
+        "Enmk": "Vasily Nemkov",
+    }
+
+
 @dataclass
 class NotificationsConfig:
     github_project: str | None = None
+    # Single-select option labels for the ``Assignee Dev`` / ``Assignee QA``
+    # project fields. Edit these in ``config.yaml`` to extend the team
+    # roster — RelEasy provisions exactly the listed options on the
+    # GitHub Project board (see ``setup_project``) and reconciles
+    # missing ones on subsequent runs. Existing options the user added
+    # by hand on the board are preserved (we only ever add, never
+    # delete, since a different field-owner outside RelEasy may be
+    # managing additions).
+    assignee_dev_options: list[str] = field(
+        default_factory=_default_assignee_dev_options,
+    )
+    assignee_qa_options: list[str] = field(
+        default_factory=_default_assignee_qa_options,
+    )
+    # GitHub login → ``Assignee Dev`` option label. Drives the default
+    # value RelEasy puts on the ``Assignee Dev`` field of newly created
+    # project cards (the source PR's author). Keys are lower-cased at
+    # load time so the YAML file can use whatever casing GitHub displays.
+    # Logins missing from this map leave the field empty for manual
+    # assignment.
+    assignee_dev_login_map: dict[str, str] = field(
+        default_factory=_default_assignee_dev_login_map,
+    )
 
 
 def _default_allowed_tools() -> list[str]:
@@ -123,6 +217,14 @@ class AIResolveConfig:
     enabled: bool = False
     command: str = "claude"
     prompt_file: str = "prompts/resolve_conflict.md"
+    # Prompt template used when the AI resolver is driving a `git merge`
+    # to completion (the ``releasy refresh`` flow that keeps already-open
+    # rebase PRs current with their target branch). Kept
+    # separate from ``prompt_file`` because the in-progress operation
+    # ("merge" vs "cherry-pick"), the way to conclude it (`git commit
+    # --no-edit` vs `git cherry-pick --continue`), and the framing of
+    # what to preserve all differ.
+    merge_prompt_file: str = "prompts/resolve_merge_conflict.md"
     allowed_tools: list[str] = field(default_factory=_default_allowed_tools)
     max_iterations: int = 5
     timeout_seconds: int = 7200  # 2h
@@ -352,18 +454,99 @@ def load_config(config_path: Path | None = None) -> Config:
             )
         )
 
+    def _str_list(key: str) -> list[str]:
+        """Read a list-of-strings config value, tolerating a bare string."""
+        v = ps_raw.get(key, [])
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [v]
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            raise ValueError(
+                f"pr_sources.{key} must be a list of strings, got {v!r}"
+            )
+        return v
+
     pr_sources = PRSourcesConfig(
         by_labels=by_labels,
         exclude_labels=ps_raw.get("exclude_labels", []),
         include_prs=ps_raw.get("include_prs", []),
         exclude_prs=ps_raw.get("exclude_prs", []),
+        include_authors=_str_list("include_authors"),
+        exclude_authors=_str_list("exclude_authors"),
         groups=groups,
         if_exists=global_if_exists,
         auto_pr=global_auto_pr,
     )
 
+    notif_raw = raw.get("notifications", {}) or {}
+
+    def _opt_list(key: str, fallback: list[str]) -> list[str]:
+        v = notif_raw.get(key)
+        if v is None:
+            return list(fallback)
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            raise ValueError(
+                f"notifications.{key} must be a list of strings, got {v!r}"
+            )
+        # Strip empties / dedupe while preserving order — keeps the option
+        # set on the GitHub Project board predictable even when users edit
+        # the YAML by hand and accidentally duplicate or comment out an
+        # entry by leaving it blank.
+        seen: set[str] = set()
+        out: list[str] = []
+        for s in v:
+            stripped = s.strip()
+            if not stripped or stripped in seen:
+                continue
+            seen.add(stripped)
+            out.append(stripped)
+        return out
+
+    raw_login_map = notif_raw.get("assignee_dev_login_map")
+    if raw_login_map is None:
+        login_map = _default_assignee_dev_login_map()
+    else:
+        if not isinstance(raw_login_map, dict):
+            raise ValueError(
+                "notifications.assignee_dev_login_map must be a "
+                f"mapping (got {type(raw_login_map).__name__})"
+            )
+        # Preserve the user's original casing in config.yaml so save_config
+        # round-trips don't silently rewrite ``Enmk`` to ``enmk``. Lookups
+        # are case-insensitive — see how ``sync_project`` builds a
+        # ``login_map_lc`` view at call time.
+        login_map = {}
+        seen_keys_lc: dict[str, str] = {}
+        for k, v in raw_login_map.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise ValueError(
+                    "notifications.assignee_dev_login_map entries must "
+                    "be string→string"
+                )
+            key = k.strip()
+            val = v.strip()
+            if not key:
+                continue
+            key_lc = key.lower()
+            if key_lc in seen_keys_lc:
+                raise ValueError(
+                    "notifications.assignee_dev_login_map has duplicate "
+                    f"login (case-insensitive): {seen_keys_lc[key_lc]!r} "
+                    f"and {key!r}"
+                )
+            seen_keys_lc[key_lc] = key
+            login_map[key] = val
+
     notifications = NotificationsConfig(
-        github_project=raw.get("notifications", {}).get("github_project"),
+        github_project=notif_raw.get("github_project"),
+        assignee_dev_options=_opt_list(
+            "assignee_dev_options", _default_assignee_dev_options(),
+        ),
+        assignee_qa_options=_opt_list(
+            "assignee_qa_options", _default_assignee_qa_options(),
+        ),
+        assignee_dev_login_map=login_map,
     )
 
     ai_raw = raw.get("ai_resolve", {}) or {}
@@ -371,6 +554,9 @@ def load_config(config_path: Path | None = None) -> Config:
         enabled=ai_raw.get("enabled", False),
         command=ai_raw.get("command", "claude"),
         prompt_file=ai_raw.get("prompt_file", "prompts/resolve_conflict.md"),
+        merge_prompt_file=ai_raw.get(
+            "merge_prompt_file", "prompts/resolve_merge_conflict.md",
+        ),
         allowed_tools=ai_raw.get("allowed_tools") or _default_allowed_tools(),
         max_iterations=int(ai_raw.get("max_iterations", 5)),
         timeout_seconds=int(ai_raw.get("timeout_seconds", 7200)),
@@ -446,7 +632,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     ps = config.pr_sources
     if (
         ps.by_labels or ps.exclude_labels or ps.include_prs
-        or ps.exclude_prs or ps.groups or ps.auto_pr is not True
+        or ps.exclude_prs or ps.include_authors or ps.exclude_authors
+        or ps.groups or ps.auto_pr is not True
     ):
         ps_data: dict = {}
         if ps.by_labels:
@@ -469,6 +656,10 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
             ps_data["include_prs"] = ps.include_prs
         if ps.exclude_prs:
             ps_data["exclude_prs"] = ps.exclude_prs
+        if ps.include_authors:
+            ps_data["include_authors"] = ps.include_authors
+        if ps.exclude_authors:
+            ps_data["exclude_authors"] = ps.exclude_authors
         if ps.groups:
             ps_data["groups"] = [
                 {
@@ -489,8 +680,19 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
             ps_data["auto_pr"] = ps.auto_pr
         data["pr_sources"] = ps_data
 
+    notif_data: dict = {}
     if config.notifications.github_project:
-        data["notifications"] = {"github_project": config.notifications.github_project}
+        notif_data["github_project"] = config.notifications.github_project
+    if config.notifications.assignee_dev_options != _default_assignee_dev_options():
+        notif_data["assignee_dev_options"] = config.notifications.assignee_dev_options
+    if config.notifications.assignee_qa_options != _default_assignee_qa_options():
+        notif_data["assignee_qa_options"] = config.notifications.assignee_qa_options
+    if config.notifications.assignee_dev_login_map != _default_assignee_dev_login_map():
+        notif_data["assignee_dev_login_map"] = (
+            config.notifications.assignee_dev_login_map
+        )
+    if notif_data:
+        data["notifications"] = notif_data
 
     ai = config.ai_resolve
     ai_defaults = AIResolveConfig()
@@ -501,6 +703,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         ai_data["command"] = ai.command
     if ai.prompt_file != ai_defaults.prompt_file:
         ai_data["prompt_file"] = ai.prompt_file
+    if ai.merge_prompt_file != ai_defaults.merge_prompt_file:
+        ai_data["merge_prompt_file"] = ai.merge_prompt_file
     if ai.allowed_tools != _default_allowed_tools():
         ai_data["allowed_tools"] = ai.allowed_tools
     if ai.max_iterations != ai_defaults.max_iterations:

@@ -21,7 +21,15 @@ def _load_config_or_exit(config_path: str | None = None) -> "Config":
         raise click.ClickException(f"Failed to load config: {e}")
 
 
-@click.group()
+# Click defaults `max_content_width` to 80 even on wider terminals, which
+# truncates our one-line command summaries with "..." in `releasy --help`.
+# Bumping it lets the help output use the full terminal width (Click takes
+# `min(max_content_width, terminal_width)`), so descriptions stay readable
+# at modern terminal sizes without us having to artificially shorten them.
+_CLI_CONTEXT_SETTINGS = {"max_content_width": 120}
+
+
+@click.group(context_settings=_CLI_CONTEXT_SETTINGS)
 @click.version_option(version=__version__, prog_name="releasy")
 @click.option("--config", "config_path", default=None, help="Path to config.yaml")
 @click.pass_context
@@ -34,7 +42,7 @@ def cli(ctx: click.Context, config_path: str | None) -> None:
 # ---------- Maintenance pipeline ----------
 
 
-@cli.command()
+@cli.command(short_help="Discover + port new PRs (cherry-pick + open PR).")
 @click.option(
     "--onto",
     default=None,
@@ -57,7 +65,7 @@ def run(
     work_dir: str | None,
     resolve_conflicts: bool,
 ) -> None:
-    """Port PRs onto the already-existing base branch."""
+    """Discover and port new PRs onto the base branch (cherry-pick + open PR)."""
     from releasy.pipeline import run_pipeline
 
     config = _load_config_or_exit(ctx.obj["config_path"])
@@ -79,7 +87,10 @@ def run(
         raise SystemExit(1)
 
 
-@cli.command(name="continue")
+@cli.command(
+    name="continue",
+    short_help="Reconcile state after manual fixes.",
+)
 @click.option(
     "--branch",
     default=None,
@@ -92,7 +103,7 @@ def run(
 @click.option("--work-dir", default=None, help="Working directory for git operations")
 @click.pass_context
 def continue_cmd(ctx: click.Context, branch: str | None, work_dir: str | None) -> None:
-    """Continue after manual conflict resolution / open any missing PRs."""
+    """Reconcile state after a manual fix (push + open any missing PRs)."""
     from releasy.pipeline import continue_all, continue_branch
 
     config = _load_config_or_exit(ctx.obj["config_path"])
@@ -105,11 +116,11 @@ def continue_cmd(ctx: click.Context, branch: str | None, work_dir: str | None) -
             raise SystemExit(1)
 
 
-@cli.command()
+@cli.command(short_help="Mark a port as skipped (state-only).")
 @click.option("--branch", required=True, help="Branch name or feature ID to skip")
 @click.pass_context
 def skip(ctx: click.Context, branch: str) -> None:
-    """Skip a conflicted branch for this run."""
+    """Mark a port branch as skipped (state-only, branch + PR untouched)."""
     from releasy.pipeline import skip_branch
 
     config = _load_config_or_exit(ctx.obj["config_path"])
@@ -117,30 +128,76 @@ def skip(ctx: click.Context, branch: str) -> None:
         raise SystemExit(1)
 
 
-@cli.command()
+@cli.command(short_help="Persist state and exit (nothing rolled back).")
 @click.pass_context
 def abort(ctx: click.Context) -> None:
-    """Abort the current run, leaving all branches as-is."""
+    """Persist current state and exit (no rollback; branches/PRs untouched)."""
     from releasy.pipeline import abort_run
 
     config = _load_config_or_exit(ctx.obj["config_path"])
     abort_run(config)
 
 
-@cli.command()
+@cli.command(short_help="Print current pipeline state (read-only).")
 @click.pass_context
 def status(ctx: click.Context) -> None:
-    """Print current pipeline state."""
+    """Print current pipeline state (read-only, no git/network)."""
     from releasy.pipeline import print_status
 
     config = _load_config_or_exit(ctx.obj["config_path"])
     print_status(config)
 
 
+@cli.command(short_help="Merge target branch into each tracked PR.")
+@click.option(
+    "--work-dir", default=None, help="Working directory for git operations",
+)
+@click.option(
+    "--resolve-conflicts/--no-resolve-conflicts",
+    default=True,
+    help="Invoke the AI resolver on merge conflicts (requires "
+         "ai_resolve.enabled in config). With --no-resolve-conflicts, "
+         "any tracked PR that conflicts with the target branch is just "
+         "flagged in state without attempting an automatic fix. "
+         "Default: on.",
+)
+@click.pass_context
+def refresh(
+    ctx: click.Context, work_dir: str | None, resolve_conflicts: bool,
+) -> None:
+    """Merge target branch into each tracked PR (AI-resolves conflicts).
+
+    Strictly a maintenance pass — never opens new PRs, never creates
+    new branches, never discovers new PR sources. Only operates on
+    entries already present in state.yaml.
+
+    For every PR tracked in state.yaml that has a rebase PR open and a
+    branch on origin: fetch the latest target + PR branch, attempt
+    ``git merge --no-ff origin/<base>`` into the PR branch, and:
+
+    - clean merge: leave the PR alone (use GitHub's *Update branch* if
+      you want a fresh merge commit pushed),
+    - conflict + AI resolves it: push the resolved merge commit
+      (status preserved, ``ai_resolved`` flag set),
+    - conflict + AI gives up / disabled: abort the merge, hard-reset
+      the local branch back to its original tip, mark the entry as
+      ``conflict`` in state + project board.
+
+    Exit code is 1 if any PR ended up in conflict status, 0 otherwise —
+    suitable for cron / CI loops.
+    """
+    from releasy.refresh import refresh_tracked_prs
+
+    config = _load_config_or_exit(ctx.obj["config_path"])
+    wd = Path(work_dir) if work_dir else None
+    if not refresh_tracked_prs(config, wd, resolve_conflicts=resolve_conflicts):
+        raise SystemExit(1)
+
+
 # ---------- Release ----------
 
 
-@cli.command()
+@cli.command(short_help="Build a release branch from a tag.")
 @click.option(
     "--base-tag", "base_tag", required=True,
     help="Tag/ref to base the release on (must be present locally or "
@@ -159,7 +216,7 @@ def release(
     include_skipped: bool,
     work_dir: str | None,
 ) -> None:
-    """Create release base branch + per-feature PRs from a tag/ref."""
+    """Build a release branch from a tag, merging finished ports onto it."""
     from releasy.release import build_release
 
     config = _load_config_or_exit(ctx.obj["config_path"])
@@ -171,7 +228,10 @@ def release(
 # ---------- Project setup ----------
 
 
-@cli.command(name="setup-project")
+@cli.command(
+    name="setup-project",
+    short_help="Create or verify the GitHub Project board.",
+)
 @click.pass_context
 def setup_project_cmd(ctx: click.Context) -> None:
     """Create or verify a GitHub Project for status tracking.
@@ -208,7 +268,10 @@ def setup_project_cmd(ctx: click.Context) -> None:
     sync_to_project(config)
 
 
-@cli.command(name="sync-project")
+@cli.command(
+    name="sync-project",
+    short_help="Push local state to the Project board.",
+)
 @click.pass_context
 def sync_project_cmd(ctx: click.Context) -> None:
     """Push the current local state to the GitHub Project board.
@@ -230,7 +293,7 @@ def sync_project_cmd(ctx: click.Context) -> None:
 
 @cli.group()
 def feature() -> None:
-    """Manage feature branches."""
+    """Manage the static `features:` list in config.yaml."""
 
 
 @feature.command(name="add")

@@ -18,6 +18,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from rich.console import Console
 
@@ -31,15 +32,36 @@ from releasy.github_ops import PRInfo
 console = Console()
 
 
+# What kind of conflicted git operation Claude is being asked to drive to
+# completion. Picks the prompt template (``ai_resolve.prompt_file`` for
+# cherry-picks, ``ai_resolve.merge_prompt_file`` for merges) and shapes
+# the placeholders rendered into it.
+OperationKind = Literal["cherry-pick", "merge"]
+
+
 @dataclass
 class AIResolveContext:
     port_branch: str
     base_branch: str
+    # The PR most relevant to interpreting the conflict:
+    # - cherry-pick: the upstream PR being ported (source of the commits).
+    # - merge:       the upstream source PR the rebase branch ports — the
+    #                conflict is between its changes and the moved-on
+    #                base branch, so its intent is what Claude must
+    #                preserve.
     source_pr: PRInfo
     conflict_files: list[str] = field(default_factory=list)
-    # SHA of the port branch tip BEFORE the conflicting cherry-pick was
-    # attempted. Used to verify Claude actually committed something.
+    # SHA of the port branch tip BEFORE the conflicting operation was
+    # attempted. Used to verify Claude actually committed something, and
+    # to reset to a known-good state on failure.
     start_sha: str | None = None
+    # Which kind of conflict Claude is resolving. Selects the prompt
+    # template and tweaks the postcondition narrative.
+    operation: OperationKind = "cherry-pick"
+    # Merge-only context: the URL of the rebase PR whose branch is being
+    # kept current. Rendered into the merge prompt so Claude can name it
+    # in commit messages / log lines if it wants. Ignored for cherry-pick.
+    rebase_pr_url: str | None = None
 
 
 @dataclass
@@ -49,6 +71,12 @@ class AIResolveResult:
     error: str | None = None
     timed_out: bool = False
     new_head: str | None = None  # branch tip after Claude's commit
+    # Total USD cost reported by Claude across every attempt of this
+    # resolve invocation (sum of ``total_cost_usd`` from each
+    # ``result``-typed event in the stream-json transcript, including
+    # transient-API-error retries). ``None`` when Claude reported no cost
+    # at all (e.g. failed before producing a result event).
+    cost_usd: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -104,16 +132,37 @@ def _write_build_script(repo_path: Path, build_command: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> str:
-    """Load the prompt template and fill in placeholders."""
-    prompt_path = Path(config.ai_resolve.prompt_file)
+def _resolve_prompt_template(config: Config, ctx: AIResolveContext) -> Path:
+    """Pick the prompt file path for ``ctx.operation`` and resolve it.
+
+    Cherry-pick uses ``ai_resolve.prompt_file``; merge uses
+    ``ai_resolve.merge_prompt_file`` so the two flows can have distinct
+    instructions (`git cherry-pick --continue` vs `git commit --no-edit`,
+    different framing of "what's in progress") while sharing the same
+    placeholder vocabulary.
+    """
+    if ctx.operation == "merge":
+        raw = config.ai_resolve.merge_prompt_file
+    else:
+        raw = config.ai_resolve.prompt_file
+    prompt_path = Path(raw)
     if not prompt_path.is_absolute():
         prompt_path = (config.repo_dir / prompt_path).resolve()
+    return prompt_path
+
+
+def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> str:
+    """Load the prompt template and fill in placeholders."""
+    prompt_path = _resolve_prompt_template(config, ctx)
 
     if not prompt_path.exists():
+        which = (
+            "ai_resolve.merge_prompt_file" if ctx.operation == "merge"
+            else "ai_resolve.prompt_file"
+        )
         raise FileNotFoundError(
             f"AI prompt template not found: {prompt_path}. "
-            f"Set ai_resolve.prompt_file in config."
+            f"Set {which} in config."
         )
 
     template = prompt_path.read_text(encoding="utf-8")
@@ -144,6 +193,10 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
         "build_log": _BUILD_LOG,
         "max_iterations": str(config.ai_resolve.max_iterations),
         "label": config.ai_resolve.label,
+        # Merge-only — rendered as a literal placeholder for cherry-pick
+        # prompts that don't reference it (no-op there). For merge prompts
+        # this lets Claude link the rebase PR in narration if helpful.
+        "rebase_pr_url": ctx.rebase_pr_url or "",
     }
 
     def _replace(match: re.Match[str]) -> str:
@@ -475,6 +528,32 @@ def _find_transient_api_error(output: str) -> str | None:
     return None
 
 
+def _extract_cost_usd(output: str) -> float | None:
+    """Sum ``total_cost_usd`` across every ``result`` event in the transcript.
+
+    Claude emits one ``result``-typed stream-json event per session
+    summarising the run. When ``resolve_with_claude`` retries after a
+    transient API error, each attempt produces its own result event and
+    the costs need to be added together to reflect the full bill for the
+    invocation. Returns ``None`` if no usable cost field was found.
+    """
+    total: float | None = None
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") != "result":
+            continue
+        cost = ev.get("total_cost_usd")
+        if isinstance(cost, (int, float)):
+            total = (total or 0.0) + float(cost)
+    return total
+
+
 def _count_iterations(output: str) -> int | None:
     """Best-effort: count how many build attempts Claude ran.
 
@@ -578,6 +657,11 @@ def resolve_with_claude(
     last_exit_code = -1
     last_output = ""
     last_timed_out = False
+    # Cost accrues across retries — each attempt is a separate billed
+    # turn even when only the last one succeeded. ``last_output`` only
+    # carries the most recent attempt's transcript, so we aggregate the
+    # per-attempt cost as we go.
+    cost_usd_total: float | None = None
 
     for attempt in range(1, max_attempts + 1):
         if attempt > 1:
@@ -595,6 +679,10 @@ def resolve_with_claude(
             argv, repo_path, config.ai_resolve.timeout_seconds,
         )
         last_exit_code, last_output, last_timed_out = exit_code, output, timed_out
+
+        attempt_cost = _extract_cost_usd(output)
+        if attempt_cost is not None:
+            cost_usd_total = (cost_usd_total or 0.0) + attempt_cost
 
         if timed_out:
             break
@@ -620,6 +708,7 @@ def resolve_with_claude(
         return AIResolveResult(
             success=False, timed_out=True, iterations=iterations,
             error=f"claude timed out after {config.ai_resolve.timeout_seconds}s",
+            cost_usd=cost_usd_total,
         )
 
     tail_lines = assistant_text.strip().splitlines()[-40:] if assistant_text.strip() else []
@@ -628,11 +717,13 @@ def resolve_with_claude(
         return AIResolveResult(
             success=False, iterations=iterations,
             error="claude reported UNRESOLVED",
+            cost_usd=cost_usd_total,
         )
     if any(line.strip() == "BUILD FAILED" for line in tail_lines):
         return AIResolveResult(
             success=False, iterations=iterations,
             error="claude reported BUILD FAILED",
+            cost_usd=cost_usd_total,
         )
 
     if exit_code != 0:
@@ -645,14 +736,59 @@ def resolve_with_claude(
         return AIResolveResult(
             success=False, iterations=iterations,
             error=f"claude exited with code {exit_code}{suffix}\n{tail_str}",
+            cost_usd=cost_usd_total,
         )
 
     ok, new_head, err = _verify_postconditions(config, repo_path, ctx)
     if not ok:
         return AIResolveResult(
             success=False, iterations=iterations, new_head=new_head, error=err,
+            cost_usd=cost_usd_total,
         )
 
     return AIResolveResult(
         success=True, iterations=iterations, new_head=new_head, error=err,
+        cost_usd=cost_usd_total,
     )
+
+
+# ---------------------------------------------------------------------------
+# High-level wrapper used by every caller (cherry-pick + merge resolvers)
+# ---------------------------------------------------------------------------
+
+
+def attempt_ai_resolve(
+    config: Config, repo_path: Path, ctx: AIResolveContext,
+) -> AIResolveResult:
+    """Render the prompt, run claude, and clean up on failure.
+
+    Wraps :func:`resolve_with_claude` with the cleanup contract every
+    caller needs: on a failed resolve the in-progress git operation
+    (cherry-pick / merge / rebase) is aborted and HEAD is hard-reset to
+    ``ctx.start_sha`` so the working tree is back to a known-good state.
+    Callers (the cherry-pick step, the PR-merge updater) only need to
+    decide *what to do* on success/failure, not *how to clean up*.
+
+    If ``ctx.start_sha`` isn't set the helper fills it from the current
+    HEAD before invoking Claude, so PR-conflict-resolution callers don't
+    have to remember to capture it themselves.
+    """
+    if ctx.start_sha is None:
+        head = run_git(["rev-parse", "--verify", "HEAD"], repo_path, check=False)
+        ctx.start_sha = head.stdout.strip() if head.returncode == 0 else None
+
+    result = resolve_with_claude(config, repo_path, ctx)
+
+    if result.success:
+        return result
+
+    # Reset the worktree so the caller can decide what to do next without
+    # tripping over half-baked merge / cherry-pick state.
+    if is_operation_in_progress(repo_path):
+        run_git(["cherry-pick", "--abort"], repo_path, check=False)
+        run_git(["merge", "--abort"], repo_path, check=False)
+        run_git(["rebase", "--abort"], repo_path, check=False)
+    if ctx.start_sha:
+        run_git(["reset", "--hard", ctx.start_sha], repo_path, check=False)
+
+    return result

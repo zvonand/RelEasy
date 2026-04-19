@@ -112,13 +112,24 @@ features:
     source_branch: feature/antalya-s3-disk
 
 # PR discovery and filtering
-# Set arithmetic: union(by_labels) − exclude_labels + include_prs − exclude_prs
+# Set arithmetic:
+#   union(by_labels)
+#   − exclude_labels − exclude_authors
+#   ∩ (include_authors when set)
+#   + include_prs − exclude_prs
+# include_prs always wins: it bypasses label and author filters.
 pr_sources:
   by_labels:
     - labels: ["forward-port", "v26.3"]
       merged_only: true
 
   exclude_labels: ["do-not-port"]
+
+  # Filter by PR author (GitHub login, case-insensitive).
+  # include_authors is an allowlist — only PRs by these users are kept.
+  # exclude_authors is a denylist.
+  # include_authors: ["alice", "bob"]
+  exclude_authors: ["dependabot[bot]"]
 
   include_prs:
     - https://github.com/Altinity/ClickHouse/pull/123
@@ -156,11 +167,15 @@ pr_sources:
 | `ai_resolve.api_retries` | Re-invoke Claude on transient Anthropic API errors (separate from `max_iterations`) | `3` |
 | `ai_resolve.label` | Label attached to PRs whose conflicts Claude resolved cleanly | `ai-resolved` |
 | `ai_resolve.needs_attention_label` | Label attached to draft PRs from partial-group failures | `ai-needs-attention` |
+| `ai_resolve.prompt_file` | Prompt template used when AI resolves a conflicted **cherry-pick** | `prompts/resolve_conflict.md` |
+| `ai_resolve.merge_prompt_file` | Prompt template used when AI resolves a conflicted **merge** during `releasy refresh` | `prompts/resolve_merge_conflict.md` |
 | `pr_sources.auto_pr` | Open a PR for every pushed port branch (singletons, by_labels, include_prs, groups). Requires `push: true`. | `true` |
 | `pr_sources.by_labels[].labels` | Labels a PR must have (AND logic) | — |
 | `pr_sources.by_labels[].merged_only` | Only include merged PRs | `false` |
 | `pr_sources.by_labels[].if_exists` | Override `pr_sources.if_exists` per group | inherits |
 | `pr_sources.exclude_labels` | Drop PRs carrying any of these labels | `[]` |
+| `pr_sources.include_authors` | Allowlist of GitHub logins (case-insensitive); when set, only PRs by these authors are kept. Bypassed by `include_prs`. | `[]` |
+| `pr_sources.exclude_authors` | Drop PRs by these GitHub logins (case-insensitive). Bypassed by `include_prs`. | `[]` |
 | `pr_sources.include_prs` | Always include these PRs (by URL) | `[]` |
 | `pr_sources.exclude_prs` | Always exclude these PRs (by URL) | `[]` |
 | `pr_sources.groups[].id` | Group id; becomes feature id and branch name (`feature/<base>/<id>`) | — |
@@ -178,37 +193,268 @@ pr_sources:
 
 ## CLI Reference
 
-### Pipeline
-
-```bash
-# Run the phased pipeline (--onto optional when target_branch is in config)
-releasy run [--onto <tag-or-sha>] [--work-dir <path>]
-
-# Reconcile every port in state.
-# - No args: open PRs for any clean branch that lacks one, push + open PRs
-#   for newly-resolved conflicts, highlight any still-unresolved ones, and
-#   refresh the GitHub Project board.
-# - --branch <name>: flip that one branch from conflict to needs-review.
-releasy continue [--branch <branch-or-feature-id>]
-
-# Skip a conflicted branch
-releasy skip --branch <branch-or-feature-id>
-
-# Abort current run
-releasy abort
-
-# Print current state
-releasy status
-```
+Every command honours the global options below. Run `releasy <command> --help`
+for the authoritative option list — this section summarises what each command
+does and when to reach for it.
 
 ### Global options
 
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--config <path>` | Path to `config.yaml` | `./config.yaml` |
+| `--version` | Print version and exit | — |
+
+### At a glance: which command does what
+
+The three "doing" commands look similar but operate on different things —
+this matrix is the quickest way to pick the right one.
+
+| | `run` | `continue` | `refresh` |
+|--|:-----:|:----------:|:---------:|
+| Discovers new PRs from `pr_sources` (labels, include_prs, groups) | ✅ | — | — |
+| Creates new port branches (cherry-pick onto `origin/<base>`) | ✅ | — | — |
+| Opens new rebase PRs | ✅ for new ports | ✅ for branches that missed PR creation last time | — |
+| AI-resolves **cherry-pick** conflicts (initial port) | ✅ | — | — |
+| AI-resolves **merge** conflicts (target branch moved on) | — | — | ✅ |
+| Iterates entries already in `state.yaml` | only to skip / ensure-PR | ✅ all of them | ✅ all tracked PRs |
+| Mutates your local work-dir | ✅ (cherry-picks) | ✅ (push only) | ✅ (merges) |
+| Pushes to origin | ✅ | ✅ | ✅ (only merge commits, on conflict-resolution) |
+
+In one-line summaries:
+
+- **`run`** — *"do new work."* Walks `pr_sources`, discovers PRs, creates port
+  branches, cherry-picks, opens rebase PRs.
+- **`continue`** — *"I fixed something by hand; reconcile state."* Walks
+  `state.yaml`: pushes / opens any PRs that should have been created but
+  weren't (e.g. previous run had `auto_pr: false`, or a conflict you've now
+  manually resolved in the work-dir), refreshes the project board. No git
+  ops beyond `push` + status checks.
+- **`refresh`** — *"keep open PRs current with the moved-on base."* Walks
+  `state.yaml`: for each tracked PR, attempts `git merge origin/<base>` into
+  the PR branch and AI-resolves any conflicts. Doesn't open new PRs, doesn't
+  discover new sources.
+
+> **Why both `run` and `continue`?** `run` only acts on entries it's
+> cherry-picking *right now*. If you fix a conflict by hand later in the
+> work-dir, `run` either skips your branch (`if_exists: skip`) or
+> **deletes your manual fix** and rebuilds from base (`if_exists:
+> recreate`). `continue` is the safe "preserve my work, just push + open
+> the PR" command.
+
+The remaining commands — `skip`, `abort`, `status`, `setup-project`,
+`sync-project`, `release`, `feature *` — never touch git history; they're
+state-only / project-board / config helpers (detailed below).
+
+### Pipeline lifecycle
+
+The five commands you'll touch on a regular release cycle.
+
+#### `releasy run` — port PRs onto the base branch
+
+The main pipeline. Discovers PRs from `pr_sources`, creates a port branch
+per PR/group from `origin/<base_branch>`, cherry-picks the merge commit(s),
+and (when `push: true` and `pr_sources.auto_pr: true`) opens a PR per port
+into the base. AI-resolves **cherry-pick** conflicts inline when
+`ai_resolve.enabled` is on. Unresolved conflicts are dropped (singletons
+/ first-of-group) or opened as draft PRs labelled `ai-needs-attention`
+(partial groups), and the pipeline keeps moving.
+
+For entries that already produced a branch on origin, `run` skips the
+cherry-pick and just makes sure a PR exists — it does **not** re-port,
+re-AI-resolve, or merge any moved-on target branch into them. Use
+[`refresh`](#releasy-refresh--keep-tracked-prs-current-with-the-target-branch)
+for the latter.
+
 ```bash
-releasy --config <path>    # config file (default: ./config.yaml)
-releasy --version
+releasy run [--onto <tag-or-sha>] [--work-dir <path>]
+            [--resolve-conflicts | --no-resolve-conflicts]
 ```
 
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--onto <ver>` | Version label used to derive `<project>-<version>` if `target_branch` is unset. Just a string — never resolved as a git ref. | from `target_branch` |
+| `--work-dir <path>` | Working directory for git operations (overrides config `work_dir`). | from config / cwd |
+| `--resolve-conflicts` / `--no-resolve-conflicts` | Toggle the AI resolver. The flag is a kill-switch: AI runs only if both this *and* `ai_resolve.enabled` are true. | on |
+
+Exit code: `1` if any port ended up in `conflict` status, `0` otherwise.
+
+#### `releasy refresh` — keep tracked PRs current with the target branch
+
+Strictly a maintenance pass — **never opens new PRs, never creates new
+branches, never discovers new PR sources, never re-runs cherry-picks**.
+Only operates on entries already in `state.yaml`. For each tracked PR
+with a branch + rebase PR URL, fetches latest tips, attempts
+`git merge --no-ff origin/<base_branch>` into the PR branch, and:
+
+- **clean merge** — leaves the PR alone (resets local back; if you want
+  a fresh merge commit pushed, use GitHub's *Update branch* button),
+- **conflict + AI resolves it** — pushes the resolved merge commit,
+  preserves status (and promotes any prior `conflict` back to
+  `needs_review`), sets `ai_resolved`,
+- **conflict + AI gives up / disabled** — aborts the merge, hard-resets
+  the local branch back to its original tip, marks the entry `conflict`
+  in state + project board.
+
+Uses a separate prompt template (`ai_resolve.merge_prompt_file`) but the
+same Claude invocation machinery as `run`. Suitable for a cron / CI
+loop.
+
+```bash
+releasy refresh [--work-dir <path>]
+                [--resolve-conflicts | --no-resolve-conflicts]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--work-dir <path>` | Working directory for git operations. | from config / cwd |
+| `--resolve-conflicts` / `--no-resolve-conflicts` | Toggle the AI resolver. With `--no-resolve-conflicts`, conflicting PRs are flagged in state without an automatic fix attempt. | on |
+
+Exit code: `1` if any PR ended up in `conflict` status, `0` otherwise.
+
+#### `releasy continue` — reconcile state after a manual fix
+
+Catch-all "finish whatever can be finished" command. **Doesn't discover
+new PRs, doesn't cherry-pick, doesn't merge anything in.** Just walks
+every port already in state and acts on each:
+
+- `skipped` — left alone.
+- `conflict` (AI gave up) with `failed_step_index` / `partial_pr_count`
+  / `rebase_pr_url` set — highlighted; user must act on the draft PR or
+  source PR, then re-run.
+- `conflict`, branch now clean (resolved manually in the work-dir) —
+  pushes, opens the PR (if `auto_pr` is on), flips to `needs_review`.
+- `conflict`, still unresolved — highlighted with conflict files and a
+  `cd … && git status` hint; left alone.
+- `branch_created` (branch on origin, no PR yet) — pushes (if needed)
+  and opens the PR.
+- `needs_review` — left alone (PR exists).
+
+Always finishes with a project-board reconciliation pass.
+
+Reach for this when you've done something by hand (resolved a conflict in
+the work-dir, opened/closed a PR on GitHub, or just want the project
+board to catch up) and you want the next `run` / `refresh` to start from
+a clean view of the world.
+
+```bash
+releasy continue [--branch <branch-or-feature-id>] [--work-dir <path>]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--branch <name>` | Operate on a single branch / feature ID — flips that one entry from `conflict` to `needs_review` instead of running the full reconciliation pass. | run full pass |
+| `--work-dir <path>` | Working directory for git operations. | from config / cwd |
+
+Exit code: `1` if any port still has unresolved conflicts (full-pass
+mode) or if the targeted branch couldn't be marked resolved.
+
+#### `releasy skip` — drop a conflicted port from this run
+
+Marks a port branch as `skipped` so subsequent `continue` / project-sync
+passes ignore it. Doesn't touch the branch on disk or on origin.
+
+```bash
+releasy skip --branch <branch-or-feature-id>
+```
+
+| Option | Description |
+|--------|-------------|
+| `--branch <name>` (required) | Branch name or feature ID to skip. |
+
+#### `releasy abort` — abort the current run
+
+Persists the current state and writes `STATUS.md`, but leaves all
+branches and PRs exactly as they are. There's no "undo" for ports that
+already pushed; this is for telling RelEasy "stop tracking this run as
+in-progress" without rolling anything back.
+
+```bash
+releasy abort
+```
+
+### Inspection
+
+#### `releasy status` — print current pipeline state
+
+Renders the same per-status grouping as `STATUS.md` directly to the
+terminal: one sub-table per status section (in
+[`STATUS_DISPLAY_ORDER`](src/releasy/state.py)) so the highest-attention
+entries (conflicts) surface at the top. No git operations, no network
+calls — just reads `state.yaml` and prints.
+
+```bash
+releasy status
+```
+
+### Project board sync
+
+Both commands are no-ops unless `notifications.github_project` is set
+and `RELEASY_GITHUB_TOKEN` has the `project` scope.
+
+#### `releasy setup-project` — create / verify the GitHub Project
+
+If `notifications.github_project` is set, verifies the project,
+reconciles its `Status` field options to the canonical set
+(`Needs Review`, `Branch Created`, `Conflict`, `Skipped`) — dropping
+any others — and provisions the `AI Cost` number field if it isn't
+already there. If unset, creates a new project, prints the URL to add
+to config, and triggers a project sync.
+
+```bash
+releasy setup-project
+```
+
+> **Destructive:** the Status field is fully owned by RelEasy. Any
+> non-canonical options (legacy `Ok` / `Resolved`, or anything else
+> hand-added) get dropped. Cards previously sitting on a dropped option
+> are immediately re-synced to the right Status based on local state.
+
+#### `releasy sync-project` — push local state to the project board
+
+Reads `state.yaml` and reconciles every known feature with the
+configured project: attaches missing PR cards, refreshes existing ones,
+updates the Status field. Use this after editing state by hand, after
+rotating tokens, or right after wiring up a new project URL on an
+in-flight rebase. No git operations, no PRs — only the board.
+
+```bash
+releasy sync-project
+```
+
+Exit code: `1` if sync was skipped (no project / no token / unparseable
+URL) or any item failed to sync, `0` otherwise.
+
+### Release construction
+
+#### `releasy release` — build a release branch from a tag
+
+Creates a release base branch from `--base-tag` and merges every
+finished port (`needs_review`, optionally `skipped`) onto it. Useful
+after a `run` cycle is fully reconciled.
+
+```bash
+releasy release \
+  --base-tag <tag> \
+  --name <branch-name> \
+  [--strict] \
+  [--include-skipped] \
+  [--work-dir <path>]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--base-tag <tag>` (required) | Tag/ref to base the release on. Must be present locally or fetchable from origin. | — |
+| `--name <branch>` (required) | Release branch name to create. | — |
+| `--strict` | Abort if any enabled feature is not in `needs_review`. | off |
+| `--include-skipped` | Include `skipped` features in the release. | off |
+| `--work-dir <path>` | Working directory for git operations. | from config / cwd |
+
 ### Feature management
+
+`features:` in `config.yaml` lists static port targets — branches that
+already exist somewhere and need to be re-applied onto each base. PR
+sources (`pr_sources.*`) are the dynamic counterpart; this group manages
+the static list.
 
 ```bash
 releasy feature add --id <id> --source-branch <branch> --description <desc>
@@ -218,15 +464,13 @@ releasy feature remove --id <id>
 releasy feature list
 ```
 
-### Release construction
-
-```bash
-releasy release \
-  --base-tag <tag> \
-  --name <branch-name> \
-  [--strict] \
-  [--include-skipped]
-```
+| Subcommand | Description |
+|------------|-------------|
+| `feature add` | Append a new entry to `features:` in `config.yaml`. Requires `--id`, `--source-branch`, `--description`. |
+| `feature enable` | Set `enabled: true` on a feature (runs participate in `releasy run`). Requires `--id`. |
+| `feature disable` | Set `enabled: false` (skipped by `releasy run`). Requires `--id`. |
+| `feature remove` | Delete the feature from `config.yaml`. Doesn't touch any branches. Requires `--id`. |
+| `feature list` | Print the configured features grouped by enabled / disabled. |
 
 ## Conflict Resolution
 
@@ -270,32 +514,15 @@ The earlier picks already produced valid commits, so RelEasy:
 Pull the branch, resolve the conflict locally, push, then mark the PR
 ready for review.
 
-### `releasy continue`
+### After conflicts: which command to run
 
-The catch-all "reconcile everything" command. Walks every port in state
-and:
-
-- **`skipped`** — leaves it alone.
-- **`conflict` (AI gave up)** — entries with `failed_step_index` /
-  `partial_pr_count` / `rebase_pr_url` set: highlights and skips. You
-  fix it manually (on the draft PR or the source PR) and re-run.
-- **`conflict`, still unresolved** — highlights with the conflicting
-  files and the `cd … && git status` hint, then moves on.
-- **`conflict`, now resolved** (clean tree, commit beyond base) — pushes,
-  opens the PR (if `auto_pr` is on), flips to `needs_review` (or
-  `branch_created` if no PR was opened).
-- **`branch_created`** (branch on origin, no PR yet) — pushes (if
-  needed) and opens the PR. Covers the case where the previous run had
-  `pr_sources.auto_pr: false` and only pushed the branch, or where an
-  earlier failure prevented PR creation. AI-resolved branches also get
-  the `ai-resolved` label applied. If `auto_pr` is still off, stays
-  as `branch_created` and surfaces a *Create PR manually* compare-URL on
-  the project board.
-- **`needs_review`** — left alone (PR exists, ready for review).
-
-Always finishes with a project-board reconciliation pass: stale draft
-stubs created on earlier no-PR runs are removed and replaced by the real
-PR cards.
+| You want to… | Run |
+|--------------|-----|
+| Re-attempt a source PR you just fixed manually | [`releasy run`](#releasy-run--port-prs-onto-the-base-branch) |
+| Mark a manually-resolved port branch as done (open PR + flip status) | [`releasy continue`](#releasy-continue--reconcile-state-after-a-manual-fix) |
+| Flag an open rebase PR that's started conflicting with the moved-on target branch | [`releasy refresh`](#releasy-refresh--keep-tracked-prs-current-with-the-target-branch) |
+| Drop a port from this run entirely | [`releasy skip`](#releasy-skip--drop-a-conflicted-port-from-this-run) |
+| Force-resync the GitHub Project board to current state | [`releasy sync-project`](#releasy-sync-project--push-local-state-to-the-project-board) |
 
 > **Status semantics:** every successful port — clean cherry-pick or
 > AI-resolved — that has a rebase PR open lands at `needs_review`. If
@@ -381,7 +608,7 @@ If you have a project but it's empty, or no project yet:
 releasy setup-project
 ```
 
-This creates the project (if needed), reconciles the Status field options exactly to the canonical set (`Needs Review`, `Branch Created`, `Conflict`, `Skipped`), and triggers a project sync.
+This creates the project (if needed), reconciles the Status field options exactly to the canonical set (`Needs Review`, `Branch Created`, `Conflict`, `Skipped`), provisions the `AI Cost` number field (see below), and triggers a project sync.
 
 > **Note — destructive option reconcile:** the Status field is fully owned by RelEasy. `setup-project` drops any options that aren't in the canonical set (e.g. legacy `Ok` / `Resolved` from earlier RelEasy versions, or anything else hand-added). Cards previously sitting on a dropped option lose their Status value momentarily — the immediate `sync-project` pass that follows re-assigns them based on local state (which is itself migrated to the new vocabulary on load). If you have hand-added options you want to keep, edit `STATUS_OPTIONS` in `src/releasy/github_ops.py` to include them.
 
@@ -391,8 +618,25 @@ After each state change (when `push: true`), RelEasy:
 - Creates a **view (tab)** for each rebase, named after the base branch (e.g. `antalya-26.3`)
 - Attaches the **real PR** to the project (or a draft-issue stub for `Branch Created` ports)
 - Sets the **Status** field to match the pipeline state
+- Updates the **AI Cost** number field (USD) with the cumulative Anthropic
+  bill RelEasy ran up resolving conflicts on this entry — `0` for cards
+  the resolver never touched, monotonically increasing as later
+  cherry-pick / `releasy refresh` merges spend more
+- Seeds the **Assignee Dev** single-select field on freshly-created cards
+  with the source PR's author (the first PR's author for groups), looked
+  up via `notifications.assignee_dev_login_map`. Subsequent syncs never
+  overwrite the value, so reassignments by humans on the board persist.
+  **Assignee QA** is left empty for the QA team to fill in by hand.
 - Updates the card body with the base commit, conflicted files, and (for `Branch Created`) a *Open a pull request manually* compare URL
 - Replaces stale draft stubs with the real PR card once a PR gets opened
+
+The `AI Cost` field is a `Number` field auto-provisioned on the project
+the first time `releasy setup-project` or any sync runs against it. It
+holds the sum of `total_cost_usd` reported by Claude across every
+resolve invocation that touched the entry — both successful and failed
+attempts (a failed turn is still billed). The same value is persisted
+in `state.yaml` as `ai_cost_usd`, so re-syncing a board after restoring
+state keeps the column accurate.
 
 One project, multiple views — each rebase gets its own tab. You don't need to create any cards or views manually.
 
@@ -405,3 +649,50 @@ To get the same grouped layout as `STATUS.md` and `releasy status` on the projec
 3. Pick **Status**.
 
 This is a one-time UI setting (GitHub's Projects v2 GraphQL API doesn't expose view-config writes, so RelEasy can't set it for you). After that, your board mirrors the local layout: one section per status, ordered Conflict → Branch Created → Needs Review → Skipped.
+
+### Showing the AI Cost column
+
+`releasy setup-project` provisions the `AI Cost` number field on the
+project, and every sync writes a value to each card (`0` for untouched
+cards, the cumulative USD bill otherwise). Projects v2 does **not**
+auto-add newly-created fields as visible columns in pre-existing
+views, so you need to flip it on once per view:
+
+1. Open the view (the tab named after your base branch).
+2. Click the **⋯** menu in the view header → **Fields**.
+3. Toggle **AI Cost** on.
+
+Same Projects v2 API limitation as `Group by → Status` — RelEasy can't
+set view-level field visibility for you. The data is always there: open
+any card and the field shows up in its side panel even when it isn't a
+column.
+
+### Assignee Dev / Assignee QA
+
+`releasy setup-project` provisions two extra single-select fields the
+**first time** it sees the board:
+
+- **`Assignee Dev`** — the developer responsible for the port. RelEasy
+  seeds it once with the source PR's author when a card is first
+  created, mapping the GitHub login through
+  `notifications.assignee_dev_login_map` to one of
+  `notifications.assignee_dev_options`. Logins not in the map (and
+  groups whose first PR has no known author) leave the field empty.
+- **`Assignee QA`** — the QA owner. Always empty by default; the QA team
+  fills it in manually. The option list includes the special
+  `Verified by Dev` value to flag entries that don't need a separate
+  QA pass.
+
+Both fields' option lists come from `config.yaml`
+(`notifications.assignee_dev_options` / `assignee_qa_options`). On a
+freshly created board RelEasy provisions exactly the listed options;
+on subsequent runs RelEasy **never edits the option list** — that's
+the user's job in the GitHub UI, so manual additions / removals are
+preserved across re-runs. To add a new team member, edit the option
+list in the GitHub project settings (and, if Dev, also add the
+login → label entry to `assignee_dev_login_map` so the next batch of
+cards picks them up automatically).
+
+Like `AI Cost`, both fields exist on every card but Projects v2 doesn't
+auto-add new fields to existing views — flip them on once per view via
+**⋯ → Fields**.

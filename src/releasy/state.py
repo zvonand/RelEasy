@@ -66,9 +66,20 @@ class FeatureState:
     pr_body: str | None = None
     pr_numbers: list[int] = field(default_factory=list)
     pr_urls: list[str] = field(default_factory=list)
+    # GitHub login of the (first) source PR's author. Used by the project
+    # board sync to seed the ``Assignee Dev`` field once, when the card is
+    # first created. Stored on state so re-runs and ``releasy continue``
+    # can rebuild the board without re-fetching every PR from GitHub.
+    pr_author: str | None = None
     rebase_pr_url: str | None = None  # auto-created PR targeting base branch
     ai_resolved: bool = False
     ai_iterations: int | None = None
+    # Cumulative USD cost reported by Claude across every resolve
+    # invocation that touched this entry (cherry-pick steps + later
+    # ``releasy refresh`` merges). ``None`` means we have no cost data
+    # for this entry — either AI never ran, or Claude didn't report a
+    # cost. Synced to the GitHub Project board's "AI Cost" number field.
+    ai_cost_usd: float | None = None
     # For partially-applied groups: 0-based index of the cherry-pick step that
     # failed conflict resolution, and how many earlier picks were committed.
     failed_step_index: int | None = None
@@ -126,9 +137,11 @@ def load_state(repo_dir: Path | None = None) -> PipelineState:
             pr_body=fraw.get("pr_body"),
             pr_numbers=fraw.get("pr_numbers", []) or [],
             pr_urls=fraw.get("pr_urls", []) or [],
+            pr_author=fraw.get("pr_author"),
             rebase_pr_url=fraw.get("rebase_pr_url"),
             ai_resolved=fraw.get("ai_resolved", False),
             ai_iterations=fraw.get("ai_iterations"),
+            ai_cost_usd=fraw.get("ai_cost_usd"),
             failed_step_index=fraw.get("failed_step_index"),
             partial_pr_count=fraw.get("partial_pr_count"),
         )
@@ -173,12 +186,16 @@ def save_state(state: PipelineState, repo_dir: Path | None = None) -> None:
             entry["pr_numbers"] = fs.pr_numbers
         if fs.pr_urls and len(fs.pr_urls) > 1:
             entry["pr_urls"] = fs.pr_urls
+        if fs.pr_author:
+            entry["pr_author"] = fs.pr_author
         if fs.rebase_pr_url:
             entry["rebase_pr_url"] = fs.rebase_pr_url
         if fs.ai_resolved:
             entry["ai_resolved"] = True
         if fs.ai_iterations is not None:
             entry["ai_iterations"] = fs.ai_iterations
+        if fs.ai_cost_usd is not None:
+            entry["ai_cost_usd"] = float(fs.ai_cost_usd)
         if fs.failed_step_index is not None:
             entry["failed_step_index"] = fs.failed_step_index
         if fs.partial_pr_count is not None:

@@ -142,6 +142,12 @@ class FeatureUnit:
     # Mutable per-run bookkeeping (set by _process_feature_unit):
     ai_resolved_count: int = 0
     ai_iterations_total: int = 0
+    # Sum of USD cost reported by Claude across every cherry-pick step
+    # in this unit (groups accumulate; singletons hit at most one step).
+    # ``None`` until Claude reports a cost at least once — keeps
+    # downstream code able to distinguish "AI ran but produced no cost
+    # data" (None) from "AI ran and the bill was 0.0".
+    ai_cost_usd_total: float | None = None
 
     @property
     def sort_key(self) -> tuple[str, int]:
@@ -171,6 +177,33 @@ def _singleton_feature_id(pr: PRInfo, origin_slug: str | None) -> str:
     return f"{owner}-{repo}-pr-{pr.number}"
 
 
+def _author_filter_reason(
+    author: str | None,
+    included_authors: set[str],
+    excluded_authors: set[str],
+) -> str | None:
+    """Return a human-readable reason to drop a PR by author, or ``None``
+    if the PR survives the author filter.
+
+    ``included_authors`` and ``excluded_authors`` are lower-cased GitHub
+    logins. When ``included_authors`` is non-empty it's an allowlist:
+    PRs whose author is unknown or not on the list are dropped.
+    """
+    login = (author or "").lower()
+    if excluded_authors and login and login in excluded_authors:
+        return f"author @{author} is in pr_sources.exclude_authors"
+    if included_authors:
+        if not login:
+            return (
+                "author is unknown but pr_sources.include_authors is set"
+            )
+        if login not in included_authors:
+            return (
+                f"author @{author} is not in pr_sources.include_authors"
+            )
+    return None
+
+
 def _build_singleton_units(
     config: Config,
     collected: dict[PRRef, tuple[PRInfo, PRSourceConfig]],
@@ -191,10 +224,16 @@ def _build_group_units(
     config: Config,
     excluded_pr_refs: set[PRRef],
     excluded_labels: set[str],
+    included_authors: set[str],
+    excluded_authors: set[str],
 ) -> tuple[list[FeatureUnit], set[PRRef]]:
     """Materialise group units, fetching each PR. Returns (units, claimed_refs)
     where ``claimed_refs`` are ``(owner, repo, number)`` tuples that should
     NOT also appear as standalone units.
+
+    ``included_authors`` and ``excluded_authors`` are lower-cased GitHub
+    logins; they filter group members the same way they filter top-level
+    discovered PRs.
     """
     origin_slug = get_origin_repo_slug(config)
     units: list[FeatureUnit] = []
@@ -226,6 +265,15 @@ def _build_group_units(
                 console.print(
                     f"    [yellow]−[/yellow] {ref_label} carries an excluded "
                     "label, dropping from group"
+                )
+                continue
+            reason = _author_filter_reason(
+                pr.author, included_authors, excluded_authors,
+            )
+            if reason is not None:
+                console.print(
+                    f"    [yellow]−[/yellow] {ref_label} {reason}, "
+                    "dropping from group"
                 )
                 continue
             group_prs.append(pr)
@@ -463,6 +511,34 @@ def run_pipeline(
                 f"({', '.join(prs_cfg.exclude_labels)})[/dim]"
             )
 
+    included_authors = {a.lower() for a in prs_cfg.include_authors if a}
+    excluded_authors = {a.lower() for a in prs_cfg.exclude_authors if a}
+    if included_authors or excluded_authors:
+        kept: dict[PRRef, tuple[PRInfo, PRSourceConfig]] = {}
+        dropped: list[tuple[PRInfo, str]] = []
+        for ref, (pr, src) in collected.items():
+            if ref in include_pr_refs:
+                kept[ref] = (pr, src)
+                continue
+            reason = _author_filter_reason(
+                pr.author, included_authors, excluded_authors,
+            )
+            if reason is None:
+                kept[ref] = (pr, src)
+            else:
+                dropped.append((pr, reason))
+        collected = kept
+        if dropped:
+            console.print(
+                f"\n  [dim]Excluded {len(dropped)} PR(s) by author filter:"
+                "[/dim]"
+            )
+            for pr, reason in dropped:
+                ref_label = pr_ref_label(
+                    pr.repo_slug, pr.number, origin_slug,
+                )
+                console.print(f"    [dim]− {ref_label}: {reason}[/dim]")
+
     if include_pr_refs:
         default_source = (
             config.pr_sources.by_labels[0]
@@ -495,6 +571,7 @@ def run_pipeline(
     excluded_label_set = set(prs_cfg.exclude_labels)
     group_units, claimed_pr_refs = _build_group_units(
         config, exclude_pr_refs, excluded_label_set,
+        included_authors, excluded_authors,
     )
     # Drop any singletons that the groups have claimed.
     for ref in claimed_pr_refs:
@@ -559,7 +636,14 @@ def run_pipeline(
 
 
 def _unit_pr_meta(unit: FeatureUnit) -> dict:
-    """Build state-meta dict for a unit (single PR or group)."""
+    """Build state-meta dict for a unit (single PR or group).
+
+    ``pr_author`` is the GitHub login of the *primary* (first) PR — for
+    groups, that's the author of the first PR in cherry-pick order, per
+    the user's spec for the project board's default ``Assignee Dev``.
+    May be ``None`` when GitHub didn't expose the author (rare:
+    deleted accounts).
+    """
     primary = unit.primary_pr()
     return {
         "pr_url": primary.url,
@@ -568,6 +652,7 @@ def _unit_pr_meta(unit: FeatureUnit) -> dict:
         "pr_body": primary.body,
         "pr_numbers": [pr.number for pr in unit.prs],
         "pr_urls": [pr.url for pr in unit.prs],
+        "pr_author": primary.author,
     }
 
 
@@ -1210,6 +1295,8 @@ def _finish_clean_unit(
     if ai_used:
         fs.ai_resolved = True
         fs.ai_iterations = unit.ai_iterations_total or None
+    if unit.ai_cost_usd_total is not None:
+        fs.ai_cost_usd = unit.ai_cost_usd_total
     state.features[unit.feature_id] = fs
 
     if config.push and config.pr_sources.auto_pr:
@@ -1412,6 +1499,7 @@ def _handle_unresolved_conflict(
             conflict_files=conflict_files,
             failed_step_index=idx,
             partial_pr_count=0,
+            ai_cost_usd=unit.ai_cost_usd_total,
             **pr_meta,
         )
         _update_state_and_status(config, state)
@@ -1467,6 +1555,7 @@ def _handle_unresolved_conflict(
         conflict_files=conflict_files,
         failed_step_index=applied,
         partial_pr_count=applied,
+        ai_cost_usd=unit.ai_cost_usd_total,
         **pr_meta,
     )
     if rebase_pr_url:
@@ -1493,40 +1582,40 @@ def _try_ai_resolve_step(
     singletons and for any step inside a sequential group.
 
     Returns True on success. On failure the working tree is reset to a
-    clean state at ``start_sha`` (any Claude in-progress op aborted, any
-    half-baked commits dropped) and the caller is responsible for
-    deciding what to do next — typically routing through
-    :func:`_handle_unresolved_conflict`.
+    clean state at ``start_sha`` (handled inside ``attempt_ai_resolve``)
+    and the caller is responsible for deciding what to do next — typically
+    routing through :func:`_handle_unresolved_conflict`.
     """
-    from releasy.ai_resolve import AIResolveContext, resolve_with_claude
-
-    head = run_git(["rev-parse", "--verify", "HEAD"], repo_path, check=False)
-    start_sha = head.stdout.strip() if head.returncode == 0 else None
+    from releasy.ai_resolve import AIResolveContext, attempt_ai_resolve
 
     ctx = AIResolveContext(
         port_branch=new_branch,
         base_branch=base_branch,
         source_pr=pr,
         conflict_files=conflict_files,
-        start_sha=start_sha,
+        operation="cherry-pick",
     )
 
-    result = resolve_with_claude(config, repo_path, ctx)
+    result = attempt_ai_resolve(config, repo_path, ctx)
+
+    # Cost is billed even when Claude failed — record it before deciding
+    # what to do about the failure.
+    if result.cost_usd is not None:
+        unit.ai_cost_usd_total = (
+            (unit.ai_cost_usd_total or 0.0) + result.cost_usd
+        )
 
     if not result.success:
         reason = result.error or (
             "timed out" if result.timed_out else "unknown failure"
         )
-        console.print(f"    [yellow]AI resolve failed:[/yellow] {reason}")
-        # Reset to a known state so the caller can decide what to do next.
-        # If Claude left the cherry-pick aborted but committed something
-        # half-way, hard-reset back to start_sha.
-        if is_operation_in_progress(repo_path):
-            run_git(["cherry-pick", "--abort"], repo_path, check=False)
-            run_git(["merge", "--abort"], repo_path, check=False)
-            run_git(["rebase", "--abort"], repo_path, check=False)
-        if start_sha:
-            run_git(["reset", "--hard", start_sha], repo_path, check=False)
+        cost_note = (
+            f" [dim](cost: ${result.cost_usd:.4f})[/dim]"
+            if result.cost_usd is not None else ""
+        )
+        console.print(
+            f"    [yellow]AI resolve failed:[/yellow] {reason}{cost_note}"
+        )
         return False
 
     unit.ai_resolved_count += 1
@@ -1535,8 +1624,12 @@ def _try_ai_resolve_step(
     iters = (
         f" (iterations: {result.iterations})" if result.iterations else ""
     )
+    cost = (
+        f" [dim](cost: ${result.cost_usd:.4f})[/dim]"
+        if result.cost_usd is not None else ""
+    )
     console.print(
-        f"    [green]✓[/green] AI resolved #{pr.number}{iters}"
+        f"    [green]✓[/green] AI resolved #{pr.number}{iters}{cost}"
     )
     return True
 

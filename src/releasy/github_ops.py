@@ -658,17 +658,22 @@ def _get_project_id(owner: str, number: int, is_org: bool) -> str | None:
         return None
 
 
-def _get_status_field(project_id: str) -> tuple[str, dict[str, str], list[dict]] | None:
-    """Return (field_id, {lowercase_name: option_id}, [raw_options]) or None."""
+def _list_project_fields(project_id: str) -> list[dict]:
+    """Return every field node on a project (any data type).
+
+    Single-select fields carry their ``options``; non-single-select fields
+    (NUMBER, TEXT, DATE, …) just have ``id``/``name``/``dataType``. Empty
+    list on lookup failure — callers fall back gracefully.
+    """
     query = """
     query($projectId: ID!) {
       node(id: $projectId) {
         ... on ProjectV2 {
-          fields(first: 30) {
+          fields(first: 50) {
             nodes {
+              __typename
+              ... on ProjectV2FieldCommon { id name dataType }
               ... on ProjectV2SingleSelectField {
-                id
-                name
                 options { id name color description }
               }
             }
@@ -679,21 +684,177 @@ def _get_status_field(project_id: str) -> tuple[str, dict[str, str], list[dict]]
     """
     data = _gql(query, {"projectId": project_id})
     if not data:
+        return []
+    try:
+        return data["node"]["fields"]["nodes"] or []
+    except (KeyError, TypeError):
+        return []
+
+
+def _get_status_field(project_id: str) -> tuple[str, dict[str, str], list[dict]] | None:
+    """Return (field_id, {lowercase_name: option_id}, [raw_options]) or None.
+
+    Looks for a single-select field named "Status" (case-insensitive). A
+    field with that name but a different data type (TEXT / NUMBER /
+    DATE) is ignored — RelEasy can only drive a single-select Status.
+    """
+    for field_node in _list_project_fields(project_id):
+        if field_node.get("name", "").lower() != "status":
+            continue
+        if field_node.get("dataType") and field_node["dataType"] != "SINGLE_SELECT":
+            continue
+        raw_options = field_node.get("options") or []
+        options = {
+            opt["name"].lower(): opt["id"]
+            for opt in raw_options
+        }
+        return field_node["id"], options, raw_options
+    return None
+
+
+# Project field names RelEasy owns. Hard-coded to keep board layout stable
+# and to make the "find or create" lookups trivial.
+AI_COST_FIELD_NAME = "AI Cost"
+ASSIGNEE_DEV_FIELD_NAME = "Assignee Dev"
+ASSIGNEE_QA_FIELD_NAME = "Assignee QA"
+
+
+def _find_field_by_name(
+    project_id: str, name: str, data_type: str | None = None,
+) -> str | None:
+    """Return the field id for ``name`` on ``project_id`` (case-insensitive).
+
+    When ``data_type`` is given, also requires the field to be of that
+    type — protects against accidentally wiring up to a same-named field
+    of the wrong shape (e.g. a TEXT "AI Cost" left over from a hand-edit).
+    """
+    target = name.lower()
+    for f in _list_project_fields(project_id):
+        if (f.get("name") or "").lower() != target:
+            continue
+        if data_type and (f.get("dataType") or "") != data_type:
+            continue
+        return f.get("id")
+    return None
+
+
+def _create_number_field(project_id: str, name: str) -> str | None:
+    """Create a NUMBER field on a project. Returns the field id."""
+    mutation = """
+    mutation($projectId: ID!, $name: String!) {
+      createProjectV2Field(input: {
+        projectId: $projectId
+        dataType: NUMBER
+        name: $name
+      }) {
+        projectV2Field { ... on ProjectV2Field { id } }
+      }
+    }
+    """
+    data = _gql(mutation, {"projectId": project_id, "name": name})
+    if not data:
         return None
     try:
-        field_nodes = data["node"]["fields"]["nodes"]
+        return data["createProjectV2Field"]["projectV2Field"]["id"]
     except (KeyError, TypeError):
         return None
 
-    for field_node in field_nodes:
-        if field_node.get("name", "").lower() == "status":
-            raw_options = field_node.get("options", [])
-            options = {
-                opt["name"].lower(): opt["id"]
-                for opt in raw_options
-            }
-            return field_node["id"], options, raw_options
+
+def _get_single_select_field(
+    project_id: str, name: str,
+) -> tuple[str, dict[str, str], list[dict]] | None:
+    """Look up a single-select field by name. Returns ``(field_id,
+    {lowercase_name: option_id}, raw_options)`` or ``None``.
+
+    Generalises ``_get_status_field`` for any single-select field (used
+    for ``Assignee Dev`` / ``Assignee QA``). A field with the right name
+    but a different ``dataType`` is rejected — protects against an
+    accidental TEXT field shadowing a SINGLE_SELECT one.
+    """
+    target = name.lower()
+    for field_node in _list_project_fields(project_id):
+        if (field_node.get("name") or "").lower() != target:
+            continue
+        dt = field_node.get("dataType")
+        if dt and dt != "SINGLE_SELECT":
+            continue
+        raw_options = field_node.get("options") or []
+        options = {
+            opt["name"].lower(): opt["id"] for opt in raw_options
+        }
+        return field_node["id"], options, raw_options
     return None
+
+
+# Color used for newly-provisioned Assignee Dev / Assignee QA options.
+# GRAY keeps the UI neutral (no implied semantics like "good"/"bad").
+_ASSIGNEE_OPTION_COLOR = "GRAY"
+
+
+def _ensure_assignee_field(
+    project_id: str, field_name: str, configured_options: list[str],
+) -> tuple[str, dict[str, str]] | None:
+    """Find or create a single-select assignee field on the project.
+
+    On first creation the field is provisioned with exactly the
+    ``configured_options`` list (each option coloured GRAY). On
+    subsequent runs the field is left untouched — RelEasy never
+    rewrites the option list, so any options the user added in the
+    GitHub UI (and any value assigned to a card on a since-removed
+    option) are preserved.
+
+    Returns ``(field_id, {lowercase_option_name: option_id})`` for the
+    live field, or ``None`` if the field could neither be found nor
+    created (e.g. the token can't write to the project).
+    """
+    existing = _get_single_select_field(project_id, field_name)
+    if existing:
+        field_id, options_by_name, _ = existing
+        return field_id, options_by_name
+
+    if not configured_options:
+        log.warning(
+            "Cannot create %r field: no options configured "
+            "(notifications.assignee_*_options is empty)", field_name,
+        )
+        return None
+
+    options_payload = [
+        {
+            "name": opt,
+            "color": _ASSIGNEE_OPTION_COLOR,
+            "description": "",
+        }
+        for opt in configured_options
+    ]
+    field_id = _create_single_select_field(
+        project_id, field_name, options_payload,
+    )
+    if not field_id:
+        return None
+    # Re-read so we get the option ids GitHub assigned.
+    refreshed = _get_single_select_field(project_id, field_name)
+    if not refreshed:
+        log.warning(
+            "Created field %r but could not re-read its options",
+            field_name,
+        )
+        return field_id, {}
+    return refreshed[0], refreshed[1]
+
+
+def _ensure_ai_cost_field(project_id: str) -> str | None:
+    """Find or create the ``AI Cost`` NUMBER field on a project.
+
+    Idempotent: returns the existing field id when one is already present
+    with the right type, creates one otherwise. Returns ``None`` only on
+    a hard GraphQL failure — callers degrade gracefully (skip the cost
+    sync rather than abort the whole project sync).
+    """
+    existing = _find_field_by_name(project_id, AI_COST_FIELD_NAME, data_type="NUMBER")
+    if existing:
+        return existing
+    return _create_number_field(project_id, AI_COST_FIELD_NAME)
 
 
 def _list_project_items(project_id: str) -> list[dict]:
@@ -875,6 +1036,36 @@ def _set_item_field(project_id: str, item_id: str, field_id: str, option_id: str
         "itemId": item_id,
         "fieldId": field_id,
         "optionId": option_id,
+    })
+    return data is not None
+
+
+def _set_item_number_field(
+    project_id: str, item_id: str, field_id: str, value: float,
+) -> bool:
+    """Set a NUMBER field on a project item to ``value``.
+
+    GitHub's GraphQL API takes a ``Float`` for ``value.number``; passing
+    a Python float is fine — the JSON encoder serialises it correctly
+    and integers are accepted too.
+    """
+    mutation = """
+    mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: Float!) {
+      updateProjectV2ItemFieldValue(input: {
+        projectId: $projectId
+        itemId: $itemId
+        fieldId: $fieldId
+        value: { number: $value }
+      }) {
+        projectV2Item { id }
+      }
+    }
+    """
+    data = _gql(mutation, {
+        "projectId": project_id,
+        "itemId": item_id,
+        "fieldId": field_id,
+        "value": float(value),
     })
     return data is not None
 
@@ -1156,6 +1347,53 @@ def setup_project(config: Config) -> str | None:
                 "(see warnings above)"
             )
 
+    # Ensure the AI Cost (NUMBER) field exists. Created lazily here so an
+    # already-running project picks it up the next time the user runs
+    # ``releasy setup-project``; ``sync_project`` also creates it on the
+    # fly so cards always carry the value.
+    ai_cost_field_id = _ensure_ai_cost_field(project_id)
+    if ai_cost_field_id:
+        console.print(
+            f"  [green]\u2713[/green] {AI_COST_FIELD_NAME} field present"
+        )
+    else:
+        console.print(
+            f"  [yellow]![/yellow] Could not create {AI_COST_FIELD_NAME} "
+            "field (token missing project scope?). Cost will not be "
+            "synced to the board."
+        )
+
+    # Provision the Assignee Dev / Assignee QA single-select fields. On
+    # first creation each is populated with the option list from
+    # ``notifications.assignee_*_options``. On subsequent runs we leave
+    # the options alone — adding/removing options would risk wiping
+    # values the user manually set on the board.
+    for field_name, options in (
+        (ASSIGNEE_DEV_FIELD_NAME, config.notifications.assignee_dev_options),
+        (ASSIGNEE_QA_FIELD_NAME, config.notifications.assignee_qa_options),
+    ):
+        existed = _get_single_select_field(project_id, field_name) is not None
+        ensured = _ensure_assignee_field(project_id, field_name, options)
+        if not ensured:
+            console.print(
+                f"  [yellow]![/yellow] Could not create [cyan]{field_name}"
+                "[/cyan] field (token missing project scope?). Add it "
+                "manually in the project settings to enable assignee "
+                "tracking."
+            )
+            continue
+        if existed:
+            console.print(
+                f"  [dim]\u2713 {field_name} field already exists "
+                "(option list left untouched — edit in the GitHub UI to "
+                "add or remove people).[/dim]"
+            )
+        else:
+            console.print(
+                f"  [green]\u2713[/green] {field_name} field created "
+                f"with {len(options)} option(s): {', '.join(options) or '\u2014'}"
+            )
+
     return project_url
 
 
@@ -1407,6 +1645,27 @@ def sync_project(config: Config, state: PipelineState) -> ProjectSyncSummary:
     if status_info:
         status_field_id, status_options, _ = status_info
 
+    # Auto-provision the AI Cost field. Best-effort: if the token can't
+    # create it, we just skip the cost sync — every other part of the
+    # board still updates.
+    ai_cost_field_id = _ensure_ai_cost_field(project_id)
+
+    # Look up (do NOT auto-create here — that's setup_project's job) the
+    # Assignee Dev field. We only set its default value on freshly created
+    # cards; missing field => default-seeding is silently skipped.
+    assignee_dev_field_id: str | None = None
+    assignee_dev_options: dict[str, str] = {}
+    dev_field = _get_single_select_field(project_id, ASSIGNEE_DEV_FIELD_NAME)
+    if dev_field:
+        assignee_dev_field_id, assignee_dev_options, _ = dev_field
+    # Lower-case the configured login → option-label map at the call
+    # site so we can compare PR-author logins case-insensitively without
+    # mutating the live config.
+    login_map_lc = {
+        k.lower(): v
+        for k, v in config.notifications.assignee_dev_login_map.items()
+    }
+
     origin_slug = get_origin_repo_slug(config)
 
     # Collect every feature we know about. State wins; static config
@@ -1512,6 +1771,43 @@ def sync_project(config: Config, state: PipelineState) -> ProjectSyncSummary:
             option_id = status_options.get(mapped.lower())
             if option_id:
                 _set_item_field(project_id, item_id, status_field_id, option_id)
+
+        # AI Cost: always write a number so the column is never blank
+        # (cards that never invoked the resolver land at 0.0). Skipped
+        # only when the field couldn't be provisioned at all.
+        if ai_cost_field_id:
+            cost_value = float(fs.ai_cost_usd) if (fs and fs.ai_cost_usd is not None) else 0.0
+            _set_item_number_field(
+                project_id, item_id, ai_cost_field_id, cost_value,
+            )
+
+        # Assignee Dev: seed once per card, on first creation only. We
+        # never overwrite an existing card's value so anything a human
+        # set manually (or any later reassignment) is preserved across
+        # re-runs. Assignee QA is left strictly untouched — it has no
+        # automatic default.
+        if (
+            not was_existing
+            and assignee_dev_field_id
+            and assignee_dev_options
+            and fs is not None
+            and fs.pr_author
+        ):
+            mapped_label = login_map_lc.get(fs.pr_author.lower())
+            if mapped_label:
+                option_id = assignee_dev_options.get(mapped_label.lower())
+                if option_id:
+                    _set_item_field(
+                        project_id, item_id,
+                        assignee_dev_field_id, option_id,
+                    )
+                else:
+                    log.info(
+                        "Assignee Dev default %r for PR author %r is not "
+                        "an option on the project field — leaving the "
+                        "field empty for manual assignment",
+                        mapped_label, fs.pr_author,
+                    )
 
         if was_existing:
             summary.updated += 1

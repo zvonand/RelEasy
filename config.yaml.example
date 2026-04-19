@@ -217,6 +217,12 @@ notifications:
 #   enabled: false
 #   command: claude
 #   prompt_file: prompts/resolve_conflict.md
+#   # Prompt template used by `releasy refresh` when Claude has to
+#   # drive a `git merge` to completion (keeping an open rebase PR
+#   # current with its target branch). Same placeholder vocabulary as
+#   # prompt_file; the difference is the in-progress operation
+#   # (merge vs cherry-pick) and how to conclude it.
+#   merge_prompt_file: prompts/resolve_merge_conflict.md
 #   # Hard cap (passed into the prompt) on how many build attempts
 #   # Claude is allowed to make per conflict before giving up.
 #   max_iterations: 5
@@ -257,4 +263,20 @@ notifications:
 #
 # The pipeline never stalls on a single bad unit anymore — it just
 # flags it and moves on.
+#
+# Once a batch of rebase PRs is open, the target branch keeps moving as
+# other work lands. Some PRs will eventually conflict with the new tip:
+#
+#   releasy refresh
+#   → strictly maintenance: never opens new PRs, never creates new
+#     branches, never discovers new sources. Only refreshes entries
+#     already in state.yaml.
+#   → for each tracked PR with a branch + rebase PR URL:
+#       fetch latest tips, attempt `git merge --no-ff origin/<base>`
+#       into the PR branch. Clean merge: leave the PR alone. Conflict
+#       + AI resolves: push the resolved merge commit. Conflict + AI
+#       gives up: abort the merge, reset, mark the entry "Conflict".
+#   → uses `ai_resolve.merge_prompt_file` (same machinery as cherry-pick
+#     resolution; different in-progress operation and prompt framing).
+#   → exits 1 if any PR ended up in conflict — suitable for cron / CI.
 # ─────────────────────────────────────────────────────────────────────
