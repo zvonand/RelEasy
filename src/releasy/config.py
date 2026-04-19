@@ -27,12 +27,6 @@ def extract_version_suffix(onto: str) -> str:
 
 
 @dataclass
-class UpstreamConfig:
-    remote: str
-    remote_name: str = "upstream"
-
-
-@dataclass
 class OriginConfig:
     remote: str
     remote_name: str = "origin"
@@ -55,7 +49,6 @@ class PRSourceConfig:
     labels: list[str]
     description: str = ""
     merged_only: bool = False
-    auto_pr: bool = False
     # When the port branch already exists: "skip" (leave it alone) or
     # "recreate" (delete and rebuild from base). Inherits PRSourcesConfig.if_exists
     # when not set per-source.
@@ -68,12 +61,11 @@ class PRGroupConfig:
 
     All ``prs`` are cherry-picked, in listed order, onto the same port branch
     ``feature/<base>/<id>`` and result in a single combined PR (when push +
-    auto_pr).
+    pr_sources.auto_pr).
     """
     id: str
     prs: list[str]
     description: str = ""
-    auto_pr: bool = True
     # When the port branch already exists locally: "skip" or "recreate".
     # Inherits from PRSourcesConfig.if_exists when not set per-group.
     if_exists: str = "skip"
@@ -90,6 +82,11 @@ class PRSourcesConfig:
     label matches. ``exclude_prs`` and ``exclude_labels`` still drop
     individual PRs from a group; if a group ends up empty, it is dropped
     with a warning.
+
+    ``auto_pr`` is a single global switch: when true (the default), every
+    pushed port branch (singleton, by-labels, include_prs, or group) gets a
+    PR opened against the base branch. Set to false to push branches only
+    and open PRs manually. Requires ``push: true`` to have any effect.
     """
     by_labels: list[PRSourceConfig] = field(default_factory=list)
     exclude_labels: list[str] = field(default_factory=list)
@@ -100,6 +97,8 @@ class PRSourcesConfig:
     # ``include_prs`` and to any ``by_labels`` / ``groups`` entry that omits
     # ``if_exists``.
     if_exists: str = "skip"
+    # Global switch: open a PR for every pushed port branch.
+    auto_pr: bool = True
 
 
 @dataclass
@@ -130,6 +129,10 @@ class AIResolveConfig:
     build_command: str = "cd build && ninja"
     label: str = "ai-resolved"
     label_color: str = "8B5CF6"
+    # Label attached to a PR that needs human attention because the AI
+    # resolver gave up (a partial-group draft PR; singletons get no PR).
+    needs_attention_label: str = "ai-needs-attention"
+    needs_attention_label_color: str = "D93F0B"
     extra_args: list[str] = field(default_factory=list)
     # How many times to re-invoke claude when the Anthropic streaming
     # API drops the turn with a transient error ("Stream idle timeout",
@@ -142,12 +145,7 @@ class AIResolveConfig:
 class Config:
     origin: OriginConfig
     project: str  # short project identifier, e.g. "antalya"
-    upstream: UpstreamConfig | None = None
     target_branch: str | None = None  # explicit base/target branch override
-    # When a cherry-pick conflicts and the AI resolver doesn't (or can't) fix
-    # it, releasy can either leave the working tree dirty (default) so you
-    # resolve manually, or commit the conflict markers as a WIP and push.
-    wip_commit_on_conflict: bool = False
     # When a PR for the port branch already exists on GitHub:
     #   false (default) — leave it exactly as-is; don't try to create a new
     #                     one and don't touch its title/body.
@@ -243,18 +241,21 @@ def load_config(config_path: Path | None = None) -> Config:
     if not raw:
         raise ValueError("Config file is empty")
 
+    if "wip_commit_on_conflict" in raw:
+        import logging
+        logging.getLogger(__name__).warning(
+            "config: 'wip_commit_on_conflict' is no longer supported and will be "
+            "ignored. Unresolved conflicts now drop the local branch (singletons "
+            "/ first-of-group) or open a draft PR labelled "
+            "'ai-needs-attention' (partial groups), and mark the entry as "
+            "'Conflict' in the GitHub Project. Remove the option from "
+            "config.yaml to silence this warning."
+        )
+
     origin = OriginConfig(
         remote=raw["origin"]["remote"],
         remote_name=raw["origin"].get("remote_name", "origin"),
     )
-
-    upstream_raw = raw.get("upstream")
-    upstream = None
-    if upstream_raw:
-        upstream = UpstreamConfig(
-            remote=upstream_raw["remote"],
-            remote_name=upstream_raw.get("remote_name", "upstream"),
-        )
 
     project = raw.get("project")
     if not project:
@@ -282,6 +283,7 @@ def load_config(config_path: Path | None = None) -> Config:
             f"pr_sources.if_exists must be one of {_VALID_IF_EXISTS}, "
             f"got {global_if_exists!r}"
         )
+    global_auto_pr = bool(ps_raw.get("auto_pr", True))
     by_labels = []
     for entry in ps_raw.get("by_labels", []):
         raw_labels = entry.get("labels", [])
@@ -293,12 +295,17 @@ def load_config(config_path: Path | None = None) -> Config:
                 f"pr_sources.by_labels[].if_exists must be one of "
                 f"{_VALID_IF_EXISTS}, got {entry_if_exists!r}"
             )
+        if "auto_pr" in entry:
+            raise ValueError(
+                f"pr_sources.by_labels[labels={raw_labels!r}].auto_pr is no "
+                "longer supported. Use the global 'pr_sources.auto_pr' "
+                "switch (default true) instead."
+            )
         by_labels.append(
             PRSourceConfig(
                 labels=raw_labels,
                 description=entry.get("description", ""),
                 merged_only=entry.get("merged_only", False),
-                auto_pr=entry.get("auto_pr", False),
                 if_exists=entry_if_exists,
             )
         )
@@ -330,12 +337,17 @@ def load_config(config_path: Path | None = None) -> Config:
                 f"pr_sources.groups[{gid!r}].if_exists must be one of "
                 f"{_VALID_IF_EXISTS}, got {group_if_exists!r}"
             )
+        if "auto_pr" in entry:
+            raise ValueError(
+                f"pr_sources.groups[id={gid!r}].auto_pr is no longer "
+                "supported. Use the global 'pr_sources.auto_pr' switch "
+                "(default true) instead."
+            )
         groups.append(
             PRGroupConfig(
                 id=gid,
                 prs=prs_list,
                 description=entry.get("description", ""),
-                auto_pr=entry.get("auto_pr", True),
                 if_exists=group_if_exists,
             )
         )
@@ -347,6 +359,7 @@ def load_config(config_path: Path | None = None) -> Config:
         exclude_prs=ps_raw.get("exclude_prs", []),
         groups=groups,
         if_exists=global_if_exists,
+        auto_pr=global_auto_pr,
     )
 
     notifications = NotificationsConfig(
@@ -364,6 +377,12 @@ def load_config(config_path: Path | None = None) -> Config:
         build_command=ai_raw.get("build_command", "cd build && ninja"),
         label=ai_raw.get("label", "ai-resolved"),
         label_color=ai_raw.get("label_color", "8B5CF6"),
+        needs_attention_label=ai_raw.get(
+            "needs_attention_label", "ai-needs-attention",
+        ),
+        needs_attention_label_color=ai_raw.get(
+            "needs_attention_label_color", "D93F0B",
+        ),
         extra_args=ai_raw.get("extra_args", []) or [],
         api_retries=int(ai_raw.get("api_retries", 3)),
         api_retry_backoff_seconds=int(ai_raw.get("api_retry_backoff_seconds", 15)),
@@ -375,9 +394,7 @@ def load_config(config_path: Path | None = None) -> Config:
     return Config(
         origin=origin,
         project=project,
-        upstream=upstream,
         target_branch=raw.get("target_branch") or None,
-        wip_commit_on_conflict=bool(raw.get("wip_commit_on_conflict", False)),
         update_existing_prs=bool(raw.get("update_existing_prs", False)),
         features=features,
         pr_sources=pr_sources,
@@ -402,17 +419,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         "project": config.project,
     }
 
-    if config.upstream:
-        data["upstream"] = {
-            "remote": config.upstream.remote,
-            "remote_name": config.upstream.remote_name,
-        }
-
     if config.target_branch:
         data["target_branch"] = config.target_branch
-
-    if config.wip_commit_on_conflict:
-        data["wip_commit_on_conflict"] = True
 
     if config.update_existing_prs:
         data["update_existing_prs"] = True
@@ -438,7 +446,7 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     ps = config.pr_sources
     if (
         ps.by_labels or ps.exclude_labels or ps.include_prs
-        or ps.exclude_prs or ps.groups
+        or ps.exclude_prs or ps.groups or ps.auto_pr is not True
     ):
         ps_data: dict = {}
         if ps.by_labels:
@@ -449,7 +457,6 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
                         "labels": entry.labels,
                         "description": entry.description or None,
                         "merged_only": entry.merged_only or None,
-                        "auto_pr": entry.auto_pr or None,
                         "if_exists": entry.if_exists if entry.if_exists != ps.if_exists else None,
                     }.items()
                     if v is not None
@@ -469,7 +476,6 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
                     for k, v in {
                         "id": g.id,
                         "description": g.description or None,
-                        "auto_pr": g.auto_pr if g.auto_pr is not True else None,
                         "if_exists": g.if_exists if g.if_exists != ps.if_exists else None,
                         "prs": g.prs,
                     }.items()
@@ -479,6 +485,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
             ]
         if ps.if_exists != "skip":
             ps_data["if_exists"] = ps.if_exists
+        if ps.auto_pr is not True:
+            ps_data["auto_pr"] = ps.auto_pr
         data["pr_sources"] = ps_data
 
     if config.notifications.github_project:
@@ -505,6 +513,10 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         ai_data["label"] = ai.label
     if ai.label_color != ai_defaults.label_color:
         ai_data["label_color"] = ai.label_color
+    if ai.needs_attention_label != ai_defaults.needs_attention_label:
+        ai_data["needs_attention_label"] = ai.needs_attention_label
+    if ai.needs_attention_label_color != ai_defaults.needs_attention_label_color:
+        ai_data["needs_attention_label_color"] = ai.needs_attention_label_color
     if ai.extra_args:
         ai_data["extra_args"] = ai.extra_args
     if ai.api_retries != ai_defaults.api_retries:

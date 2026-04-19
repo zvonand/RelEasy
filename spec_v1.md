@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-A standalone CLI tool that ports features and PRs onto a stable **base branch** on origin. Rather than rebasing long-lived branches in place, each feature / PR is cherry-picked onto its own port branch (`feature/<base>/<id>`) and optionally opened as a PR. Works with a fork against an upstream, or within a single repo for forward-porting/back-porting.
+A standalone CLI tool that ports features and PRs onto a stable **base branch** on origin. Rather than rebasing long-lived branches in place, each feature / PR is cherry-picked onto its own port branch (`feature/<base>/<id>`) and optionally opened as a PR. RelEasy tracks a single repo (`origin`); PRs from other repos can still be ported by listing their full URLs in `pr_sources.include_prs` / `pr_sources.groups[].prs`.
 
 The pipeline is **resumable**: state is persisted between runs, and each `releasy run` picks up from where the previous run stopped.
 
@@ -12,7 +12,7 @@ The pipeline is **resumable**: state is persisted between runs, and each `releas
 
 ```
 releasy/
-├── config.yaml        ← origin/upstream URLs, features, PR sources (gitignored)
+├── config.yaml        ← origin URL, features, PR sources (gitignored)
 ├── config.yaml.example ← documented template
 ├── state.yaml         ← persisted pipeline state (auto-managed)
 ├── STATUS.md          ← human-readable branch status table (auto-managed)
@@ -24,15 +24,21 @@ releasy/
 ## 3. Branch Naming Convention
 
 The base/target branch is taken from `target_branch` in config when set;
-otherwise it's derived as `<project>-<version>` from the upstream ref:
-- Tags like `v26.3.4.234-lts` → version suffix `26.3`
+otherwise it's derived as `<project>-<version>` where `<version>` is parsed
+from the `--onto` value:
+- `26.3` → `26.3`
+- Tag-style strings like `v26.3.4.234-lts` → `26.3`
 - Raw SHAs → first 8 characters
+
+`--onto` is a **naming label**, not a git ref. RelEasy never tries to
+fetch or resolve it; the base branch itself must already exist on origin.
 
 | Type | Pattern | Example |
 |------|---------|---------|
 | Base | `target_branch` or `<project>-<version>` | `antalya-26.3` |
 | Feature | `feature/<base>/<id>` | `feature/antalya-26.3/s3-disk` |
-| PR Feature | `feature/<base>/pr-<N>` | `feature/antalya-26.3/pr-42` |
+| Origin PR feature | `feature/<base>/pr-<N>` | `feature/antalya-26.3/pr-42` |
+| External PR feature | `feature/<base>/<owner>-<repo>-pr-<N>` | `feature/antalya-26.3/ClickHouse-ClickHouse-pr-12345` |
 
 - `<project>` is taken from the top-level `project:` config key
 - Old branches stay on the remote as history — nothing is force-pushed or destroyed
@@ -49,11 +55,6 @@ work_dir: /path/to/repo  # path to existing clone or where to clone
 origin:
   remote: https://github.com/Altinity/ClickHouse.git
   remote_name: origin
-
-# Upstream (optional) — omit entirely if porting within origin
-upstream:
-  remote: https://github.com/ClickHouse/ClickHouse.git
-  remote_name: upstream
 
 # Project identifier — used for derived branch names
 project: antalya
@@ -77,11 +78,11 @@ features:
 # PR discovery and filtering
 # Set arithmetic: union(by_labels) − exclude_labels + include_prs − exclude_prs
 pr_sources:
+  # auto_pr: true   # default; open PR for every pushed port branch
   by_labels:
     - labels: ["forward-port", "v26.3"]
       description: "Forward-ported changes"
       merged_only: true
-      auto_pr: true
       if_exists: skip
 
   exclude_labels: ["do-not-port"]
@@ -111,13 +112,13 @@ notifications:
 - `push: false` (default) keeps everything local — no branches pushed, no PRs created, no project board sync.
 - `work_dir` can point to an existing git clone. If the directory has a `.git`, it's used directly (no clone).
 - `origin` is required — the repo where branches are pushed and PRs are created.
-- `upstream` is optional — omit it when forward-porting or back-porting within your own repo.
 - `pr_sources.*.if_exists`: `skip` (default) leaves existing port branches alone; `recreate` rebuilds them from scratch.
 - `pr_sources.by_labels[].labels`: AND logic — a PR must have ALL listed labels. Multiple `by_labels` entries are unioned.
 - `pr_sources.exclude_labels`: any PR carrying at least one of these labels is dropped (unless it appears in `include_prs`).
-- `pr_sources.include_prs`: always include these PRs by URL, regardless of labels.
-- `pr_sources.exclude_prs`: always exclude these PRs by URL — final override.
-- `pr_sources.groups`: each group is one *unit of work* — its PRs are cherry-picked, in listed order, onto a single port branch named `feature/<base>/<id>`, and (when `auto_pr` and `push`) result in ONE combined PR. A PR may appear in at most one group; PRs claimed by a group are removed from the standalone stream. `exclude_prs` and `exclude_labels` still drop individual PRs from a group; an emptied group is skipped with a warning. AI conflict resolution runs per cherry-pick step (resolve + build + commit, locally only); RelEasy pushes the branch and opens the combined PR after all steps succeed and tags the PR with `ai_resolve.label` if any step needed AI.
+- `pr_sources.include_prs`: always include these PRs by URL, regardless of labels. URLs may point to any public GitHub repo — cross-repo PRs are fetched directly from the URL (no extra git remote is added). Their port branches are named `feature/<base>/<owner>-<repo>-pr-<N>` so they cannot collide with same-numbered origin PRs.
+- `pr_sources.exclude_prs`: always exclude these PRs by URL — final override. Matched by the full `(owner, repo, number)` triple.
+- `pr_sources.auto_pr`: global switch (default `true`). When `true` and `push: true`, every pushed port branch — singleton, by_labels, include_prs, or group — gets a PR opened against the base. Set `false` to push branches only and open PRs manually.
+- `pr_sources.groups`: each group is one *unit of work* — its PRs are cherry-picked, in listed order, onto a single port branch named `feature/<base>/<id>`, and (when `pr_sources.auto_pr` and `push`) result in ONE combined PR. A PR may appear in at most one group; PRs claimed by a group are removed from the standalone stream. `exclude_prs` and `exclude_labels` still drop individual PRs from a group; an emptied group is skipped with a warning. AI conflict resolution runs per cherry-pick step (resolve + build + commit, locally only); RelEasy pushes the branch and opens the combined PR after all steps succeed and tags the PR with `ai_resolve.label` if any step needed AI.
 - PRs are processed in merge order (earliest merged first); groups sort by their earliest constituent merge time.
 - `enabled: false` excludes a feature from the pipeline entirely.
 - `depends_on` declares inter-feature dependencies (manual ordering in v1).
@@ -136,12 +137,15 @@ notifications:
 ### Invocation
 
 ```
-releasy run [--onto <upstream-tag-or-sha>]
+releasy run [--onto <version-label>]
 ```
 
-`--onto` is optional when `target_branch` is set in config. The base branch
-must already exist on origin; the pipeline verifies this and then ports each
-PR / feature onto it. State is saved after each port so the run is resumable.
+`--onto` is optional when `target_branch` is set in config; otherwise it
+supplies the version suffix used to derive the base branch name (see
+§3 Branch Naming Convention). The value is a label only — it is never
+resolved as a git ref. The base branch itself must already exist on
+origin; the pipeline verifies this and then ports each PR / feature onto
+it. State is saved after each port so the run is resumable.
 
 ---
 
@@ -161,10 +165,10 @@ A *feature unit* is either a single PR or a sequential PR group. For each unit (
 
 1. Create feature branch `feature/<project>-<version>/<id>` from base. The id is `pr-<N>` for singletons or the group `id` for groups.
 2. Cherry-pick each PR's merge commit (`-m 1`) in listed order.
-3. On a clean run: push and (if `push` + `auto_pr`) open ONE PR. Group PRs include a body listing every constituent PR.
-4. On conflict (singleton or any step inside a group): try AI resolve in *step mode* — Claude resolves the conflict, builds, and commits locally; RelEasy then continues with the next cherry-pick (or finalises the unit). On AI failure: halt for manual resolution (or commit WIP markers + push if `wip_commit_on_conflict: true`).
+3. On a clean run: push and (if `push` + `pr_sources.auto_pr`) open ONE PR. Group PRs include a body listing every constituent PR.
+4. On conflict (singleton or any step inside a group): try AI resolve in *step mode* — Claude resolves the conflict, builds, and commits locally; RelEasy then continues with the next cherry-pick (or finalises the unit). On AI failure (resolver disabled, or it gave up after `max_iterations` build attempts): clean up and flag the unit. Singleton / first-of-group: abort the cherry-pick, drop the local port branch, no push, no PR — entry marked `Conflict` in the GitHub Project. Partial group (later step failed, n-1 prior picks valid): abort the failed pick only, push the branch, open a DRAFT PR labelled `ai-needs-attention` with a banner explaining what failed; remaining PRs in the group are skipped, entry marked `Conflict`. Either way the pipeline keeps moving with the next unit.
 5. Each cherry-pick produces ONE commit (`git cherry-pick -m 1 --no-edit`; AI build-fix iterations only `--amend` that same commit). For groups, RelEasy appends a `Source-PR: #<N> (<url>)` trailer to each commit so the combined PR's commit list is self-attributing.
-6. After all PRs in a unit are applied (clean or AI-resolved), push the branch and (when `auto_pr` + `push`) open ONE PR. If any step used AI, the PR title gets the `ai-resolved:` prefix and the PR is tagged with `ai_resolve.label`.
+6. After all PRs in a unit are applied (clean or AI-resolved), push the branch and (when `pr_sources.auto_pr` + `push`) open ONE PR. If any step used AI, the PR title gets the `ai-resolved:` prefix and the PR is tagged with `ai_resolve.label`.
 
 After all units: `phase = ports_done`.
 
@@ -186,13 +190,41 @@ Marks a branch as skipped (excluded from releases unless `--include-skipped`).
 
 ---
 
-## 8. Safety: Upstream PR Protection
+## 8. PR title format & identification
 
-When an upstream is configured, `create_pull_request` has a **hard safeguard**: before creating any PR, it compares the origin repo slug against the upstream remote. If they match, it raises a `ValueError` and refuses. When no upstream is configured, this check is skipped (origin is the only repo).
+Rebase PR titles are `"<Project> <version>: <subject>"` (e.g.
+`"Antalya 26.3: Token Authentication and Authorization"`). The version is
+extracted from the base branch (`<project>-<version>`; falls back to the
+whole branch name for custom `target_branch` values). The project name
+is title-cased when it's all lowercase, otherwise preserved verbatim.
+
+The source PR's title is first run through a sanitiser that strips a
+leading `<version>[<project>]:` prefix some workflows embed (e.g.
+`"26.1 Antalya: …"`), so the rebase PR title accurately reflects its real
+target rather than the source's original target.
+
+Identification is done via labels, not text in the title:
+
+- Every PR opened or updated by RelEasy is tagged with the `releasy`
+  label (auto-created with colour `#1F6FEB` on first run when
+  `push: true`).
+- AI-resolved PRs additionally get `ai_resolve.label` (default
+  `ai-resolved`).
 
 ---
 
-## 9. State (`state.yaml`)
+## 9. Safety: writes always target origin
+
+RelEasy operates as a **read-from-anywhere, write-only-to-origin** tool:
+
+- **Reads** from any public GitHub repo are allowed when a cross-repo PR URL is supplied via `pr_sources.include_prs` / `pr_sources.groups[].prs`. These are fetched directly by URL — the source repo is never added as a git remote.
+- **Writes** (PR creation, PR title/body edits, label add, branch push) only ever target the configured `origin`. The slug is re-derived on every write call and passed through `_assert_writes_target_origin`, which raises `ValueError` if the resolved target ever differs from origin. The branch-push helper `force_push(repo_path, branch, config)` takes the `Config` itself and pushes to `config.origin.remote_name` — there is no parameter to point it at a different remote.
+
+Each `releasy run` prints `PRs will be opened against <owner>/<repo> (origin)` immediately after resolving the base branch, so the write target is visible in the run log.
+
+---
+
+## 10. State (`state.yaml`)
 
 Auto-updated after every operation.
 
@@ -204,7 +236,7 @@ last_run:
   base_branch: antalya-26.3
   features:
     pr-42:
-      status: ok
+      status: needs_review
       branch_name: feature/antalya-26.3/pr-42
       base_commit: v26.3.4.234-lts
       pr_url: https://github.com/Altinity/ClickHouse/pull/42
@@ -221,24 +253,24 @@ last_run:
 
 ---
 
-## 10. Status Table (`STATUS.md`)
+## 11. Status Table (`STATUS.md`)
 
 Updated after every state change.
 
 ```markdown
 ## RelEasy Branch Status
 
-Last run: 2026-03-21 · Upstream commit: `v26.3.4.234-lts` · Phase: ports_done
+Last run: 2026-03-21 · Onto: `v26.3.4.234-lts` · Phase: ports_done
 
 | Branch | Status | Based On | PR | Conflict Files |
 |--------|--------|----------|----|----------------|
-| feature/antalya-26.3/pr-42 | ✅ ok | `v26.3.4.234-` | #42 | |
+| feature/antalya-26.3/pr-42 | 🔵 needs-review | `v26.3.4.234-` | #42 | |
 | feature/antalya-26.3/s3-disk | 🔴 conflict | `v26.3.4.234-` | | `src/Storages/StorageS3.cpp` |
 ```
 
 ---
 
-## 11. CLI Reference
+## 12. CLI Reference
 
 ```
 # Pipeline
@@ -249,7 +281,7 @@ releasy abort
 releasy status
 
 # Release
-releasy release --upstream-tag <tag> --name <branch-name> [--strict] [--include-skipped]
+releasy release --base-tag <tag> --name <branch-name> [--strict] [--include-skipped]
 
 # Feature management
 releasy feature add --id <id> --source-branch <branch> --description <desc>
@@ -261,14 +293,14 @@ releasy feature list
 
 ---
 
-## 12. GitHub Project Integration
+## 13. GitHub Project Integration
 
 Sync branch status to a GitHub Projects v2 board (optional). One-time manual setup, then RelEasy keeps it updated automatically.
 
 ### Manual Setup
 
 1. **Create the project:** GitHub org → Projects → New project (Table layout recommended).
-2. **Configure the Status field:** Edit the default "Status" single-select field. Set options to exactly: `Ok`, `Conflict`, `Resolved`, `Skipped`, `Disabled`, `Pending` (case-insensitive match).
+2. **Configure the Status field:** Edit the default "Status" single-select field. Set options to exactly: `Needs Review`, `Branch Created`, `Conflict`, `Skipped` (case-insensitive match).
 3. **Get the URL:** e.g. `https://github.com/orgs/Altinity/projects/1` (org) or `https://github.com/users/<name>/projects/1` (personal).
 4. **Token:** `RELEASY_GITHUB_TOKEN` needs `repo` + `project` scopes (classic PAT) or "Projects" read/write (fine-grained PAT).
 5. **Config:**
@@ -291,18 +323,17 @@ Creates the project (if needed) and adds the Status field with the correct optio
 When `push: true` and `notifications.github_project` is set, after each state change RelEasy:
 - Creates a **view (tab)** per rebase, named after the base branch (e.g. `antalya-26.3`). One project holds all rebases; each gets its own tab.
 - Creates one draft-issue card per port branch.
-- Sets the Status field to the pipeline state (Ok, Conflict, etc.).
-- Updates the card body with upstream commit and conflicted files.
+- Sets the Status field to the pipeline state (Needs Review, Conflict, etc.).
+- Updates the card body with the base commit and conflicted files.
 - On re-runs, deletes old cards and recreates with updated status.
 
 No cards or views need to be created manually. Project sync is skipped when `push: false`.
 
 ---
 
-## 13. Non-Goals (v1)
+## 14. Non-Goals (v1)
 
-- No automatic upstream commit discovery (`--onto` is always explicit).
+- No automatic base-ref discovery (`--onto` is always explicit).
 - No AI-assisted conflict resolution.
-- No support for multiple forks.
 - No automatic dependency-aware ordering (`depends_on` declared but ordering is manual).
 - No build/test validation after rebase.

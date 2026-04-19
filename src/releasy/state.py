@@ -9,13 +9,50 @@ from typing import Literal
 
 import yaml
 
-BranchStatus = Literal["pending", "ok", "conflict", "resolved", "skipped", "disabled"]
+BranchStatus = Literal[
+    "needs_review",
+    "branch_created",
+    "conflict",
+    "skipped",
+]
 PipelinePhase = Literal["init", "ports_done"]
+
+
+# Order in which status groups are shown to humans (STATUS.md sections,
+# `releasy status` sub-tables). Highest-attention first.
+STATUS_DISPLAY_ORDER: tuple[str, ...] = (
+    "conflict",
+    "branch_created",
+    "needs_review",
+    "skipped",
+)
+
+
+# Legacy values older state files (or older code paths) may carry.
+#   ok / resolved / pending / disabled  → ``needs_review``
+#                                         (catch-all "port done, human
+#                                         needs to review the PR" state;
+#                                         ``ai_resolved`` carries the
+#                                         AI-was-involved signal).
+#   needs_resolution                    → ``conflict``
+#                                         (used to be a separate "AI
+#                                         gave up" state; it's just an
+#                                         unresolved conflict — the
+#                                         ``failed_step_index`` /
+#                                         ``partial_pr_count`` fields
+#                                         still describe how it failed).
+_LEGACY_STATUS_ALIASES = {
+    "ok": "needs_review",
+    "resolved": "needs_review",
+    "pending": "needs_review",
+    "disabled": "needs_review",
+    "needs_resolution": "conflict",
+}
 
 
 @dataclass
 class FeatureState:
-    status: BranchStatus = "pending"
+    status: BranchStatus = "needs_review"
     branch_name: str | None = None
     base_commit: str | None = None
     conflict_files: list[str] = field(default_factory=list)
@@ -32,6 +69,10 @@ class FeatureState:
     rebase_pr_url: str | None = None  # auto-created PR targeting base branch
     ai_resolved: bool = False
     ai_iterations: int | None = None
+    # For partially-applied groups: 0-based index of the cherry-pick step that
+    # failed conflict resolution, and how many earlier picks were committed.
+    failed_step_index: int | None = None
+    partial_pr_count: int | None = None
 
 
 @dataclass
@@ -48,7 +89,7 @@ class PipelineState:
 
     def all_features_ok(self) -> bool:
         return all(
-            fs.status in ("ok", "disabled")
+            fs.status == "needs_review"
             for fs in self.features.values()
         )
 
@@ -72,8 +113,10 @@ def load_state(repo_dir: Path | None = None) -> PipelineState:
 
     features: dict[str, FeatureState] = {}
     for fid, fraw in run.get("features", {}).items():
+        raw_status = fraw.get("status", "needs_review")
+        status = _LEGACY_STATUS_ALIASES.get(raw_status, raw_status)
         features[fid] = FeatureState(
-            status=fraw.get("status", "pending"),
+            status=status,
             branch_name=fraw.get("branch_name"),
             base_commit=fraw.get("base_commit"),
             conflict_files=fraw.get("conflict_files", []),
@@ -86,6 +129,8 @@ def load_state(repo_dir: Path | None = None) -> PipelineState:
             rebase_pr_url=fraw.get("rebase_pr_url"),
             ai_resolved=fraw.get("ai_resolved", False),
             ai_iterations=fraw.get("ai_iterations"),
+            failed_step_index=fraw.get("failed_step_index"),
+            partial_pr_count=fraw.get("partial_pr_count"),
         )
 
     phase = run.get("phase", "init")
@@ -134,6 +179,10 @@ def save_state(state: PipelineState, repo_dir: Path | None = None) -> None:
             entry["ai_resolved"] = True
         if fs.ai_iterations is not None:
             entry["ai_iterations"] = fs.ai_iterations
+        if fs.failed_step_index is not None:
+            entry["failed_step_index"] = fs.failed_step_index
+        if fs.partial_pr_count is not None:
+            entry["partial_pr_count"] = fs.partial_pr_count
         features_data[fid] = entry
 
     data = {

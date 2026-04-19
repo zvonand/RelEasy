@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "releasy"
 version = "0.1.0"
-description = "CLI tool for managing fork rebases, feature branches, and release construction"
+description = "CLI tool for managing port branches, feature branches, and release construction"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"

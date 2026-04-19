@@ -9,9 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import requests
+from rich.console import Console
 
 from releasy.config import Config, get_github_token
-from releasy.state import PipelineState
+from releasy.state import FeatureState, PipelineState
+
+console = Console()
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +47,44 @@ def get_origin_repo_slug(config: Config) -> str | None:
     if not parsed:
         return None
     return f"{parsed[0]}/{parsed[1]}"
+
+
+def require_origin_repo_slug(config: Config) -> str:
+    """Return the origin slug or raise — used by every write path.
+
+    RelEasy *only* writes (create/update/label PRs, push branches) to the
+    repo configured as ``origin``. If the origin URL can't be parsed, no
+    write should be attempted at all — this is the single chokepoint that
+    makes that guarantee enforceable.
+    """
+    slug = get_origin_repo_slug(config)
+    if not slug:
+        raise ValueError(
+            f"Cannot determine origin repo slug from remote "
+            f"{config.origin.remote!r}. Refusing to perform any write "
+            "operation (PR create/update/label, push) without a valid origin."
+        )
+    return slug
+
+
+def _assert_writes_target_origin(
+    config: Config, target_slug: str, action: str,
+) -> None:
+    """Defense-in-depth: refuse to write to anything other than origin.
+
+    All write paths derive their target slug from origin in the first
+    place, so this check is tautological in correct code. It's here to
+    catch refactor mistakes loudly instead of silently mutating an
+    unintended GitHub repo.
+    """
+    origin_slug = require_origin_repo_slug(config)
+    if target_slug != origin_slug:
+        raise ValueError(
+            f"CRITICAL: refusing to {action} on {target_slug!r}: "
+            f"RelEasy only writes to the configured origin "
+            f"({origin_slug!r}). This should never happen — please "
+            "report it as a bug."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -84,63 +125,70 @@ def commit_and_push_state(message: str, repo_dir: Path | None = None) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _assert_not_upstream(config: Config, slug: str) -> None:
-    """Hard safeguard: refuse to operate against the upstream repo."""
-    if not config.upstream:
-        return
-    upstream_parsed = parse_remote_url(config.upstream.remote)
-    if upstream_parsed:
-        upstream_slug = f"{upstream_parsed[0]}/{upstream_parsed[1]}"
-        if slug == upstream_slug:
-            raise ValueError(
-                f"CRITICAL: Refusing to create PR against upstream repo '{slug}'. "
-                "PRs must only target the origin."
-            )
-
-
 def create_pull_request(
     config: Config,
     head: str,
     base: str,
     title: str,
     body: str,
+    *,
+    draft: bool = False,
+    labels: list[str] | None = None,
 ) -> str | None:
-    """Create a pull request on the origin repo.
+    """Create a pull request **on the origin repo**.
+
+    By construction this function only ever creates PRs in the configured
+    ``origin``. The slug is derived from origin on every call and
+    re-validated via ``_assert_writes_target_origin`` before any GitHub
+    write — there is deliberately no parameter for naming a different repo.
 
     Args:
         config: Config with origin remote URL.
-        head: Source branch name.
-        base: Target branch name.
+        head: Source branch name (in origin).
+        base: Target branch name (in origin).
         title: PR title.
         body: PR body (markdown).
+        draft: When True, open the PR in draft state.
+        labels: Optional labels to attach right after creation. Labels that
+            don't already exist on the repo are not auto-created here — call
+            ``ensure_label`` first if you need that.
 
     Returns the PR URL, or None if creation failed.
-    Raises ValueError if the target repo matches upstream.
     """
     token = get_github_token()
     if not token:
         log.warning("RELEASY_GITHUB_TOKEN not set — cannot create PR")
         return None
 
-    slug = get_origin_repo_slug(config)
-    if not slug:
-        log.warning("Could not parse origin remote URL: %s", config.origin.remote)
+    try:
+        slug = require_origin_repo_slug(config)
+    except ValueError as exc:
+        log.warning("%s", exc)
         return None
-
-    _assert_not_upstream(config, slug)
+    _assert_writes_target_origin(config, slug, "create PR")
 
     try:
         from github import Github, GithubException
 
         gh = Github(token)
         repo = gh.get_repo(slug)
-        pr = repo.create_pull(title=title, body=body, head=head, base=base)
+        pr = repo.create_pull(
+            title=title, body=body, head=head, base=base, draft=draft,
+        )
+        if labels:
+            try:
+                pr.add_to_labels(*labels)
+            except GithubException as exc:
+                log.warning(
+                    "Created PR %s but failed to add labels %s: %s",
+                    pr.html_url, labels, exc,
+                )
         return pr.html_url
     except GithubException as exc:
-        log.warning("Failed to create PR: %s", exc)
+        log.warning("Failed to create PR on %s: %s", slug, exc)
         return None
     except Exception as exc:
-        log.warning("Unexpected error creating PR: %s", exc)
+        log.warning("Unexpected error creating PR on %s: %s", slug, exc)
         return None
 
 
@@ -150,22 +198,23 @@ def update_pull_request(
     title: str | None = None,
     body: str | None = None,
 ) -> bool:
-    """Edit the title and/or body of an existing PR on the origin repo.
+    """Edit the title and/or body of an existing PR **on the origin repo**.
 
     Returns True on success, False on failure. A ``None`` argument means
-    "leave that field alone".
+    "leave that field alone". Like ``create_pull_request``, this only ever
+    targets the configured origin — no parameter to point elsewhere.
     """
     token = get_github_token()
     if not token:
         log.warning("RELEASY_GITHUB_TOKEN not set — cannot update PR")
         return False
 
-    slug = get_origin_repo_slug(config)
-    if not slug:
-        log.warning("Could not parse origin remote URL: %s", config.origin.remote)
+    try:
+        slug = require_origin_repo_slug(config)
+    except ValueError as exc:
+        log.warning("%s", exc)
         return False
-
-    _assert_not_upstream(config, slug)
+    _assert_writes_target_origin(config, slug, f"update PR #{pr_number}")
 
     kwargs: dict = {}
     if title is not None:
@@ -184,10 +233,10 @@ def update_pull_request(
         pr.edit(**kwargs)
         return True
     except GithubException as exc:
-        log.warning("Failed to update PR #%d: %s", pr_number, exc)
+        log.warning("Failed to update PR %s#%d: %s", slug, pr_number, exc)
         return False
     except Exception as exc:
-        log.warning("Unexpected error updating PR #%d: %s", pr_number, exc)
+        log.warning("Unexpected error updating PR %s#%d: %s", slug, pr_number, exc)
         return False
 
 
@@ -205,6 +254,7 @@ class PRInfo:
     merge_commit_sha: str | None
     head_sha: str
     url: str
+    repo_slug: str  # "owner/repo" — may differ from origin for include_prs / groups
     merged_at: str | None = None  # ISO timestamp of merge
     labels: list[str] = None  # type: ignore[assignment]
     author: str | None = None  # GitHub login of the PR author
@@ -212,6 +262,11 @@ class PRInfo:
     def __post_init__(self) -> None:
         if self.labels is None:
             self.labels = []
+
+    def ref(self) -> tuple[str, str, int]:
+        """``(owner, repo, number)`` — the canonical cross-repo identity."""
+        owner, repo = self.repo_slug.split("/", 1)
+        return owner, repo, self.number
 
 
 def _pr_author(pr) -> str | None:  # noqa: ANN001 — PyGithub PullRequest
@@ -225,30 +280,47 @@ def _pr_author(pr) -> str | None:  # noqa: ANN001 — PyGithub PullRequest
     return None
 
 
-def parse_pr_url(url: str) -> int | None:
-    """Extract the PR number from a GitHub PR URL.
+def parse_pr_url(url: str) -> tuple[str, str, int] | None:
+    """Extract ``(owner, repo, number)`` from a GitHub PR URL.
 
-    Accepts URLs like https://github.com/owner/repo/pull/123
+    Accepts URLs like https://github.com/owner/repo/pull/123 (with an
+    optional trailing ``.git`` on the repo segment).
     """
-    m = re.match(r"https://github\.com/[^/]+/[^/]+/pull/(\d+)", url)
-    return int(m.group(1)) if m else None
+    m = re.match(
+        r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/pull/(\d+)\b", url,
+    )
+    if not m:
+        return None
+    return m.group(1), m.group(2), int(m.group(3))
+
+
+def slug_to_https_url(slug: str) -> str:
+    """Build the canonical HTTPS git URL for a ``owner/repo`` slug."""
+    return f"https://github.com/{slug}.git"
 
 
 def fetch_pr_by_number(
     config: Config,
     number: int,
     merged_only: bool = False,
+    slug: str | None = None,
 ) -> PRInfo | None:
-    """Fetch a single PR by number from the origin repo."""
+    """Fetch a single PR by number.
+
+    By default fetches from the origin repo. Pass ``slug`` (``"owner/repo"``)
+    to fetch a PR from any other public GitHub repo — used for cross-repo
+    PR references in ``pr_sources.include_prs`` and ``pr_sources.groups[].prs``.
+    """
     token = get_github_token()
     if not token:
         log.warning("RELEASY_GITHUB_TOKEN not set — cannot fetch PR")
         return None
 
-    slug = get_origin_repo_slug(config)
-    if not slug:
-        log.warning("Could not parse origin remote URL: %s", config.origin.remote)
-        return None
+    if slug is None:
+        slug = get_origin_repo_slug(config)
+        if not slug:
+            log.warning("Could not parse origin remote URL: %s", config.origin.remote)
+            return None
 
     try:
         from github import Github, GithubException
@@ -274,16 +346,38 @@ def fetch_pr_by_number(
             merge_commit_sha=pr.merge_commit_sha if pr.merged else None,
             head_sha=pr.head.sha,
             url=pr.html_url,
+            repo_slug=slug,
             merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
             labels=[lbl.name for lbl in pr.labels],
             author=_pr_author(pr),
         )
     except GithubException as exc:
-        log.warning("Failed to fetch PR #%d: %s", number, exc)
+        log.warning("Failed to fetch PR %s#%d: %s", slug, number, exc)
         return None
     except Exception as exc:
-        log.warning("Unexpected error fetching PR #%d: %s", number, exc)
+        log.warning("Unexpected error fetching PR %s#%d: %s", slug, number, exc)
         return None
+
+
+def fetch_pr_by_url(
+    config: Config, url: str, merged_only: bool = False,
+) -> PRInfo | None:
+    """Fetch a PR identified by its full GitHub URL (any public repo)."""
+    parsed = parse_pr_url(url)
+    if parsed is None:
+        log.warning("Could not parse PR URL: %s", url)
+        return None
+    owner, repo, number = parsed
+    return fetch_pr_by_number(
+        config, number, merged_only=merged_only, slug=f"{owner}/{repo}",
+    )
+
+
+def pr_ref_label(pr_slug: str, number: int, origin_slug: str | None) -> str:
+    """Format a PR reference as ``#N`` for origin and ``owner/repo#N`` otherwise."""
+    if origin_slug and pr_slug == origin_slug:
+        return f"#{number}"
+    return f"{pr_slug}#{number}"
 
 
 def search_prs_by_labels(
@@ -340,6 +434,7 @@ def search_prs_by_labels(
                 merge_commit_sha=pr.merge_commit_sha if pr.merged else None,
                 head_sha=pr.head.sha,
                 url=pr.html_url,
+                repo_slug=slug,
                 merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
                 labels=[lbl.name for lbl in pr.labels],
                 author=_pr_author(pr),
@@ -367,7 +462,7 @@ def ensure_label(
     color: str = "8B5CF6",
     description: str = "",
 ) -> bool:
-    """Ensure a label exists on the origin repo. Idempotent.
+    """Ensure a label exists **on the origin repo**. Idempotent.
 
     Returns True if the label exists (pre-existing or freshly created).
     """
@@ -376,9 +471,12 @@ def ensure_label(
         log.warning("RELEASY_GITHUB_TOKEN not set \u2014 cannot ensure label %s", name)
         return False
 
-    slug = get_origin_repo_slug(config)
-    if not slug:
+    try:
+        slug = require_origin_repo_slug(config)
+    except ValueError as exc:
+        log.warning("%s", exc)
         return False
+    _assert_writes_target_origin(config, slug, f"ensure label {name!r}")
 
     try:
         from github import Github, GithubException
@@ -407,15 +505,18 @@ def ensure_label(
 
 
 def add_label_to_pr(config: Config, pr_number: int, label: str) -> bool:
-    """Attach a label to a pull request. Idempotent on repeated calls."""
+    """Attach a label to a PR **on the origin repo**. Idempotent on repeated calls."""
     token = get_github_token()
     if not token:
         log.warning("RELEASY_GITHUB_TOKEN not set \u2014 cannot label PR #%d", pr_number)
         return False
 
-    slug = get_origin_repo_slug(config)
-    if not slug:
+    try:
+        slug = require_origin_repo_slug(config)
+    except ValueError as exc:
+        log.warning("%s", exc)
         return False
+    _assert_writes_target_origin(config, slug, f"label PR #{pr_number}")
 
     try:
         from github import Github, GithubException
@@ -426,10 +527,14 @@ def add_label_to_pr(config: Config, pr_number: int, label: str) -> bool:
         issue.add_to_labels(label)
         return True
     except GithubException as exc:
-        log.warning("Failed to label PR #%d with %s: %s", pr_number, label, exc)
+        log.warning(
+            "Failed to label PR %s#%d with %s: %s", slug, pr_number, label, exc,
+        )
         return False
     except Exception as exc:
-        log.warning("Unexpected error labelling PR #%d: %s", pr_number, exc)
+        log.warning(
+            "Unexpected error labelling PR %s#%d: %s", slug, pr_number, exc,
+        )
         return False
 
 
@@ -464,6 +569,7 @@ def find_pr_for_branch(
                 merge_commit_sha=pr.merge_commit_sha if pr.merged else None,
                 head_sha=pr.head.sha,
                 url=pr.html_url,
+                repo_slug=slug,
                 merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
                 labels=[lbl.name for lbl in pr.labels],
                 author=_pr_author(pr),
@@ -483,7 +589,13 @@ def find_pr_for_branch(
 
 
 def _gql(query: str, variables: dict | None = None) -> dict | None:
-    """Execute a GitHub GraphQL query."""
+    """Execute a GitHub GraphQL query.
+
+    Returns the ``data`` block on success, ``None`` on transport failure or
+    when the response carried any GraphQL errors. Returning ``None`` in the
+    error case prevents callers from silently treating partial / invalid
+    payloads as successes (e.g. a mutation that the API rejected).
+    """
     token = get_github_token()
     if not token:
         return None
@@ -504,6 +616,7 @@ def _gql(query: str, variables: dict | None = None) -> dict | None:
     data = resp.json()
     if "errors" in data:
         log.warning("GitHub GraphQL errors: %s", data["errors"])
+        return None
     return data.get("data")
 
 
@@ -583,20 +696,26 @@ def _get_status_field(project_id: str) -> tuple[str, dict[str, str], list[dict]]
     return None
 
 
-def _find_item_by_title(project_id: str, title: str) -> tuple[str, str | None] | None:
-    """Find a project item by its draft issue title.
+def _list_project_items(project_id: str) -> list[dict]:
+    """Return every item in a project (paginated).
 
-    Returns (item_id, draft_issue_id) or None.
+    Each entry is the raw item node ``{id, content: {...}}``. ``content``
+    can be a ``DraftIssue``, ``Issue``, or ``PullRequest`` — callers
+    distinguish by the ``__typename`` field.
     """
     query = """
-    query($projectId: ID!) {
+    query($projectId: ID!, $cursor: String) {
       node(id: $projectId) {
         ... on ProjectV2 {
-          items(first: 100) {
+          items(first: 100, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
             nodes {
               id
               content {
+                __typename
                 ... on DraftIssue { id title }
+                ... on Issue { id number url }
+                ... on PullRequest { id number url }
               }
             }
           }
@@ -604,18 +723,49 @@ def _find_item_by_title(project_id: str, title: str) -> tuple[str, str | None] |
       }
     }
     """
-    data = _gql(query, {"projectId": project_id})
-    if not data:
-        return None
-    try:
-        items = data["node"]["items"]["nodes"]
-    except (KeyError, TypeError):
-        return None
+    items: list[dict] = []
+    cursor: str | None = None
+    while True:
+        data = _gql(query, {"projectId": project_id, "cursor": cursor})
+        if not data:
+            return items
+        try:
+            page = data["node"]["items"]
+        except (KeyError, TypeError):
+            return items
+        items.extend(page.get("nodes") or [])
+        info = page.get("pageInfo") or {}
+        if not info.get("hasNextPage"):
+            return items
+        cursor = info.get("endCursor")
+        if not cursor:
+            return items
 
+
+def _find_draft_item_by_title(
+    items: list[dict], title: str,
+) -> tuple[str, str] | None:
+    """Find a draft-issue item by title in a pre-fetched item list.
+
+    Returns ``(item_id, draft_issue_id)`` or ``None``.
+    """
     for item in items:
-        content = item.get("content")
-        if content and content.get("title") == title:
-            return item["id"], content.get("id")
+        content = item.get("content") or {}
+        if content.get("__typename") != "DraftIssue":
+            continue
+        if content.get("title") == title:
+            return item["id"], content["id"]
+    return None
+
+
+def _find_item_by_pr_url(items: list[dict], pr_url: str) -> str | None:
+    """Find a PR-content item by URL in a pre-fetched item list."""
+    for item in items:
+        content = item.get("content") or {}
+        if content.get("__typename") != "PullRequest":
+            continue
+        if content.get("url") == pr_url:
+            return item["id"]
     return None
 
 
@@ -636,22 +786,69 @@ def _add_draft_issue(project_id: str, title: str, body: str) -> str | None:
         return None
 
 
-def _update_draft_issue(
-    project_id: str, item_id: str,
-    title: str | None = None, body: str | None = None,
-) -> bool:
-    """Update an existing draft issue's title and/or body."""
+def _get_pr_node_id(slug: str, number: int) -> str | None:
+    """Return the GraphQL node id of a PR. Required to add it to a project."""
+    owner, name = slug.split("/", 1)
+    query = """
+    query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) { id }
+      }
+    }
+    """
+    data = _gql(query, {"owner": owner, "name": name, "number": number})
+    if not data:
+        return None
+    try:
+        return data["repository"]["pullRequest"]["id"]
+    except (KeyError, TypeError):
+        return None
+
+
+def _add_item_by_content_id(project_id: str, content_id: str) -> str | None:
+    """Add an Issue or PullRequest to a project by its node id.
+
+    Idempotent: GitHub returns the existing project-item id if the content
+    was already added to this project.
+    """
     mutation = """
-    mutation($projectId: ID!, $itemId: ID!, $title: String, $body: String) {
+    mutation($projectId: ID!, $contentId: ID!) {
+      addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+        item { id }
+      }
+    }
+    """
+    data = _gql(mutation, {"projectId": project_id, "contentId": content_id})
+    if not data:
+        return None
+    try:
+        return data["addProjectV2ItemById"]["item"]["id"]
+    except (KeyError, TypeError):
+        return None
+
+
+def _update_draft_issue(
+    draft_issue_id: str,
+    title: str | None = None,
+    body: str | None = None,
+) -> bool:
+    """Update an existing draft issue's title and/or body.
+
+    Note: the ``UpdateProjectV2DraftIssueInput`` type takes ``draftIssueId``
+    only — there is no ``projectId`` field on it. Passing one makes the
+    GraphQL endpoint reject the whole mutation.
+    """
+    mutation = """
+    mutation($draftIssueId: ID!, $title: String, $body: String) {
       updateProjectV2DraftIssue(input: {
-        projectId: $projectId, draftIssueId: $itemId,
+        draftIssueId: $draftIssueId,
         title: $title, body: $body
       }) {
         draftIssue { id }
       }
     }
     """
-    variables: dict = {"projectId": project_id, "itemId": item_id}
+    variables: dict = {"draftIssueId": draft_issue_id}
     if title is not None:
         variables["title"] = title
     if body is not None:
@@ -694,15 +891,18 @@ def _delete_item(project_id: str, item_id: str) -> bool:
     return data is not None
 
 
-STATUS_OPTIONS = ["Ok", "Conflict", "Resolved", "Skipped", "Disabled", "Pending"]
+STATUS_OPTIONS = [
+    "Needs Review",
+    "Branch Created",
+    "Conflict",
+    "Skipped",
+]
 
 STATUS_COLORS = {
-    "Ok": "GREEN",
+    "Needs Review": "BLUE",
+    "Branch Created": "YELLOW",
     "Conflict": "RED",
-    "Resolved": "BLUE",
     "Skipped": "YELLOW",
-    "Disabled": "GRAY",
-    "Pending": "ORANGE",
 }
 
 
@@ -771,8 +971,14 @@ def _create_single_select_field(
 
 def _update_single_select_options(
     field_id: str, options: list[dict],
-) -> bool:
-    """Replace all options on an existing single-select field."""
+) -> tuple[bool, str | None]:
+    """Replace all options on an existing single-select field.
+
+    Returns ``(success, error_message_or_None)`` so the caller can
+    surface the GitHub-side reason for a failure (commonly: missing
+    ``project`` token scope, or per-API-version constraints on which
+    fields ``updateProjectV2Field`` permits editing).
+    """
     mutation = """
     mutation($fieldId: ID!, $options: [ProjectV2SingleSelectFieldOptionInput!]!) {
       updateProjectV2Field(input: {
@@ -783,8 +989,36 @@ def _update_single_select_options(
       }
     }
     """
-    data = _gql(mutation, {"fieldId": field_id, "options": options})
-    return data is not None
+    token = get_github_token()
+    if not token:
+        return False, "RELEASY_GITHUB_TOKEN not set"
+    try:
+        resp = requests.post(
+            GRAPHQL_URL,
+            json={
+                "query": mutation,
+                "variables": {"fieldId": field_id, "options": options},
+            },
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        return False, f"network error: {exc}"
+    if resp.status_code != 200:
+        snippet = resp.text[:300]
+        return False, f"HTTP {resp.status_code}: {snippet}"
+    payload = resp.json()
+    if "errors" in payload:
+        msgs = "; ".join(
+            e.get("message", "?") for e in payload["errors"]
+        )
+        return False, f"GraphQL errors: {msgs}"
+    if not payload.get("data", {}).get("updateProjectV2Field"):
+        return False, f"unexpected response shape: {payload}"
+    return True, None
 
 
 def setup_project(config: Config) -> str | None:
@@ -839,34 +1073,72 @@ def setup_project(config: Config) -> str | None:
     status_info = _get_status_field(project_id)
     if status_info:
         field_id, existing_options, raw_options = status_info
+        canonical_lower = {opt.lower() for opt in STATUS_OPTIONS}
+        existing_names = [o["name"] for o in raw_options]
         missing = [
             opt for opt in STATUS_OPTIONS
             if opt.lower() not in existing_options
         ]
-        if missing:
-            merged = [
+        extra = [
+            o["name"] for o in raw_options
+            if o["name"].lower() not in canonical_lower
+        ]
+        console.print(
+            "  [dim]Status field options found:[/dim] "
+            f"{', '.join(existing_names) or '(none)'}"
+        )
+        console.print(
+            f"  [dim]Canonical:[/dim] {', '.join(STATUS_OPTIONS)}"
+        )
+        if missing or extra:
+            console.print(
+                f"  [yellow]→[/yellow] reconciling: "
+                f"add={missing or '—'}, remove={extra or '—'}"
+            )
+            # Replace, don't merge: the Status field is fully owned by
+            # RelEasy. Orphan options (e.g. legacy ``Ok`` / ``Resolved``
+            # from older RelEasy versions, or anything else hand-added to
+            # the field) get dropped. Items that were sitting on a
+            # dropped option lose their Status value momentarily — the
+            # next ``sync_project`` call re-assigns them based on
+            # ``fs.status``, which the load-time migration has already
+            # collapsed to the new vocabulary.
+            canonical = [
                 {
-                    "name": o["name"],
-                    "color": o.get("color", "GRAY"),
-                    "description": o.get("description") or "",
-                }
-                for o in raw_options
-            ]
-            for opt in missing:
-                merged.append({
                     "name": opt,
                     "color": STATUS_COLORS.get(opt, "GRAY"),
                     "description": "",
-                })
-            if _update_single_select_options(field_id, merged):
-                log.info("Added missing Status options: %s", ", ".join(missing))
-            else:
-                log.warning(
-                    "Failed to add missing Status options: %s. "
-                    "Add them manually in the project settings.",
-                    ", ".join(missing),
+                }
+                for opt in STATUS_OPTIONS
+            ]
+            ok, err = _update_single_select_options(field_id, canonical)
+            if ok:
+                console.print(
+                    "  [green]✓[/green] Status field options reconciled"
                 )
+            else:
+                console.print(
+                    f"  [red]✗[/red] Could not update Status field "
+                    f"options: [yellow]{err}[/yellow]"
+                )
+                console.print(
+                    "    [dim]Most common cause: token is missing the "
+                    "[cyan]project[/cyan] scope (classic PAT) or "
+                    "[cyan]Projects: Read & write[/cyan] permission "
+                    "(fine-grained PAT). Fix the token and re-run, or "
+                    "edit the options manually in the project "
+                    "settings.[/dim]"
+                )
+        else:
+            console.print(
+                "  [dim]Status field options already canonical, "
+                "nothing to do.[/dim]"
+            )
     else:
+        console.print(
+            "  [dim]No Status field found on the project, creating "
+            "one...[/dim]"
+        )
         options = [
             {
                 "name": opt,
@@ -876,19 +1148,29 @@ def setup_project(config: Config) -> str | None:
             for opt in STATUS_OPTIONS
         ]
         field_id = _create_single_select_field(project_id, "Status", options)
-        if not field_id:
-            log.warning("Failed to create Status field")
+        if field_id:
+            console.print("  [green]✓[/green] Status field created")
+        else:
+            console.print(
+                "  [red]✗[/red] Failed to create Status field "
+                "(see warnings above)"
+            )
 
     return project_url
 
 
 STATUS_MAP = {
-    "ok": "Ok",
+    "needs_review": "Needs Review",
+    "branch_created": "Branch Created",
     "conflict": "Conflict",
-    "resolved": "Resolved",
     "skipped": "Skipped",
-    "disabled": "Disabled",
-    "pending": "Pending",
+    # Legacy aliases — state.load_state() already migrates these on read,
+    # but keep the mapping in case a raw status string slips through.
+    "ok": "Needs Review",
+    "resolved": "Needs Review",
+    "pending": "Needs Review",
+    "disabled": "Needs Review",
+    "needs_resolution": "Conflict",
 }
 
 REST_API_URL = "https://api.github.com"
@@ -1016,27 +1298,105 @@ def _ensure_project_view(
     return result is not None
 
 
-def sync_project(config: Config, state: PipelineState) -> bool:
-    """Sync pipeline state to a GitHub Project board."""
+@dataclass
+class ProjectSyncSummary:
+    """Outcome of a single ``sync_project`` call.
+
+    ``added`` counts cards that didn't exist on the board before this call
+    (newly attached PRs + newly created draft issues). ``updated`` counts
+    pre-existing cards we refreshed (body / Status field). ``errors`` is
+    the number of features we wanted to sync but couldn't.
+
+    ``skipped`` is True when sync didn't run at all (no project URL
+    configured, missing token, unparseable URL, …) — that's not an error,
+    just a no-op.
+    """
+    added: int = 0
+    updated: int = 0
+    errors: int = 0
+    skipped: bool = False
+    skipped_reason: str | None = None
+
+    @property
+    def changed(self) -> int:
+        return self.added + self.updated
+
+    def summary_line(self) -> str:
+        if self.skipped:
+            return f"skipped ({self.skipped_reason or 'no project configured'})"
+        parts: list[str] = []
+        if self.added:
+            parts.append(f"{self.added} added")
+        if self.updated:
+            parts.append(f"{self.updated} updated")
+        if self.errors:
+            parts.append(f"{self.errors} error(s)")
+        if not parts:
+            return "already up to date"
+        return ", ".join(parts)
+
+
+def sync_project(config: Config, state: PipelineState) -> ProjectSyncSummary:
+    """Sync pipeline state to a GitHub Project board.
+
+    Iterates every feature actually present in ``state.features`` (ports
+    discovered via ``pr_sources`` are only known here, never in
+    ``config.features``) and any static feature from ``config.features``
+    that has not produced state yet (so unstarted/disabled features still
+    show up as cards).
+
+    Each feature becomes one item on the project:
+
+    * If a PR exists for it (``fs.rebase_pr_url``), the *real* PR is
+      attached to the project via ``addProjectV2ItemById`` — that's the
+      whole point of the Projects v2 API. The mutation is idempotent so
+      re-running is safe.
+    * Otherwise (pending / disabled / dropped singleton) we fall back to a
+      DraftIssue carrying the same status info, so the board still
+      reflects the run.
+
+    The returned ``ProjectSyncSummary`` reports how many cards were added
+    vs. refreshed, so reconciliation passes (e.g. at the end of ``releasy
+    continue``) can tell the user "added 3 missing items" without parsing
+    log output.
+    """
     project_url = config.notifications.github_project
     if not project_url:
-        return False
+        return ProjectSyncSummary(
+            skipped=True,
+            skipped_reason="notifications.github_project not set",
+        )
 
     token = get_github_token()
     if not token:
         log.warning("RELEASY_GITHUB_TOKEN not set — skipping project sync")
-        return False
+        return ProjectSyncSummary(
+            skipped=True, skipped_reason="RELEASY_GITHUB_TOKEN not set",
+        )
 
     parsed = _parse_project_url(project_url)
     if not parsed:
         log.warning("Could not parse project URL: %s", project_url)
-        return False
+        return ProjectSyncSummary(
+            skipped=True,
+            skipped_reason=f"unparseable project URL {project_url!r}",
+        )
 
     owner, number, is_org = parsed
     project_id = _get_project_id(owner, number, is_org)
     if not project_id:
-        log.warning("Could not resolve project ID for %s", project_url)
-        return False
+        log.warning(
+            "Could not resolve project ID for %s — check that the URL is "
+            "correct and that RELEASY_GITHUB_TOKEN has the 'project' scope",
+            project_url,
+        )
+        return ProjectSyncSummary(
+            skipped=True,
+            skipped_reason=(
+                f"could not resolve project {project_url!r} "
+                "(token missing 'project' scope?)"
+            ),
+        )
 
     if state.base_branch:
         _ensure_project_view(owner, number, is_org, state.base_branch)
@@ -1047,39 +1407,105 @@ def sync_project(config: Config, state: PipelineState) -> bool:
     if status_info:
         status_field_id, status_options, _ = status_info
 
-    branches: list[tuple[str, str, list[str]]] = []
+    origin_slug = get_origin_repo_slug(config)
 
-    for feat in config.features:
-        fs = state.features.get(feat.id)
-        if fs:
-            label = fs.branch_name or feat.source_branch
-            branches.append((f"{label} ({feat.id})", fs.status, fs.conflict_files))
-        else:
-            status = "disabled" if not feat.enabled else "pending"
-            branches.append((f"{feat.source_branch} ({feat.id})", status, []))
+    # Collect every feature we know about. State wins; static config
+    # features merely provide a row for things that haven't run yet.
+    rows: list[tuple[str, str, str, list[str], FeatureState | None]] = []
+    seen: set[str] = set()
 
-    synced = 0
-    for title, status, conflict_files in branches:
-        body_parts = [f"**Status:** {status}"]
-        if state.onto:
-            body_parts.append(f"**Onto:** `{state.onto}`")
-        if state.base_branch:
-            body_parts.append(f"**Base:** `{state.base_branch}`")
-        if conflict_files:
-            files_str = "\n".join(f"- `{f}`" for f in conflict_files)
-            body_parts.append(f"**Conflict files:**\n{files_str}")
-        body = "\n\n".join(body_parts)
+    for feat_id, fs in state.features.items():
+        feat = config.get_feature(feat_id)
+        label = (
+            fs.branch_name
+            or (feat.source_branch if feat else None)
+            or feat_id
+        )
+        title = f"{label} ({feat_id})"
+        rows.append((feat_id, title, fs.status, fs.conflict_files, fs))
+        seen.add(feat_id)
 
-        existing = _find_item_by_title(project_id, title)
-        if existing:
-            item_id, draft_id = existing
-            if draft_id:
-                _update_draft_issue(project_id, draft_id, body=body)
-        else:
-            item_id = _add_draft_issue(project_id, title, body)
-            if not item_id:
-                log.warning("Failed to create project item for %s", title)
-                continue
+    # Static config.features that haven't run yet are deliberately
+    # skipped: they have no real status, no branch, and nothing to track.
+    # They appear on the board only after a run produces a state entry.
+
+    summary = ProjectSyncSummary()
+    if not rows:
+        log.info("No features to sync to GitHub Project")
+        return summary
+
+    existing_items = _list_project_items(project_id)
+
+    for feat_id, title, status, conflict_files, fs in rows:
+        body = _project_item_body(
+            state, status, conflict_files, fs, origin_slug,
+        )
+
+        item_id: str | None = None
+        was_existing = False
+        attached_real_pr = False
+        # Prefer attaching the real PR — that's what Projects v2 is for.
+        pr_url = fs.rebase_pr_url if fs else None
+        if pr_url:
+            item_id = _find_item_by_pr_url(existing_items, pr_url)
+            if item_id:
+                was_existing = True
+                attached_real_pr = True
+            else:
+                pr_ref = parse_pr_url(pr_url)
+                pr_slug = (
+                    f"{pr_ref[0]}/{pr_ref[1]}"
+                    if pr_ref else (origin_slug or "")
+                )
+                pr_number = pr_ref[2] if pr_ref else None
+                if pr_slug and pr_number is not None:
+                    pr_node_id = _get_pr_node_id(pr_slug, pr_number)
+                    if pr_node_id:
+                        item_id = _add_item_by_content_id(
+                            project_id, pr_node_id,
+                        )
+                        if item_id:
+                            attached_real_pr = True
+                        else:
+                            log.warning(
+                                "Failed to add PR %s to project — falling "
+                                "back to draft issue", pr_url,
+                            )
+                    else:
+                        log.warning(
+                            "Could not resolve PR node id for %s — falling "
+                            "back to draft issue", pr_url,
+                        )
+
+        if not item_id:
+            existing_draft = _find_draft_item_by_title(existing_items, title)
+            if existing_draft:
+                item_id, draft_id = existing_draft
+                _update_draft_issue(draft_id, body=body)
+                was_existing = True
+            else:
+                item_id = _add_draft_issue(project_id, title, body)
+                if not item_id:
+                    log.warning("Failed to create project item for %s", title)
+                    summary.errors += 1
+                    continue
+        elif attached_real_pr:
+            # Real PR is now the project item. Remove any leftover draft stub
+            # created on a prior run when no PR existed yet — otherwise the
+            # board ends up with two cards for the same feature.
+            stale_draft = _find_draft_item_by_title(existing_items, title)
+            if stale_draft:
+                stale_item_id, _ = stale_draft
+                if _delete_item(project_id, stale_item_id):
+                    log.info(
+                        "Removed stale draft project item %r (replaced by "
+                        "PR %s)", title, pr_url,
+                    )
+                else:
+                    log.warning(
+                        "Could not remove stale draft project item %r — "
+                        "board may show duplicate cards", title,
+                    )
 
         if status_field_id and status_options:
             mapped = STATUS_MAP.get(status, "Pending")
@@ -1087,7 +1513,86 @@ def sync_project(config: Config, state: PipelineState) -> bool:
             if option_id:
                 _set_item_field(project_id, item_id, status_field_id, option_id)
 
-        synced += 1
+        if was_existing:
+            summary.updated += 1
+        else:
+            summary.added += 1
 
-    log.info("Synced %d items to GitHub Project", synced)
-    return synced > 0
+    log.info(
+        "Synced %d items to GitHub Project (%d added, %d updated, %d errors)",
+        summary.added + summary.updated,
+        summary.added, summary.updated, summary.errors,
+    )
+    return summary
+
+
+def _project_item_body(
+    state: PipelineState,
+    status: str,
+    conflict_files: list[str],
+    fs: FeatureState | None,
+    origin_slug: str | None = None,
+) -> str:
+    """Render the body for a draft-issue project card."""
+    body_parts = [f"**Status:** {status}"]
+    if state.onto:
+        body_parts.append(f"**Onto:** `{state.onto}`")
+    if state.base_branch:
+        body_parts.append(f"**Base:** `{state.base_branch}`")
+    if (
+        status == "branch_created" and fs is not None
+        and fs.branch_name and origin_slug
+    ):
+        repo_url = f"https://github.com/{origin_slug}"
+        branch_url = f"{repo_url}/tree/{fs.branch_name}"
+        # GitHub /compare/<base>...<head>?expand=1 lands on the
+        # "Open a pull request" form pre-populated with the diff, so the
+        # user can create the PR manually with one click.
+        compare_url = (
+            f"{repo_url}/compare/{state.base_branch or 'main'}..."
+            f"{fs.branch_name}?expand=1"
+        )
+        body_parts.append(
+            "**Branch pushed, no PR opened yet.**\n"
+            f"- Branch: [`{fs.branch_name}`]({branch_url})\n"
+            f"- [Open a pull request manually]({compare_url})"
+        )
+    # An "AI gave up" conflict (legacy ``needs_resolution``) is now just
+    # a regular ``conflict`` — but the ``failed_step_index`` /
+    # ``partial_pr_count`` / ``rebase_pr_url`` fields, when set, identify
+    # this flavour and let the body explain what happened. Plain
+    # cherry-pick conflicts (no AI involvement) just fall through to the
+    # ``conflict_files`` block below.
+    if (
+        status == "conflict" and fs is not None and (
+            fs.partial_pr_count is not None
+            or fs.failed_step_index is not None
+            or fs.rebase_pr_url
+        )
+    ):
+        note_lines = [
+            "**Needs manual intervention.**",
+            "Releasy could not resolve a conflict automatically.",
+        ]
+        if fs.partial_pr_count is not None and fs.partial_pr_count > 0:
+            note_lines.append(
+                f"Partial group: {fs.partial_pr_count} PR(s) applied "
+                "before the failure. A draft PR was opened — see "
+                "`rebase_pr_url` below."
+            )
+        elif fs.failed_step_index is not None:
+            note_lines.append(
+                "Local port branch was dropped (nothing to keep). "
+                "Resolve the source PR manually and re-run."
+            )
+        if fs.failed_step_index is not None:
+            note_lines.append(
+                f"Failed at cherry-pick step #{fs.failed_step_index + 1}."
+            )
+        if fs.rebase_pr_url:
+            note_lines.append(f"Draft PR: {fs.rebase_pr_url}")
+        body_parts.append("\n".join(note_lines))
+    if conflict_files:
+        files_str = "\n".join(f"- `{f}`" for f in conflict_files)
+        body_parts.append(f"**Conflict files:**\n{files_str}")
+    return "\n\n".join(body_parts)

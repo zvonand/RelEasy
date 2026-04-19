@@ -3,7 +3,10 @@
 Assumes the base branch (e.g. ``antalya-26.3``) already exists on origin.
 For each source PR discovered via configured labels, the pipeline creates a
 port branch off ``origin/<base_branch>``, cherry-picks the PR merge commit,
-and on conflict either invokes the AI resolver or commits WIP markers.
+and on conflict either invokes the AI resolver or — if the resolver is
+disabled or fails — drops the local branch (singletons / first-of-group)
+or opens a draft PR labelled ``ai-needs-attention`` (partial groups), then
+records the entry as ``Conflict`` in the GitHub Project.
 """
 
 from __future__ import annotations
@@ -16,15 +19,16 @@ from rich.console import Console
 
 from releasy.config import Config, FeatureConfig, PRGroupConfig, PRSourceConfig
 from releasy.git_ops import (
+    OperationResult,
     abort_in_progress_op,
     append_commit_trailer,
     branch_exists,
     local_branch_exists,
     remote_branch_exists,
     cherry_pick_merge_commit,
-    commit_conflict_markers,
     create_branch_from_ref,
     ensure_work_repo,
+    fetch_commit,
     fetch_pr_ref,
     fetch_remote,
     force_push,
@@ -42,8 +46,12 @@ from releasy.github_ops import (
     ensure_label,
     fetch_pr_by_number,
     find_pr_for_branch,
+    get_origin_repo_slug,
     parse_pr_url,
+    pr_ref_label,
+    require_origin_repo_slug,
     search_prs_by_labels,
+    slug_to_https_url,
     sync_project,
     update_pull_request,
 )
@@ -70,8 +78,8 @@ def _update_state_and_status(config: Config, state: PipelineState) -> None:
 def _setup_repo(
     config: Config, work_dir: Path | None, base_branch: str | None = None,
 ) -> Path:
-    """Set up work repo and fetch origin. Upstream is not fetched anymore —
-    the ``onto`` argument is used only for branch naming.
+    """Set up work repo and fetch origin. The ``onto`` argument is used
+    only for branch naming.
 
     If the repo was just cloned and ``base_branch`` is provided, check it
     out from origin and initialise submodules — saves the user (and Claude)
@@ -109,11 +117,8 @@ def _setup_repo(
 
 
 def _push(config: Config, repo_path: Path, branch: str) -> None:
-    """Push a branch to the origin remote, with upstream safety check."""
-    force_push(
-        repo_path, branch, config.origin.remote_name,
-        upstream_name=config.upstream.remote_name if config.upstream else None,
-    )
+    """Push a branch to the origin remote (the only push path we use)."""
+    force_push(repo_path, branch, config)
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +136,6 @@ class FeatureUnit:
     feature_id: str
     prs: list[PRInfo]
     if_exists: str
-    auto_pr: bool
     title_prefix: str = ""        # used for both single-PR and group titles
     is_group: bool = False
     group_id: str | None = None   # filled when is_group
@@ -150,17 +154,34 @@ class FeatureUnit:
         return self.prs[0]
 
 
+PRRef = tuple[str, str, int]
+
+
+def _singleton_feature_id(pr: PRInfo, origin_slug: str | None) -> str:
+    """Branch / state ID for a single-PR port.
+
+    Origin PRs keep the historical short ``pr-<N>`` form so existing state
+    files and branches keep working. PRs from other repos get a slug-prefixed
+    ID (``<owner>-<repo>-pr-<N>``) so a same-numbered origin PR can't clash
+    with them.
+    """
+    if origin_slug and pr.repo_slug == origin_slug:
+        return f"pr-{pr.number}"
+    owner, repo = pr.repo_slug.split("/", 1)
+    return f"{owner}-{repo}-pr-{pr.number}"
+
+
 def _build_singleton_units(
     config: Config,
-    collected: dict[int, tuple[PRInfo, PRSourceConfig]],
+    collected: dict[PRRef, tuple[PRInfo, PRSourceConfig]],
 ) -> list[FeatureUnit]:
     units: list[FeatureUnit] = []
+    origin_slug = get_origin_repo_slug(config)
     for pr, src in collected.values():
         units.append(FeatureUnit(
-            feature_id=f"pr-{pr.number}",
+            feature_id=_singleton_feature_id(pr, origin_slug),
             prs=[pr],
             if_exists=src.if_exists,
-            auto_pr=src.auto_pr,
             title_prefix=src.description,
         ))
     return units
@@ -168,15 +189,16 @@ def _build_singleton_units(
 
 def _build_group_units(
     config: Config,
-    excluded_pr_numbers: set[int],
+    excluded_pr_refs: set[PRRef],
     excluded_labels: set[str],
-) -> tuple[list[FeatureUnit], set[int]]:
-    """Materialise group units, fetching each PR. Returns (units, claimed_nums)
-    where ``claimed_nums`` are PR numbers that should NOT also appear as
-    standalone units.
+) -> tuple[list[FeatureUnit], set[PRRef]]:
+    """Materialise group units, fetching each PR. Returns (units, claimed_refs)
+    where ``claimed_refs`` are ``(owner, repo, number)`` tuples that should
+    NOT also appear as standalone units.
     """
+    origin_slug = get_origin_repo_slug(config)
     units: list[FeatureUnit] = []
-    claimed: set[int] = set()
+    claimed: set[PRRef] = set()
     for group in config.pr_sources.groups:
         console.print(
             f"\n  Resolving group [yellow]{group.id}[/yellow] "
@@ -184,30 +206,32 @@ def _build_group_units(
         )
         group_prs: list[PRInfo] = []
         for url in group.prs:
-            num = parse_pr_url(url)
-            if num is None:
+            parsed = parse_pr_url(url)
+            if parsed is None:
                 console.print(f"    [red]✗[/red] Bad PR URL: {url}")
                 continue
-            if num in excluded_pr_numbers:
+            owner, repo, num = parsed
+            ref_label = pr_ref_label(f"{owner}/{repo}", num, origin_slug)
+            if parsed in excluded_pr_refs:
                 console.print(
-                    f"    [yellow]−[/yellow] #{num} excluded via "
+                    f"    [yellow]−[/yellow] {ref_label} excluded via "
                     "pr_sources.exclude_prs, dropping from group"
                 )
                 continue
-            pr = fetch_pr_by_number(config, num)
+            pr = fetch_pr_by_number(config, num, slug=f"{owner}/{repo}")
             if pr is None:
-                console.print(f"    [red]✗[/red] Could not fetch PR #{num}")
+                console.print(f"    [red]✗[/red] Could not fetch PR {ref_label}")
                 continue
             if excluded_labels and (set(pr.labels) & excluded_labels):
                 console.print(
-                    f"    [yellow]−[/yellow] #{num} carries an excluded label, "
-                    "dropping from group"
+                    f"    [yellow]−[/yellow] {ref_label} carries an excluded "
+                    "label, dropping from group"
                 )
                 continue
             group_prs.append(pr)
-            claimed.add(num)
+            claimed.add(parsed)
             console.print(
-                f"    [dim]+ #{num}[/dim] {pr.title} [{pr.state}]"
+                f"    [dim]+ {ref_label}[/dim] {pr.title} [{pr.state}]"
             )
         if not group_prs:
             console.print(
@@ -219,7 +243,6 @@ def _build_group_units(
             feature_id=group.id,
             prs=group_prs,
             if_exists=group.if_exists,
-            auto_pr=group.auto_pr,
             title_prefix=group.description,
             is_group=True,
             group_id=group.id,
@@ -242,30 +265,34 @@ def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
 
     Returns True if any entry was removed (so the caller can persist state).
     """
-    group_pr_numbers: set[int] = set()
+    group_pr_refs: set[PRRef] = set()
     group_feature_ids: set[str] = set()
     for group in config.pr_sources.groups:
         group_feature_ids.add(group.id)
         for url in group.prs:
-            num = parse_pr_url(url)
-            if num is not None:
-                group_pr_numbers.add(num)
+            parsed = parse_pr_url(url)
+            if parsed is not None:
+                group_pr_refs.add(parsed)
 
-    if not group_pr_numbers:
+    if not group_pr_refs:
         return False
 
-    stale: list[tuple[str, FeatureState]] = []
+    origin_slug = get_origin_repo_slug(config)
+    stale: list[tuple[str, FeatureState, PRRef]] = []
     for fid, fs in state.features.items():
         if fid in group_feature_ids:
             continue  # the group's own state entry
         if len(fs.pr_numbers) > 1:
             continue  # a different multi-PR unit
-        if fs.pr_number is None:
+        if not fs.pr_url:
             continue
-        if fs.pr_number in group_pr_numbers:
-            stale.append((fid, fs))
+        parsed = parse_pr_url(fs.pr_url)
+        if parsed is not None and parsed in group_pr_refs:
+            stale.append((fid, fs, parsed))
 
-    for fid, fs in stale:
+    for fid, fs, ref in stale:
+        owner, repo, num = ref
+        ref_label = pr_ref_label(f"{owner}/{repo}", num, origin_slug)
         extra = ""
         if fs.rebase_pr_url:
             extra = (
@@ -274,7 +301,7 @@ def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
             )
         console.print(
             f"  [yellow]⚠[/yellow] Dropping stale singleton "
-            f"[cyan]{fid}[/cyan] (PR #{fs.pr_number} is now in a group){extra}"
+            f"[cyan]{fid}[/cyan] (PR {ref_label} is now in a group){extra}"
         )
         del state.features[fid]
 
@@ -334,11 +361,20 @@ def run_pipeline(
 
     base_ref = f"{remote}/{base_branch}"
     console.print(f"Base: [cyan]{base_ref}[/cyan]")
+    console.print(
+        f"PRs will be opened against [bold cyan]{require_origin_repo_slug(config)}[/bold cyan] "
+        "(origin) — RelEasy never opens PRs against any other repo."
+    )
 
     state.set_started(onto)
     state.base_branch = base_branch
     state.phase = "init"
     _update_state_and_status(config, state)
+
+    if config.push:
+        ensure_label(
+            config, RELEASY_LABEL, RELEASY_LABEL_COLOR, RELEASY_LABEL_DESCRIPTION,
+        )
 
     ai_active = resolve_conflicts and config.ai_resolve.enabled
     if ai_active:
@@ -359,12 +395,28 @@ def run_pipeline(
         why = "disabled via --no-resolve-conflicts" if not resolve_conflicts else "disabled in config"
         console.print(f"[dim]AI conflict resolver: {why}[/dim]")
 
+    # The needs-attention label is used for partial-group draft PRs whenever
+    # an unresolved conflict surfaces, regardless of whether the AI resolver
+    # was enabled — pre-create it so the PR-creation path doesn't fail on a
+    # missing label.
+    if config.push:
+        ensure_label(
+            config,
+            config.ai_resolve.needs_attention_label,
+            config.ai_resolve.needs_attention_label_color,
+            "Releasy stopped on a conflict it could not resolve — needs human review",
+        )
+
     console.print(
         f"\n[bold]Phase:[/bold] Porting PRs onto [cyan]{base_branch}[/cyan]"
     )
 
+    origin_slug = get_origin_repo_slug(config)
+
     # --- Collect PRs from all sources (union) ---
-    collected: dict[int, tuple[PRInfo, PRSourceConfig]] = {}
+    # Keyed by (owner, repo, number) so cross-repo PR references can never
+    # collide with same-numbered origin PRs.
+    collected: dict[PRRef, tuple[PRInfo, PRSourceConfig]] = {}
     for pr_source in config.pr_sources.by_labels:
         labels_str = ", ".join(pr_source.labels)
         filter_str = " (merged only)" if pr_source.merged_only else ""
@@ -380,24 +432,29 @@ def run_pipeline(
 
         console.print(f"    Found {len(prs)} PR(s)")
         for pr in prs:
-            if pr.number not in collected:
-                collected[pr.number] = (pr, pr_source)
+            ref = pr.ref()
+            if ref not in collected:
+                collected[ref] = (pr, pr_source)
 
     prs_cfg = config.pr_sources
-    include_pr_numbers = {
-        n for url in prs_cfg.include_prs if (n := parse_pr_url(url)) is not None
+    include_pr_refs: set[PRRef] = {
+        parsed
+        for url in prs_cfg.include_prs
+        if (parsed := parse_pr_url(url)) is not None
     }
-    exclude_pr_numbers = {
-        n for url in prs_cfg.exclude_prs if (n := parse_pr_url(url)) is not None
+    exclude_pr_refs: set[PRRef] = {
+        parsed
+        for url in prs_cfg.exclude_prs
+        if (parsed := parse_pr_url(url)) is not None
     }
 
     if prs_cfg.exclude_labels:
         exclude_set = set(prs_cfg.exclude_labels)
         before = len(collected)
         collected = {
-            num: (pr, src)
-            for num, (pr, src) in collected.items()
-            if not (set(pr.labels) & exclude_set) or num in include_pr_numbers
+            ref: (pr, src)
+            for ref, (pr, src) in collected.items()
+            if not (set(pr.labels) & exclude_set) or ref in include_pr_refs
         }
         removed = before - len(collected)
         if removed:
@@ -406,39 +463,47 @@ def run_pipeline(
                 f"({', '.join(prs_cfg.exclude_labels)})[/dim]"
             )
 
-    if include_pr_numbers:
+    if include_pr_refs:
         default_source = (
             config.pr_sources.by_labels[0]
             if config.pr_sources.by_labels
             else PRSourceConfig(labels=[], if_exists=config.pr_sources.if_exists)
         )
-        for pr_num in sorted(include_pr_numbers):
-            if pr_num in collected:
+        for ref in sorted(include_pr_refs):
+            if ref in collected:
                 continue
-            console.print(f"\n  Fetching explicitly included PR #{pr_num}...")
-            pr_info = fetch_pr_by_number(config, pr_num)
+            owner, repo, pr_num = ref
+            ref_label = pr_ref_label(f"{owner}/{repo}", pr_num, origin_slug)
+            console.print(f"\n  Fetching explicitly included PR {ref_label}...")
+            pr_info = fetch_pr_by_number(config, pr_num, slug=f"{owner}/{repo}")
             if pr_info:
-                collected[pr_num] = (pr_info, default_source)
+                collected[ref] = (pr_info, default_source)
                 console.print(f"    [green]✓[/green] {pr_info.title}")
             else:
-                console.print(f"    [red]✗[/red] Could not fetch PR #{pr_num}")
+                console.print(f"    [red]✗[/red] Could not fetch PR {ref_label}")
 
-    for pr_num in exclude_pr_numbers:
-        if pr_num in collected:
-            pr_info, _ = collected.pop(pr_num)
-            console.print(f"\n  [dim]Excluded PR #{pr_num} ({pr_info.title})[/dim]")
+    for ref in exclude_pr_refs:
+        if ref in collected:
+            pr_info, _ = collected.pop(ref)
+            owner, repo, pr_num = ref
+            ref_label = pr_ref_label(f"{owner}/{repo}", pr_num, origin_slug)
+            console.print(
+                f"\n  [dim]Excluded PR {ref_label} ({pr_info.title})[/dim]"
+            )
 
     # --- Build sequential PR groups (each becomes one combined feature) ---
     excluded_label_set = set(prs_cfg.exclude_labels)
-    group_units, claimed_pr_numbers = _build_group_units(
-        config, exclude_pr_numbers, excluded_label_set,
+    group_units, claimed_pr_refs = _build_group_units(
+        config, exclude_pr_refs, excluded_label_set,
     )
     # Drop any singletons that the groups have claimed.
-    for n in claimed_pr_numbers:
-        if n in collected:
-            pr_info, _ = collected.pop(n)
+    for ref in claimed_pr_refs:
+        if ref in collected:
+            pr_info, _ = collected.pop(ref)
+            owner, repo, pr_num = ref
+            ref_label = pr_ref_label(f"{owner}/{repo}", pr_num, origin_slug)
             console.print(
-                f"  [dim]#{n} ({pr_info.title}) belongs to a group — "
+                f"  [dim]{ref_label} ({pr_info.title}) belongs to a group — "
                 "removed from singletons[/dim]"
             )
 
@@ -455,12 +520,14 @@ def run_pipeline(
         if unit.feature_id in existing_ids:
             continue
         existing_ids.add(unit.feature_id)
-        outcome = _process_feature_unit(
+        # _process_feature_unit always returns "continue" — unresolved
+        # conflicts are now handled in-place (drop the branch or open a
+        # draft PR), and the pipeline keeps moving so a single bad PR
+        # can't strand the whole queue.
+        _process_feature_unit(
             config, repo_path, state, unit, base_branch, base_ref, onto,
             remote, ai_active,
         )
-        if outcome == "stop":
-            break
 
     state.phase = "ports_done"
     _update_state_and_status(config, state)
@@ -469,15 +536,23 @@ def run_pipeline(
     console.print(f"\n[bold]Pipeline complete.[/bold] Phase: {state.phase}")
     if state.base_branch:
         console.print(f"  Base branch: [cyan]{state.base_branch}[/cyan]")
-    ok = sum(1 for fs in state.features.values() if fs.status == "ok")
-    resolved = sum(
-        1 for fs in state.features.values()
-        if fs.status == "resolved" and fs.ai_resolved
+    ready = sum(
+        1 for fs in state.features.values() if fs.status == "needs_review"
     )
-    conflict = sum(1 for fs in state.features.values() if fs.status == "conflict")
-    if ok or resolved or conflict:
+    branch_only = sum(
+        1 for fs in state.features.values() if fs.status == "branch_created"
+    )
+    ai_assisted = sum(
+        1 for fs in state.features.values()
+        if fs.status in ("needs_review", "branch_created") and fs.ai_resolved
+    )
+    conflicts = sum(
+        1 for fs in state.features.values() if fs.status == "conflict"
+    )
+    if ready or branch_only or conflicts:
         console.print(
-            f"  Ports: {ok} ok, {resolved} ai-resolved, {conflict} conflict"
+            f"  Ports: {ready} needs-review, {branch_only} branch-created, "
+            f"{conflicts} conflict ({ai_assisted} ai-assisted)"
         )
 
     return state
@@ -496,21 +571,139 @@ def _unit_pr_meta(unit: FeatureUnit) -> dict:
     }
 
 
-def _unit_title(unit: FeatureUnit) -> str:
-    """Synthesise the [releasy]-prefixed PR title for a unit."""
+_VERSION_TOKEN = r"v?\d+(?:\.\d+)+"
+_RELEASY_PREFIX_RE = re.compile(r"^\[releasy\b[^\]]*\]\s*", re.IGNORECASE)
+
+# Label automatically applied to every PR RelEasy opens or updates, so a
+# project's GitHub UI can filter "everything releasy created/touched" at a
+# glance — and so the title itself stays clean.
+RELEASY_LABEL = "releasy"
+RELEASY_LABEL_COLOR = "1F6FEB"  # GitHub blue
+RELEASY_LABEL_DESCRIPTION = "Created/managed by RelEasy"
+
+
+def _display_project(project: str | None) -> str:
+    """Render ``config.project`` for inclusion in PR titles.
+
+    Lower-case names get title-cased (``antalya`` → ``Antalya``,
+    ``stable-26`` → ``Stable-26``); names that already carry mixed case
+    are preserved verbatim (so e.g. ``ClickHouse`` stays ``ClickHouse``).
+    """
+    if not project:
+        return ""
+    if project.islower():
+        return project.title()
+    return project
+
+
+def _version_label(project: str | None, base_branch: str | None) -> str:
+    """Pull the version suffix out of the base branch name when possible.
+
+    If ``base_branch`` follows the conventional ``<project>-<version>``
+    shape (``antalya-26.3``), the bit after ``<project>-`` is the version
+    label. Otherwise the whole branch name is used so the prefix still
+    points at the real target — never silently drops information.
+    """
+    if not base_branch:
+        return ""
+    if project:
+        prefix = f"{project.lower()}-"
+        if base_branch.lower().startswith(prefix):
+            return base_branch[len(prefix):]
+    return base_branch
+
+
+def _subject_prefix(project: str | None, base_branch: str | None) -> str:
+    """Build the ``"Antalya 26.3"``-style PR title prefix.
+
+    Falls back gracefully:
+
+      - both pieces present → ``"Antalya 26.3"``
+      - project only        → ``"Antalya"``
+      - base only           → ``"antalya-26.3"``
+      - neither             → ``""`` (caller handles)
+    """
+    proj = _display_project(project)
+    ver = _version_label(project, base_branch)
+    if proj and ver:
+        return f"{proj} {ver}"
+    return proj or ver or ""
+
+
+def _strip_misleading_title_prefix(title: str, project: str | None) -> str:
+    """Strip a misleading version-prefix from a source PR title.
+
+    Source repos often title backport PRs with their own target version,
+    e.g. ``"26.1 Antalya: Token Authentication and Authorization"`` for a
+    PR landing on ``antalya-26.1``. When that PR is re-ported onto a
+    different base (say ``antalya-26.3``), the embedded ``"26.1"`` becomes
+    actively misleading in the rebase PR title.
+
+    This helper drops, in order of preference:
+
+      1. A leading ``[releasy …]`` tag from a previous run (so we never
+         double-tag when porting one of our own rebase PRs).
+      2. ``"<version> <project>[:|-] "`` (e.g. ``"26.1 Antalya: "``).
+      3. ``"<project> <version>[:|-] "`` (e.g. ``"Antalya 26.1: "``).
+      4. Bare ``"<version>[:|-] "`` (e.g. ``"v3.2 - "``).
+
+    A bare leading version with no separator (``"26.1 Foo"``) is left
+    alone — without a colon/dash we can't tell a target-version prefix
+    from a genuine title.
+    """
+    cleaned = _RELEASY_PREFIX_RE.sub("", title.strip(), count=1)
+
+    patterns: list[str] = []
+    if project:
+        proj = re.escape(project)
+        patterns.append(rf"^{_VERSION_TOKEN}\s+{proj}\s*[:\-]\s+")
+        patterns.append(rf"^{proj}\s+{_VERSION_TOKEN}\s*[:\-]\s+")
+    patterns.append(rf"^{_VERSION_TOKEN}\s*[:\-]\s+")
+
+    for pat in patterns:
+        new = re.sub(pat, "", cleaned, count=1, flags=re.IGNORECASE)
+        if new != cleaned:
+            cleaned = new
+            break
+
+    return cleaned.strip() or title
+
+
+def _unit_title(
+    unit: FeatureUnit,
+    project: str | None,
+    base_branch: str | None,
+) -> str:
+    """Synthesise the PR title for a unit.
+
+    Format: ``"<Project> <version>: <subject>"`` — e.g.
+    ``"Antalya 26.3: Token Authentication and Authorization"``. The
+    ``[releasy]`` text tag is gone; identification is done via the
+    ``releasy`` label on the PR (see :data:`RELEASY_LABEL`).
+
+    Source PR titles are sanitised via ``_strip_misleading_title_prefix``
+    so a leading ``"26.1 Antalya: …"`` (the source's own target version)
+    doesn't leak into a rebase PR that actually targets a different
+    version.
+    """
+    prefix = _subject_prefix(project, base_branch)
+
     if unit.is_group:
         if unit.title_prefix:
-            return f"[releasy] {unit.title_prefix.rstrip()}".strip()
-        n = len(unit.prs)
-        first_title = unit.prs[0].title
-        if n == 1:
-            return f"[releasy] {first_title}"
-        return f"[releasy] {unit.group_id}: combined port of {n} PRs"
-    pr = unit.primary_pr()
-    title = pr.title
-    if unit.title_prefix:
-        title = f"{unit.title_prefix}{title}"
-    return f"[releasy] {title}"
+            subject = unit.title_prefix.rstrip()
+        elif len(unit.prs) == 1:
+            subject = _strip_misleading_title_prefix(unit.prs[0].title, project)
+        else:
+            subject = (
+                f"{unit.group_id}: combined port of {len(unit.prs)} PRs"
+            )
+    else:
+        pr = unit.primary_pr()
+        subject = _strip_misleading_title_prefix(pr.title, project)
+        if unit.title_prefix:
+            subject = f"{unit.title_prefix}{subject}"
+
+    return f"{prefix}: {subject}" if prefix else subject
 
 
 # Matches any level markdown heading: "# title", "## title", … up to 6.
@@ -651,30 +844,78 @@ def _format_pr_attribution(prs: "list[PRInfo]") -> str:
     return ", ".join(parts)
 
 
-def _unit_body(unit: FeatureUnit, conflicted: bool = False) -> str:
-    """Build the PR body listing constituent PRs."""
+def _unit_body(
+    unit: FeatureUnit,
+    origin_slug: str | None,
+    *,
+    needs_intervention: bool = False,
+    failed_index: int | None = None,
+    failed_pr: PRInfo | None = None,
+    conflict_files: list[str] | None = None,
+) -> str:
+    """Build the PR body listing constituent PRs.
+
+    Origin-repo PRs are referenced as ``#N`` so GitHub auto-links them in
+    the destination (origin) repo. PRs from any other repo are referenced
+    as ``owner/repo#N`` — GitHub also auto-links those cross-repo refs.
+
+    When ``needs_intervention`` is True, prepends a banner explaining that
+    the branch holds the first ``failed_index`` cherry-picks of a group
+    and that the PR at position ``failed_index`` could not be resolved
+    automatically. The banner lists the conflicted files from the failed
+    step (if known) and notes that any later PRs in the group were not
+    attempted.
+    """
     lines: list[str] = []
-    if conflicted:
-        lines.append("> **WARNING:** Unresolved conflict markers.\n")
+    if needs_intervention:
+        applied = failed_index if failed_index is not None else 0
+        remaining = max(0, len(unit.prs) - applied - 1)
+        failed_ref = (
+            pr_ref_label(failed_pr.repo_slug, failed_pr.number, origin_slug)
+            if failed_pr is not None
+            else "unknown"
+        )
+        lines.append(
+            "> **This PR needs manual intervention.**"
+        )
+        lines.append(
+            f"> Cherry-pick of {failed_ref} could not be resolved "
+            "automatically (AI resolver was disabled, exhausted its "
+            "iteration budget, or gave up)."
+        )
+        lines.append(
+            f"> The branch contains the first {applied} commit(s) of "
+            f"the group; {remaining} later PR(s) were not attempted."
+        )
+        if conflict_files:
+            lines.append("> Conflicted files at the failure point:")
+            for cf in conflict_files:
+                lines.append(f"> - `{cf}`")
+        lines.append(
+            "> Resolve the conflict locally, push the fix, and mark this "
+            "PR ready for review."
+        )
+        lines.append("")  # blank separator before the rest
 
     changelog = _build_changelog_block(unit)
     if changelog:
         lines.append(changelog)
         lines.append("")  # blank separator before the rest
 
-    source_refs = ", ".join(f"#{pr.number}" for pr in unit.prs)
+    refs = [pr_ref_label(pr.repo_slug, pr.number, origin_slug) for pr in unit.prs]
+    source_refs = ", ".join(refs)
     if unit.is_group or len(unit.prs) > 1:
         lines.append(
             f"Combined port of {len(unit.prs)} PR(s) "
             f"(group `{unit.group_id or unit.feature_id}`). "
             f"Cherry-picked from {source_refs}.\n"
         )
-        for pr in unit.prs:
-            lines.append(f"- #{pr.number} — {pr.title}")
+        for pr, ref in zip(unit.prs, refs):
+            lines.append(f"- {ref} — {pr.title}")
         lines.append("")  # blank
-        for pr in unit.prs:
+        for pr, ref in zip(unit.prs, refs):
             if pr.body:
-                lines.append(f"\n---\n### #{pr.number}: {pr.title}\n\n{pr.body}")
+                lines.append(f"\n---\n### {ref}: {pr.title}\n\n{pr.body}")
     else:
         pr = unit.prs[0]
         lines.append(f"Cherry-picked from {source_refs}.")
@@ -684,7 +925,7 @@ def _unit_body(unit: FeatureUnit, conflicted: bool = False) -> str:
 
 
 def _tag_commit_with_source_pr(
-    repo_path: Path, unit: FeatureUnit, pr: PRInfo,
+    repo_path: Path, unit: FeatureUnit, pr: PRInfo, origin_slug: str | None,
 ) -> None:
     """For grouped units, append a ``Source-PR`` trailer to the just-made
     commit so the combined PR's commit list is self-attributing.
@@ -694,23 +935,50 @@ def _tag_commit_with_source_pr(
     """
     if not unit.is_group or len(unit.prs) <= 1:
         return
+    ref = pr_ref_label(pr.repo_slug, pr.number, origin_slug)
     append_commit_trailer(
-        repo_path, "Source-PR", f"#{pr.number} ({pr.url})",
+        repo_path, "Source-PR", f"{ref} ({pr.url})",
     )
 
 
 def _cherry_pick_pr(
-    repo_path: Path, remote: str, pr: PRInfo,
-):
-    """Cherry-pick one PR into the current branch."""
+    repo_path: Path, config: Config, pr: PRInfo,
+) -> OperationResult:
+    """Cherry-pick one PR into the current branch.
+
+    For PRs from the configured ``origin`` repo we use the origin remote
+    (already fetched) and rely on the merge commit being locally present.
+    For PRs from any other repo (cross-repo references in
+    ``pr_sources.include_prs`` / ``pr_sources.groups[].prs``) we fetch the
+    needed commit / PR ref directly from that repo's HTTPS URL — no extra
+    git remote is added.
+    """
+    origin_slug = get_origin_repo_slug(config)
+    is_external = origin_slug is None or pr.repo_slug != origin_slug
+    fetch_target = (
+        slug_to_https_url(pr.repo_slug) if is_external
+        else config.origin.remote_name
+    )
+
     if pr.state == "merged" and pr.merge_commit_sha:
+        if is_external and not fetch_commit(
+            repo_path, fetch_target, pr.merge_commit_sha,
+        ):
+            return OperationResult(
+                success=False, conflict_files=[],
+                error_message=(
+                    f"could not fetch commit {pr.merge_commit_sha[:12]} "
+                    f"from {pr.repo_slug}"
+                ),
+            )
         return cherry_pick_merge_commit(
             repo_path, pr.merge_commit_sha, abort_on_conflict=False,
         )
-    if not fetch_pr_ref(repo_path, remote, pr.number):
-        from releasy.git_ops import CherryPickResult
-        return CherryPickResult(
-            success=False, conflict_files=[], error=f"could not fetch PR #{pr.number}",
+
+    if not fetch_pr_ref(repo_path, fetch_target, pr.number):
+        return OperationResult(
+            success=False, conflict_files=[],
+            error_message=f"could not fetch PR #{pr.number} from {pr.repo_slug}",
         )
     return cherry_pick_merge_commit(
         repo_path, "FETCH_HEAD", abort_on_conflict=False,
@@ -730,23 +998,32 @@ def _process_feature_unit(
 ) -> str:
     """Process one feature unit (single PR or sequential group).
 
-    Returns ``"stop"`` if the pipeline should halt (unresolved conflict, no
-    WIP fallback), or ``"continue"`` otherwise.
+    Always returns ``"continue"`` — unresolved conflicts are handled
+    in-place by :func:`_handle_unresolved_conflict` (drop the local branch
+    for singletons / first-of-group, or open a draft PR for partial
+    groups), and the pipeline keeps moving.
     """
+    origin_slug = get_origin_repo_slug(config)
     new_branch = config.feature_branch_name(unit.feature_id, onto)
     on_remote = remote_branch_exists(repo_path, new_branch, remote)
     on_local = local_branch_exists(repo_path, new_branch)
     label = (
         f"group {unit.group_id} ({len(unit.prs)} PRs)"
         if unit.is_group
-        else f"PR #{unit.primary_pr().number}: {unit.primary_pr().title}"
+        else (
+            f"PR {pr_ref_label(unit.primary_pr().repo_slug, unit.primary_pr().number, origin_slug)}: "
+            f"{unit.primary_pr().title}"
+        )
     )
 
     if on_remote:
         console.print(
             f"\n    [cyan]{new_branch}[/cyan] ({label}) — already exists on "
-            f"[cyan]{remote}[/cyan], skipping (resolve manually if you want "
-            "to rebuild it)"
+            f"[cyan]{remote}[/cyan], skipping cherry-pick "
+            "(resolve manually if you want to rebuild it)"
+        )
+        _ensure_pr_for_existing_remote_branch(
+            config, state, unit, new_branch, base_branch,
         )
         return "continue"
 
@@ -778,7 +1055,8 @@ def _process_feature_unit(
 
     console.print(f"\n  [cyan]{new_branch}[/cyan] ({label})")
     for pr in unit.prs:
-        console.print(f"    PR #{pr.number}: {pr.url}  [{pr.state}]")
+        ref = pr_ref_label(pr.repo_slug, pr.number, origin_slug)
+        console.print(f"    PR {ref}: {pr.url}  [{pr.state}]")
 
     pr_meta = _unit_pr_meta(unit)
 
@@ -788,19 +1066,23 @@ def _process_feature_unit(
     # Cherry-pick each PR in order. Conflicts are handled per-PR; a
     # successful AI resolve continues to the next PR in the group.
     for idx, pr in enumerate(unit.prs):
+        ref = pr_ref_label(pr.repo_slug, pr.number, origin_slug)
         if len(unit.prs) > 1:
             console.print(
-                f"    [dim]→ cherry-picking #{pr.number} "
+                f"    [dim]→ cherry-picking {ref} "
                 f"({idx + 1}/{len(unit.prs)})[/dim]"
             )
-        cp_result = _cherry_pick_pr(repo_path, remote, pr)
+        cp_result = _cherry_pick_pr(repo_path, config, pr)
 
         if cp_result.success:
-            _tag_commit_with_source_pr(repo_path, unit, pr)
+            _tag_commit_with_source_pr(repo_path, unit, pr, origin_slug)
             continue
 
         # --- Conflict path on this PR ---
-        console.print(f"    [red]✗[/red] Conflict on #{pr.number}!")
+        msg = f"Conflict on {ref}!"
+        if cp_result.error_message and not cp_result.conflict_files:
+            msg = f"{msg} ({cp_result.error_message})"
+        console.print(f"    [red]✗[/red] {msg}")
         for cf in cp_result.conflict_files:
             console.print(f"      [red]•[/red] {cf}")
 
@@ -812,72 +1094,15 @@ def _process_feature_unit(
             )
 
         if handled:
-            _tag_commit_with_source_pr(repo_path, unit, pr)
+            _tag_commit_with_source_pr(repo_path, unit, pr, origin_slug)
             continue
 
-        # --- Unhandled conflict — record state and decide whether to halt ---
-        state.features[unit.feature_id] = FeatureState(
-            status="conflict", branch_name=new_branch, base_commit=onto,
-            conflict_files=cp_result.conflict_files, **pr_meta,
+        # --- Unhandled conflict — clean up and flag for manual review ---
+        _handle_unresolved_conflict(
+            config, repo_path, state, unit, new_branch, base_branch,
+            base_ref, onto, idx, pr, cp_result.conflict_files, pr_meta,
+            ai_attempted=ai_active,
         )
-
-        if not config.wip_commit_on_conflict:
-            console.print(
-                "\n    [yellow]Pipeline stopped on unresolved conflict.[/yellow]"
-            )
-            console.print(
-                f"    Branch [cyan]{new_branch}[/cyan] left with conflict "
-                "markers and an in-progress cherry-pick."
-            )
-            if unit.is_group:
-                remaining = len(unit.prs) - idx - 1
-                if remaining > 0:
-                    console.print(
-                        f"    [dim]Group {unit.group_id!r}: {idx} PR(s) "
-                        f"applied, {remaining} not yet attempted.[/dim]"
-                    )
-            console.print("\n    To resolve manually:")
-            console.print(f"      [dim]cd {repo_path}[/dim]")
-            console.print("      [dim]# edit the conflicted files, then:[/dim]")
-            console.print(
-                "      [dim]git add -A && git cherry-pick --continue[/dim]"
-            )
-            if unit.is_group and idx < len(unit.prs) - 1:
-                rest = " ".join(
-                    str(p.merge_commit_sha or f"PR#{p.number}")
-                    for p in unit.prs[idx + 1:]
-                )
-                console.print(
-                    f"      [dim]# then cherry-pick the remaining PR(s):"
-                    f"\n      git cherry-pick {rest}[/dim]"
-                )
-            console.print(
-                f"      [dim]releasy continue --branch {new_branch}[/dim]"
-            )
-            console.print(
-                "      [dim]releasy run    # to continue with remaining ports[/dim]\n"
-            )
-            _update_state_and_status(config, state)
-            return "stop"
-
-        # WIP-marker fallback: commit markers, push, open PR, give up on group.
-        commit_conflict_markers(repo_path)
-        console.print("    [yellow]↑[/yellow] Committed conflict markers as WIP")
-        if config.push:
-            _push(config, repo_path, new_branch)
-            console.print(f"    [green]✓[/green] Pushed [cyan]{new_branch}[/cyan]")
-        if config.push and unit.auto_pr:
-            rebase_pr_url = create_pull_request(
-                config, new_branch, base_branch,
-                _unit_title(unit), _unit_body(unit, conflicted=True),
-            )
-            if rebase_pr_url:
-                state.features[unit.feature_id].rebase_pr_url = rebase_pr_url
-                console.print(
-                    f"    [green]✓[/green] PR opened: [link={rebase_pr_url}]"
-                    f"{rebase_pr_url}[/link]"
-                )
-        _update_state_and_status(config, state)
         return "continue"
 
     # --- All PRs cherry-picked cleanly (possibly via AI) ---
@@ -885,6 +1110,73 @@ def _process_feature_unit(
         config, repo_path, state, unit, new_branch, base_branch, onto, pr_meta,
     )
     return "continue"
+
+
+def _success_status(rebase_pr_url: str | None) -> str:
+    """Status for a port branch that finished cleanly (no conflicts).
+
+    ``needs_review`` once a PR exists for the rebase branch — that's the
+    "ready for human review" state. ``branch_created`` when the branch is
+    around but no PR has been opened yet (e.g. ``pr_sources.auto_pr:
+    false``, or PR creation hit a transient failure). The latter shows up
+    on the project board with a branch link and a GitHub *compare* URL so
+    the user can open the PR manually with one click.
+    """
+    return "needs_review" if rebase_pr_url else "branch_created"
+
+
+def _ensure_pr_for_existing_remote_branch(
+    config: Config,
+    state: PipelineState,
+    unit: FeatureUnit,
+    new_branch: str,
+    base_branch: str,
+) -> None:
+    """For a unit whose branch is already on origin: open (or find) the PR
+    and update state / labels accordingly.
+
+    Triggered on re-runs when the cherry-pick is skipped because the branch
+    is already pushed (typical case: a prior run that ran with
+    ``pr_sources.auto_pr: false`` and only pushed the branch). Idempotent:
+    if a PR is already on file, this just makes sure the labels and project
+    board reflect it.
+
+    No-op unless ``config.push`` is enabled. When ``pr_sources.auto_pr``
+    is off, the helper still ensures a state entry exists for the branch
+    (status ``branch_created``) so the project board can show it with a
+    compare-URL link.
+    """
+    if not config.push:
+        return
+
+    fs = state.features.get(unit.feature_id)
+    if config.pr_sources.auto_pr:
+        title = _unit_title(unit, config.project, base_branch)
+        body = _unit_body(unit, get_origin_repo_slug(config))
+        pr_url, outcome = _ensure_pr_for_branch(
+            config, new_branch, base_branch, title, body,
+        )
+        _log_pr_action(outcome, pr_url)
+    else:
+        pr_url = None
+
+    if fs is None:
+        # Branch on remote but no state entry — record a minimal one so the
+        # project board picks it up. Without prior context we can't tell
+        # whether AI was involved; ``ai_resolved`` stays at its default
+        # (False).
+        fs = FeatureState(
+            status=_success_status(pr_url), branch_name=new_branch,
+            **_unit_pr_meta(unit),
+        )
+        state.features[unit.feature_id] = fs
+    if pr_url:
+        fs.rebase_pr_url = pr_url
+        fs.status = "needs_review"
+        _apply_releasy_label_to_pr(config, pr_url)
+        if fs.ai_resolved:
+            _apply_ai_label_to_pr(config, pr_url)
+    _update_state_and_status(config, state)
 
 
 def _finish_clean_unit(
@@ -910,33 +1202,42 @@ def _finish_clean_unit(
     else:
         console.print("    [dim]Skipping push[/dim]")
 
-    status = "resolved" if ai_used else "ok"
+    # Provisional status — refined below once we know if a PR got opened.
     fs = FeatureState(
-        status=status, branch_name=new_branch, base_commit=onto, **pr_meta,
+        status="branch_created" if config.push else "needs_review",
+        branch_name=new_branch, base_commit=onto, **pr_meta,
     )
     if ai_used:
         fs.ai_resolved = True
         fs.ai_iterations = unit.ai_iterations_total or None
     state.features[unit.feature_id] = fs
 
-    if config.push and unit.auto_pr:
-        title = _unit_title(unit)
-        if ai_used:
-            title = title.replace("[releasy]", "[releasy] ai-resolved:", 1)
+    if config.push and config.pr_sources.auto_pr:
+        # Title format is identical regardless of AI involvement; the
+        # `ai-resolved` label (applied below) is what marks it.
+        title = _unit_title(unit, config.project, base_branch)
         rebase_pr_url, outcome = _ensure_pr_for_branch(
-            config, new_branch, base_branch, title, _unit_body(unit),
+            config, new_branch, base_branch, title,
+            _unit_body(unit, get_origin_repo_slug(config)),
         )
         _log_pr_action(outcome, rebase_pr_url)
         if rebase_pr_url:
             state.features[unit.feature_id].rebase_pr_url = rebase_pr_url
+            state.features[unit.feature_id].status = "needs_review"
+            _apply_releasy_label_to_pr(config, rebase_pr_url)
             if ai_used:
                 _apply_ai_label_to_pr(config, rebase_pr_url)
     elif config.push and ai_used:
-        # Branch pushed but no auto_pr — try to label any pre-existing PR.
+        # Branch pushed but pr_sources.auto_pr disabled — try to label any
+        # pre-existing PR for this branch.
         existing = find_pr_for_branch(config, new_branch, base_branch)
         if existing:
+            _apply_releasy_label_to_pr(
+                config, existing.url, pr_number=existing.number,
+            )
             _apply_ai_label_to_pr(config, existing.url, pr_number=existing.number)
             state.features[unit.feature_id].rebase_pr_url = existing.url
+            state.features[unit.feature_id].status = "needs_review"
 
     _update_state_and_status(config, state)
 
@@ -1006,11 +1307,9 @@ def _apply_ai_label_to_pr(
 ) -> None:
     """Best-effort: add the ai_resolve.label to the PR identified by URL."""
     if pr_number is None:
-        # Extract trailing /pull/<n>
-        try:
-            pr_number = int(pr_url.rstrip("/").rsplit("/", 1)[-1])
-        except ValueError:
-            return
+        pr_number = _pr_number_from_url(pr_url)
+    if pr_number is None:
+        return
     ok = add_label_to_pr(config, pr_number, config.ai_resolve.label)
     if ok:
         console.print(
@@ -1022,6 +1321,158 @@ def _apply_ai_label_to_pr(
             f"    [yellow]![/yellow] Could not add label "
             f"'{config.ai_resolve.label}' to PR"
         )
+
+
+def _apply_releasy_label_to_pr(
+    config: Config, pr_url: str, pr_number: int | None = None,
+) -> None:
+    """Best-effort: tag the PR with the ``releasy`` label.
+
+    This is the replacement for the old ``[releasy]`` text prefix in the
+    title — the label conveys the same identification, while keeping the
+    title clean (``"Antalya 26.3: <subject>"``).
+    """
+    if pr_number is None:
+        pr_number = _pr_number_from_url(pr_url)
+    if pr_number is None:
+        return
+    add_label_to_pr(config, pr_number, RELEASY_LABEL)
+
+
+def _handle_unresolved_conflict(
+    config: Config,
+    repo_path: Path,
+    state: PipelineState,
+    unit: FeatureUnit,
+    new_branch: str,
+    base_branch: str,
+    base_ref: str,
+    onto: str,
+    idx: int,
+    failed_pr: PRInfo,
+    conflict_files: list[str],
+    pr_meta: dict,
+    *,
+    ai_attempted: bool,
+) -> None:
+    """Centralised cleanup for an unresolved cherry-pick conflict.
+
+    Drops in two flavours, depending on whether earlier picks in the unit
+    landed cleanly:
+
+    * ``idx == 0`` (singleton, or the very first pick of a group): the
+      branch has no commits worth keeping — abort the in-progress git op,
+      detach from the branch, delete it locally, and record a
+      ``conflict`` state entry with no PR / no push.
+
+    * ``idx > 0`` (a partial group): the prior ``idx`` picks are valid
+      commits — abort the current pick, push the branch as-is, open a
+      DRAFT PR labelled ``ai-needs-attention`` with a banner explaining
+      what failed, and record a ``conflict`` state entry pointing at the
+      new draft PR. Remaining PRs in the group are NOT attempted.
+
+    Either way the state is persisted (and synced to the GitHub Project
+    when ``push`` is enabled) before returning, so the caller can simply
+    move on to the next unit.
+    """
+    origin_slug = get_origin_repo_slug(config)
+    ref = pr_ref_label(failed_pr.repo_slug, failed_pr.number, origin_slug)
+
+    # 1. Make sure no git op is mid-flight. Idempotent: if the resolver
+    # already aborted/reset (the AI path does this), these are no-ops.
+    if is_operation_in_progress(repo_path):
+        run_git(["cherry-pick", "--abort"], repo_path, check=False)
+        run_git(["merge", "--abort"], repo_path, check=False)
+        run_git(["rebase", "--abort"], repo_path, check=False)
+
+    why = (
+        "AI resolver gave up" if ai_attempted
+        else "AI resolver disabled"
+    )
+
+    if idx == 0:
+        # Nothing to keep — drop the branch entirely.
+        if local_branch_exists(repo_path, new_branch):
+            run_git(["checkout", "--detach", base_ref], repo_path, check=False)
+            run_git(["branch", "-D", new_branch], repo_path, check=False)
+        console.print(
+            f"    [yellow]Dropped local branch[/yellow] [cyan]{new_branch}[/cyan] "
+            f"({why}; nothing to keep)."
+        )
+        if unit.is_group:
+            remaining = max(0, len(unit.prs) - 1)
+            console.print(
+                f"    [dim]Group {unit.group_id!r}: first PR {ref} could "
+                f"not be resolved; {remaining} later PR(s) abandoned.[/dim]"
+            )
+        state.features[unit.feature_id] = FeatureState(
+            status="conflict",
+            branch_name=None,
+            base_commit=onto,
+            conflict_files=conflict_files,
+            failed_step_index=idx,
+            partial_pr_count=0,
+            **pr_meta,
+        )
+        _update_state_and_status(config, state)
+        return
+
+    # Partial group: keep the n-1 successful commits, push, draft PR.
+    applied = idx
+    remaining = max(0, len(unit.prs) - applied - 1)
+    console.print(
+        f"    [yellow]Partial group:[/yellow] {applied} PR(s) applied, "
+        f"{ref} unresolved ({why}); {remaining} later PR(s) abandoned."
+    )
+
+    rebase_pr_url: str | None = None
+    pushed = False
+    if config.push:
+        _push(config, repo_path, new_branch)
+        console.print(f"    [green]✓[/green] Pushed [cyan]{new_branch}[/cyan]")
+        pushed = True
+
+    if pushed and config.pr_sources.auto_pr:
+        title = _unit_title(unit, config.project, base_branch)
+        body = _unit_body(
+            unit,
+            origin_slug,
+            needs_intervention=True,
+            failed_index=applied,
+            failed_pr=failed_pr,
+            conflict_files=conflict_files,
+        )
+        rebase_pr_url = create_pull_request(
+            config, new_branch, base_branch, title, body,
+            draft=True,
+            labels=[config.ai_resolve.needs_attention_label],
+        )
+        if rebase_pr_url:
+            console.print(
+                f"    [green]✓[/green] Draft PR opened: "
+                f"[link={rebase_pr_url}]{rebase_pr_url}[/link] "
+                f"[dim](label: {config.ai_resolve.needs_attention_label})[/dim]"
+            )
+            _apply_releasy_label_to_pr(config, rebase_pr_url)
+        else:
+            console.print(
+                "    [yellow]![/yellow] Could not open draft PR for "
+                f"[cyan]{new_branch}[/cyan] (see warnings above)"
+            )
+
+    fs = FeatureState(
+        status="conflict",
+        branch_name=new_branch,
+        base_commit=onto,
+        conflict_files=conflict_files,
+        failed_step_index=applied,
+        partial_pr_count=applied,
+        **pr_meta,
+    )
+    if rebase_pr_url:
+        fs.rebase_pr_url = rebase_pr_url
+    state.features[unit.feature_id] = fs
+    _update_state_and_status(config, state)
 
 
 def _try_ai_resolve_step(
@@ -1041,8 +1492,11 @@ def _try_ai_resolve_step(
     opening the (possibly combined) PR. This contract is the same for
     singletons and for any step inside a sequential group.
 
-    Returns True on success. On failure the caller decides whether to halt
-    (default) or fall through to the WIP-marker path.
+    Returns True on success. On failure the working tree is reset to a
+    clean state at ``start_sha`` (any Claude in-progress op aborted, any
+    half-baked commits dropped) and the caller is responsible for
+    deciding what to do next — typically routing through
+    :func:`_handle_unresolved_conflict`.
     """
     from releasy.ai_resolve import AIResolveContext, resolve_with_claude
 
@@ -1064,24 +1518,15 @@ def _try_ai_resolve_step(
             "timed out" if result.timed_out else "unknown failure"
         )
         console.print(f"    [yellow]AI resolve failed:[/yellow] {reason}")
-        # Reset to a known state so the user sees the original conflict and
-        # can resolve it manually. If Claude left the cherry-pick aborted but
-        # committed something half-way, hard-reset back to start_sha.
+        # Reset to a known state so the caller can decide what to do next.
+        # If Claude left the cherry-pick aborted but committed something
+        # half-way, hard-reset back to start_sha.
         if is_operation_in_progress(repo_path):
             run_git(["cherry-pick", "--abort"], repo_path, check=False)
             run_git(["merge", "--abort"], repo_path, check=False)
             run_git(["rebase", "--abort"], repo_path, check=False)
         if start_sha:
             run_git(["reset", "--hard", start_sha], repo_path, check=False)
-        # Re-apply the conflict so the human can resolve from a clean state.
-        if pr.merge_commit_sha:
-            cherry_pick_merge_commit(
-                repo_path, pr.merge_commit_sha, abort_on_conflict=False,
-            )
-        else:
-            cherry_pick_merge_commit(
-                repo_path, "FETCH_HEAD", abort_on_conflict=False,
-            )
         return False
 
     unit.ai_resolved_count += 1
@@ -1148,13 +1593,16 @@ def continue_branch(config: Config, branch_name: str) -> bool:
         )
         return False
 
-    state.features[feat.id].status = "resolved"
+    state.features[feat.id].status = _success_status(
+        state.features[feat.id].rebase_pr_url
+    )
     state.features[feat.id].conflict_files = []
     _update_state_and_status(config, state)
     console.print(
         f"[green]✓[/green] Feature [cyan]{feat.id}[/cyan] "
-        f"({fs.branch_name}) marked as resolved"
+        f"({fs.branch_name}) → {state.features[feat.id].status}"
     )
+    _reconcile_project_board(config, state)
     return True
 
 
@@ -1212,20 +1660,35 @@ def _open_pr_for_resolved(
         _push(config, repo_path, branch)
         console.print(f"    [green]✓[/green] Pushed [cyan]{branch}[/cyan]")
 
-    title_src = fs.pr_title or branch
+    subject = (
+        _strip_misleading_title_prefix(fs.pr_title, config.project)
+        if fs.pr_title else branch
+    )
+    prefix = _subject_prefix(config.project, base_branch)
+    title = f"{prefix}: {subject}" if prefix else subject
+
     body_parts: list[str] = []
-    pr_numbers = fs.pr_numbers or ([fs.pr_number] if fs.pr_number else [])
-    if pr_numbers:
-        source_refs = ", ".join(f"#{n}" for n in pr_numbers)
-        body_parts.append(f"Cherry-picked from {source_refs}.")
+    origin_slug = get_origin_repo_slug(config)
+    pr_urls = fs.pr_urls or ([fs.pr_url] if fs.pr_url else [])
+    refs: list[str] = []
+    for url in pr_urls:
+        parsed = parse_pr_url(url) if url else None
+        if parsed:
+            owner, repo, n = parsed
+            refs.append(pr_ref_label(f"{owner}/{repo}", n, origin_slug))
+    # Fallback if old state lacks pr_urls but does have pr_numbers (assume origin).
+    if not refs:
+        pr_numbers = fs.pr_numbers or ([fs.pr_number] if fs.pr_number else [])
+        refs = [f"#{n}" for n in pr_numbers if n is not None]
+    if refs:
+        body_parts.append(f"Cherry-picked from {', '.join(refs)}.")
     if fs.pr_body:
         body_parts.append(f"\n---\n\n{fs.pr_body}")
-    title = f"[releasy] {title_src}"
     body = "\n".join(body_parts) or branch
 
     if fs.rebase_pr_url:
+        pr_num = _pr_number_from_url(fs.rebase_pr_url)
         if config.update_existing_prs:
-            pr_num = _pr_number_from_url(fs.rebase_pr_url)
             if pr_num is not None and update_pull_request(
                 config, pr_num, title=title, body=body,
             ):
@@ -1244,6 +1707,13 @@ def _open_pr_for_resolved(
                 f"[link={fs.rebase_pr_url}]{fs.rebase_pr_url}[/link] "
                 f"(set [cyan]update_existing_prs: true[/cyan] to overwrite "
                 f"title/body)[/dim]"
+            )
+        # Make sure the `releasy` label is present even on PRs from older
+        # runs that predated label-based identification.
+        _apply_releasy_label_to_pr(config, fs.rebase_pr_url, pr_number=pr_num)
+        if fs.ai_resolved:
+            _apply_ai_label_to_pr(
+                config, fs.rebase_pr_url, pr_number=pr_num,
             )
         return
 
@@ -1274,7 +1744,11 @@ def _open_pr_for_resolved(
     _log_pr_action(outcome, pr_url)
     if pr_url:
         fs.rebase_pr_url = pr_url
+        fs.status = "needs_review"
         state.features[_feature_id_from_branch(state, branch)] = fs
+        _apply_releasy_label_to_pr(config, pr_url)
+        if fs.ai_resolved:
+            _apply_ai_label_to_pr(config, pr_url)
 
 
 def _pr_number_from_url(url: str) -> int | None:
@@ -1293,13 +1767,28 @@ def _feature_id_from_branch(state: PipelineState, branch: str) -> str:
 
 
 def continue_all(config: Config, work_dir: Path | None = None) -> bool:
-    """Process every feature in state and either finalise it or flag it.
+    """Re-check every feature in state and finish whatever can be finished.
 
-    Decisions per feature:
-      - status ok / skipped / disabled → log and skip
-      - status conflict, branch now clean → mark resolved, push, open PR
-      - status conflict, still unresolved → highlight, leave alone
-      - status resolved without PR → push, open PR
+    This is the catch-all "reconcile everything" command. Per feature:
+
+      - ``skipped`` → log and skip.
+      - ``conflict`` from an AI-gave-up partial group / dropped singleton
+        (any of ``failed_step_index`` / ``partial_pr_count`` /
+        ``rebase_pr_url`` set) → highlight; user must act on the draft
+        PR or source PR, then re-run.
+      - ``conflict``, branch now clean → push, open PR (if ``auto_pr``),
+        flip to ``needs_review`` or ``branch_created``.
+      - ``conflict``, still unresolved → highlight, leave alone.
+      - ``branch_created`` (branch on origin, no PR yet) → try to open
+        the PR. Covers the case where the previous run had
+        ``pr_sources.auto_pr: false`` and only pushed the branch, or
+        where an earlier failure prevented PR creation. Stays as
+        ``branch_created`` if PR creation is still disabled / failing.
+      - ``needs_review`` already linked to a PR → leave alone.
+
+    Always finishes with a project-board reconciliation pass so the GitHub
+    Project reflects the current state (and stale draft stubs get replaced
+    by the real PR cards).
     """
     state = load_state(config.repo_dir)
     if not state.features:
@@ -1334,6 +1823,7 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
         )
         return False
     base_ref = f"{config.origin.remote_name}/{base_branch}"
+    remote_name = config.origin.remote_name
 
     console.print(
         f"\n[bold]Continuing[/bold] — base [cyan]{base_branch}[/cyan]"
@@ -1344,20 +1834,61 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
         branch = fs.branch_name or feat_id
         header = f"\n  [cyan]{branch}[/cyan]"
 
-        if fs.status in ("ok", "skipped", "disabled"):
-            console.print(f"{header} — [dim]{fs.status}, skipping[/dim]")
+        if fs.status == "skipped":
+            console.print(f"{header} — [dim]skipped[/dim]")
             continue
 
+        # AI-gave-up flavour of conflict (partial group / dropped
+        # singleton) — these have an explicit human-action checkpoint
+        # (the draft PR or the source PR), so we never auto-flip them
+        # below; the user re-runs ``continue`` after the manual fix.
+        if fs.status == "conflict" and (
+            fs.failed_step_index is not None
+            or fs.partial_pr_count is not None
+            or fs.rebase_pr_url
+        ):
+            console.print(
+                f"{header} — [dim]conflict (AI gave up)[/dim] "
+                "— fix locally / on the draft PR, then re-run"
+            )
+            continue
+
+        # Already-finished states. ``needs_review`` is terminal (PR exists);
+        # ``branch_created`` is the "branch pushed but no PR" case, where
+        # ``releasy continue`` will try to open the PR.
+        if fs.status == "needs_review":
+            console.print(
+                f"{header} — [dim]needs-review, PR open[/dim]"
+            )
+            continue
+        if fs.status == "branch_created":
+            if not (config.push and config.pr_sources.auto_pr):
+                console.print(
+                    f"{header} — [dim]branch-created (auto_pr off, "
+                    "open PR manually)[/dim]"
+                )
+                continue
+            if not fs.branch_name or not (
+                local_branch_exists(repo_path, fs.branch_name)
+                or remote_branch_exists(repo_path, fs.branch_name, remote_name)
+            ):
+                console.print(
+                    f"{header} [yellow]branch missing (local & remote), "
+                    "skipping[/yellow]"
+                )
+                continue
+            console.print(
+                f"{header} — [green]branch-created[/green], opening PR"
+            )
+            _open_pr_for_resolved(config, repo_path, state, fs, base_branch)
+            _update_state_and_status(config, state)
+            continue
+
+        # Conflict path needs the branch locally so we can inspect / continue.
         if not fs.branch_name or not local_branch_exists(repo_path, fs.branch_name):
             console.print(
                 f"{header} [yellow]branch missing locally, skipping[/yellow]"
             )
-            continue
-
-        if fs.status == "resolved":
-            console.print(f"{header} — already resolved")
-            _open_pr_for_resolved(config, repo_path, state, fs, base_branch)
-            _update_state_and_status(config, state)
             continue
 
         if fs.status != "conflict":
@@ -1380,11 +1911,15 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
             continue
 
         console.print(f"{header} [green]✓ resolved[/green]")
-        fs.status = "resolved"
         fs.conflict_files = []
+        # Provisional — flips to needs_review inside _open_pr_for_resolved
+        # if a PR is opened (or already exists for the branch).
+        fs.status = _success_status(fs.rebase_pr_url)
         state.features[feat_id] = fs
         _open_pr_for_resolved(config, repo_path, state, fs, base_branch)
         _update_state_and_status(config, state)
+
+    _reconcile_project_board(config, state)
 
     if any_unresolved:
         console.print(
@@ -1395,6 +1930,108 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
 
     console.print("\n[green]All ports processed.[/green]")
     return True
+
+
+def sync_to_project(config: Config) -> bool:
+    """Standalone reconciliation: push current local state to the board.
+
+    Loads ``state.yaml`` from the repo and calls the same reconciliation
+    used at the end of ``releasy continue``, so the user can refresh the
+    project board without running the whole pipeline (handy after editing
+    state by hand, after rotating tokens, or right after wiring up a new
+    project URL on an in-flight rebase).
+
+    Returns False — for non-zero CLI exit — only when the user asked for a
+    sync but nothing happened: no project configured, missing token,
+    unparseable URL, or sync errors. A clean "already up to date" is
+    success.
+    """
+    if not config.notifications.github_project:
+        console.print(
+            "[yellow]No GitHub Project configured.[/yellow] Set "
+            "[cyan]notifications.github_project[/cyan] in config.yaml or "
+            "run [cyan]releasy setup-project[/cyan] first."
+        )
+        return False
+
+    state = load_state(config.repo_dir)
+    if not state.features and not config.features:
+        console.print(
+            "[yellow]Nothing to sync.[/yellow] No features in state and "
+            "no static features in config — run [cyan]releasy run[/cyan] "
+            "first."
+        )
+        return False
+
+    console.print(
+        f"\n[bold]Syncing local state[/bold] → "
+        f"[cyan]{config.notifications.github_project}[/cyan]"
+    )
+    summary = sync_project(config, state)
+
+    if summary.skipped:
+        console.print(
+            f"  [yellow]project sync skipped:[/yellow] {summary.skipped_reason}"
+        )
+        return False
+    if summary.added:
+        console.print(
+            f"  [green]✓[/green] added {summary.added} missing item(s) "
+            "to the project board"
+        )
+    if summary.updated:
+        console.print(
+            f"  [dim]refreshed {summary.updated} existing card(s)[/dim]"
+        )
+    if not summary.added and not summary.updated and not summary.errors:
+        console.print("  [dim]project board already up to date[/dim]")
+    if summary.errors:
+        console.print(
+            f"  [yellow]![/yellow] {summary.errors} item(s) could not be "
+            "synced — see warnings above"
+        )
+        return False
+    return True
+
+
+def _reconcile_project_board(config: Config, state: PipelineState) -> None:
+    """Make sure every local port is reflected on the GitHub Project board.
+
+    Per-feature state changes during the run already trigger
+    ``sync_project`` from ``_update_state_and_status`` (when ``push`` is
+    on). This is the belt-and-braces pass: even with ``push: false``, or
+    when the project URL was added to config after some ports were
+    already in state, we still want ``releasy continue`` to leave the
+    board in sync with what we have locally.
+
+    Output is a single, friendly line — quiet when there's nothing to do,
+    informative when there is.
+    """
+    if not config.notifications.github_project:
+        return
+    console.print("\n[dim]Reconciling GitHub Project board...[/dim]")
+    summary = sync_project(config, state)
+    if summary.skipped:
+        console.print(
+            f"  [yellow]project sync skipped:[/yellow] {summary.skipped_reason}"
+        )
+        return
+    if summary.added and summary.errors == 0:
+        console.print(
+            f"  [green]✓[/green] added {summary.added} missing item(s) to "
+            "the project board"
+        )
+    if summary.updated:
+        console.print(
+            f"  [dim]refreshed {summary.updated} existing card(s)[/dim]"
+        )
+    if not summary.added and not summary.updated and not summary.errors:
+        console.print("  [dim]project board already up to date[/dim]")
+    if summary.errors:
+        console.print(
+            f"  [yellow]![/yellow] {summary.errors} item(s) could not be "
+            "synced — see warnings above"
+        )
 
 
 def skip_branch(config: Config, branch_name: str) -> bool:
@@ -1426,8 +2063,14 @@ def abort_run(config: Config) -> None:
 
 
 def print_status(config: Config) -> None:
-    """Print the current pipeline state."""
+    """Print the current pipeline state, grouped by status.
+
+    One sub-table per status section (in :data:`STATUS_DISPLAY_ORDER`),
+    so the most-attention-needing entries (conflicts) surface at the top.
+    """
     from rich.table import Table
+    from releasy.state import STATUS_DISPLAY_ORDER
+    from releasy.status import STATUS_HEADINGS, STATUS_ICONS
 
     state = load_state(config.repo_dir)
 
@@ -1440,18 +2083,12 @@ def print_status(config: Config) -> None:
     if state.base_branch:
         console.print(f"Base branch: [cyan]{state.base_branch}[/cyan]")
 
-    table = Table(title="RelEasy Port Status")
-    table.add_column("Branch", style="cyan")
-    table.add_column("Status")
-    table.add_column("AI", style="magenta")
-    table.add_column("Based On")
-    table.add_column("PR")
-    table.add_column("Conflict Files", style="red")
-
-    style_map = {
-        "ok": "green", "conflict": "red", "resolved": "blue",
-        "skipped": "yellow", "disabled": "dim", "pending": "dim",
+    section_styles = {
+        "needs_review": "blue", "branch_created": "yellow",
+        "conflict": "red", "skipped": "yellow",
     }
+
+    origin_slug = get_origin_repo_slug(config)
 
     def _ai_cell(fs: FeatureState) -> str:
         if not fs.ai_resolved:
@@ -1459,39 +2096,77 @@ def print_status(config: Config) -> None:
         iters = f" ({fs.ai_iterations}×)" if fs.ai_iterations else ""
         return f"[magenta]ai-resolved[/magenta]{iters}"
 
-    for feat in config.features:
-        fs = state.features.get(feat.id)
-        if fs is None:
-            status = "disabled" if not feat.enabled else "pending"
-            table.add_row(
-                feat.source_branch or feat.id,
-                f"[dim]{status}[/dim]", "", "", "", "",
-            )
-            continue
-        label = fs.branch_name or feat.source_branch or feat.id
-        s = style_map.get(fs.status, "white")
-        pr_link = ""
-        if fs.rebase_pr_url:
-            pr_label = f"#{fs.pr_number}" if fs.pr_number else "PR"
-            pr_link = f"[link={fs.rebase_pr_url}]{pr_label}[/link]"
-        table.add_row(
-            label, f"[{s}]{fs.status}[/{s}]", _ai_cell(fs),
-            (fs.base_commit or "")[:12], pr_link,
-            ", ".join(fs.conflict_files),
-        )
+    def _pr_cell(fs: FeatureState) -> str:
+        if not fs.rebase_pr_url:
+            return ""
+        label = "PR"
+        if fs.pr_url:
+            parsed = parse_pr_url(fs.pr_url)
+            if parsed:
+                owner, repo, n = parsed
+                label = pr_ref_label(f"{owner}/{repo}", n, origin_slug)
+        elif fs.pr_number:
+            label = f"#{fs.pr_number}"
+        return f"[link={fs.rebase_pr_url}]{label}[/link]"
 
+    if not state.features:
+        console.print("\n[dim]No ports tracked yet.[/dim]")
+        return
+
+    by_status: dict[str, list[tuple[str, FeatureState]]] = {}
     for fid, fs in state.features.items():
-        if any(f.id == fid for f in config.features):
-            continue
-        label = fs.branch_name or fid
-        s = style_map.get(fs.status, "white")
-        pr_link = ""
-        if fs.rebase_pr_url:
-            pr_link = f"[link={fs.rebase_pr_url}]PR[/link]"
-        table.add_row(
-            label, f"[{s}]{fs.status}[/{s}]", _ai_cell(fs),
-            (fs.base_commit or "")[:12], pr_link,
-            ", ".join(fs.conflict_files),
-        )
+        by_status.setdefault(fs.status, []).append((fid, fs))
 
-    console.print(table)
+    ordered = [s for s in STATUS_DISPLAY_ORDER if s in by_status]
+    ordered.extend(sorted(s for s in by_status if s not in STATUS_DISPLAY_ORDER))
+
+    summary_parts = [
+        f"{len(by_status[s])} {STATUS_ICONS.get(s, s)}"
+        for s in ordered
+    ]
+    console.print(f"\n[bold]Summary:[/bold] {'  ·  '.join(summary_parts)}")
+
+    for status in ordered:
+        rows = by_status[status]
+        style = section_styles.get(status, "white")
+        heading = STATUS_HEADINGS.get(status, status)
+        icon = STATUS_ICONS.get(status, status)
+        table = Table(
+            title=f"[{style}]{icon} — {heading} ({len(rows)})[/{style}]",
+            title_justify="left",
+            show_header=True,
+        )
+        table.add_column("Branch", style="cyan")
+        table.add_column("AI", style="magenta")
+        table.add_column("Based On")
+        table.add_column("Source PR")
+        table.add_column("Rebase PR")
+        if status == "conflict":
+            table.add_column("Conflict Files", style="red")
+        for fid, fs in rows:
+            feat = next((f for f in config.features if f.id == fid), None)
+            label = fs.branch_name or (feat.source_branch if feat else None) or fid
+            source_pr = ""
+            if fs.pr_url:
+                parsed = parse_pr_url(fs.pr_url)
+                if parsed:
+                    owner, repo, n = parsed
+                    source_pr = (
+                        f"[link={fs.pr_url}]"
+                        f"{pr_ref_label(f'{owner}/{repo}', n, origin_slug)}"
+                        f"[/link]"
+                    )
+                elif fs.pr_number:
+                    source_pr = f"[link={fs.pr_url}]#{fs.pr_number}[/link]"
+            row = [
+                label,
+                _ai_cell(fs),
+                (fs.base_commit or "")[:12],
+                source_pr,
+                _pr_cell(fs),
+            ]
+            if status == "conflict":
+                row.append(", ".join(fs.conflict_files))
+            table.add_row(*row)
+        console.print()
+        console.print(table)

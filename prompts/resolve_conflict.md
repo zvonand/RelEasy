@@ -1,13 +1,13 @@
 # Claude skill: resolve a RelEasy port cherry-pick conflict
 
-You are an autonomous agent resolving a git cherry-pick conflict in a ClickHouse fork at `{repo_slug}`.
+You are an autonomous agent resolving a git cherry-pick conflict in `{repo_slug}`.
 
 The repository at `{cwd}` is already prepared for you:
 
 - Current branch: `{port_branch}` (already checked out).
 - A cherry-pick is **in progress** and has hit conflict markers.
 - The target base branch is `{base_branch}` (exists on origin).
-- The port is of upstream PR [{source_pr_url}]({source_pr_url}) — "{source_pr_title}".
+- The port is of source PR [{source_pr_url}]({source_pr_url}) — "{source_pr_title}".
 
 > **NOTE:** This is one step of a larger pipeline. Your job ends after the
 > conflict is resolved, the build succeeds, and the cherry-pick has been
@@ -26,7 +26,7 @@ The repository at `{cwd}` is already prepared for you:
 ## Task — execute these steps in order, without asking for confirmation
 
 1. **Resolve the conflicts** in each of the listed files. Preserve the intent of
-   the upstream PR. Do not introduce unrelated changes. Read the surrounding
+   the source PR. Do not introduce unrelated changes. Read the surrounding
    code to understand the merge context before editing.
 2. **Stage** only the conflicted files or files modified when resolving conflicts: `git add <file> <file> ...`.
    Do not `git add -A` — avoid accidentally committing build artefacts.
@@ -70,7 +70,7 @@ The repository at `{cwd}` is already prepared for you:
 
 - You are only allowed to touch branch `{port_branch}`. Never check out, push, or delete any other branch.
 - **Never push.** Never run `git push`, `gh pr create`, `gh pr edit`, or any other command that mutates the remote. RelEasy will push and open the PR after you finish.
-- Never force-push to `{base_branch}` or any upstream/protected branch.
+- Never force-push to `{base_branch}` or any protected branch.
 - Never amend or rewrite commits that already exist on `origin/{base_branch}`.
 - Do not run `git reset --hard` against any remote ref.
 - Never write log files yourself; the only build log is `{build_log}`, and it is produced by the wrapper script — you only ever read it.

@@ -54,7 +54,7 @@ def run_git(
 
 
 def ensure_work_repo(config: Config, work_dir: Path) -> tuple[Path, bool]:
-    """Ensure a local clone of the origin repo exists and has the right remotes.
+    """Ensure a local clone of the origin repo exists and has the right remote.
 
     If work_dir itself is a git repo, it is used directly.
     Otherwise, a clone is created at work_dir/repo.
@@ -71,22 +71,15 @@ def ensure_work_repo(config: Config, work_dir: Path) -> tuple[Path, bool]:
         work_dir.mkdir(parents=True, exist_ok=True)
         run_git(["clone", config.origin.remote, "repo"], work_dir)
         freshly_cloned = True
-        if config.upstream:
-            run_git(
-                ["remote", "add", config.upstream.remote_name, config.upstream.remote],
-                repo_path,
-                check=False,
-            )
     else:
-        remotes: list[tuple[str, str]] = [
-            (config.origin.remote_name, config.origin.remote),
-        ]
-        if config.upstream:
-            remotes.append((config.upstream.remote_name, config.upstream.remote))
-        for rname, rurl in remotes:
-            result = run_git(["remote", "get-url", rname], repo_path, check=False)
-            if result.returncode != 0:
-                run_git(["remote", "add", rname, rurl], repo_path, check=False)
+        result = run_git(
+            ["remote", "get-url", config.origin.remote_name], repo_path, check=False,
+        )
+        if result.returncode != 0:
+            run_git(
+                ["remote", "add", config.origin.remote_name, config.origin.remote],
+                repo_path, check=False,
+            )
 
     return repo_path, freshly_cloned
 
@@ -109,8 +102,6 @@ def fetch_remote(repo_path: Path, remote_name: str) -> None:
 
 
 def fetch_all(config: Config, repo_path: Path) -> None:
-    if config.upstream:
-        fetch_remote(repo_path, config.upstream.remote_name)
     fetch_remote(repo_path, config.origin.remote_name)
 
 
@@ -207,16 +198,15 @@ def ref_exists_locally(repo_path: Path, ref: str) -> bool:
     return result.returncode == 0
 
 
-def force_push(
-    repo_path: Path, branch: str, remote: str, *, upstream_name: str | None = None,
-) -> None:
-    """Push a branch to a remote. Refuses to push to the upstream remote."""
-    if upstream_name and remote == upstream_name:
-        raise ValueError(
-            f"CRITICAL: Refusing to push to upstream remote '{remote}'. "
-            "Pushes must only target the origin."
-        )
-    run_git(["push", "--force", remote, branch], repo_path)
+def force_push(repo_path: Path, branch: str, config: Config) -> None:
+    """Force-push a branch **to the origin remote**.
+
+    By construction this is the *only* push path RelEasy uses for the
+    work repo; there is no parameter to point it at a different remote.
+    Any future code that wants to push elsewhere has to be added
+    explicitly — it can't happen by accident through this helper.
+    """
+    run_git(["push", "--force", config.origin.remote_name, branch], repo_path)
 
 
 def get_branch_tip(repo_path: Path, ref: str) -> str:
@@ -415,15 +405,31 @@ def merge_squash_ref(
 # ---------------------------------------------------------------------------
 
 
-def fetch_pr_ref(repo_path: Path, remote: str, pr_number: int) -> bool:
+def fetch_pr_ref(repo_path: Path, remote_or_url: str, pr_number: int) -> bool:
     """Fetch a PR's merge ref from GitHub (needed for open PRs).
+
+    ``remote_or_url`` can be either a configured remote name or a full
+    git URL (e.g. ``https://github.com/owner/repo.git``) — the latter
+    is used for cross-repo PR sources.
 
     Returns True if the merge ref was fetched successfully.
     """
     result = run_git(
-        ["fetch", remote, f"refs/pull/{pr_number}/merge"],
+        ["fetch", remote_or_url, f"refs/pull/{pr_number}/merge"],
         repo_path,
         check=False,
+    )
+    return result.returncode == 0
+
+
+def fetch_commit(repo_path: Path, remote_or_url: str, sha: str) -> bool:
+    """Fetch a single commit by SHA from a remote name or URL.
+
+    Useful when cherry-picking a merged PR from a foreign repo whose
+    commit isn't yet in the local clone.
+    """
+    result = run_git(
+        ["fetch", remote_or_url, sha], repo_path, check=False,
     )
     return result.returncode == 0
 

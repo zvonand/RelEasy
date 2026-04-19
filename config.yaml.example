@@ -4,18 +4,21 @@
 # push: true
 
 # ── Conflict handling ───────────────────────────────────────────────
-# When a cherry-pick conflicts and the AI resolver doesn't (or can't)
-# fix it:
-#   false (default) — stop the pipeline, leave the working tree dirty
-#                     with the in-progress cherry-pick so you can resolve
-#                     it manually. After resolving, run:
-#                       git add -A && git cherry-pick --continue
-#                       releasy continue --branch <branch>
-#                       releasy run     # to resume with remaining PRs
-#   true            — commit conflict markers as a WIP, push, and open a
-#                     "needs resolution" PR. Lets the pipeline continue
-#                     to the next PR.
-# wip_commit_on_conflict: false
+# When a cherry-pick conflicts and the AI resolver is disabled or gives
+# up (after exhausting `ai_resolve.max_iterations` build attempts), the
+# pipeline:
+#   * Singleton PR or first-of-group: aborts the cherry-pick, deletes the
+#     local port branch (it has no useful commits), records the entry as
+#     "Conflict" in the GitHub Project. No push, no PR.
+#   * Group with N>=1 successful prior picks: aborts the failed pick,
+#     pushes the branch as-is, opens a DRAFT PR labelled
+#     `ai-needs-attention` with a banner explaining what failed, and
+#     records "Conflict" in the GitHub Project. Remaining PRs in
+#     the group are not attempted.
+# Either way the pipeline keeps going with the next unit.
+#
+# `wip_commit_on_conflict` is no longer supported. If present in this
+# file, releasy logs a warning and ignores it.
 
 # ── Existing-PR behaviour ───────────────────────────────────────────
 # When a PR for the port branch already exists on GitHub:
@@ -26,9 +29,9 @@
 #   true            — reuse the same PR but overwrite its title and body
 #                     with what releasy would have set (source-PR refs,
 #                     combined group body, ai-resolved prefix, …). Handy
-#                     when upstream PR descriptions changed or you
-#                     tweaked the body format and want the rebase PR to
-#                     reflect it.
+#                     when source PR descriptions changed or you tweaked
+#                     the body format and want the rebase PR to reflect
+#                     it.
 # update_existing_prs: false
 
 # ── Work directory ──────────────────────────────────────────────────
@@ -39,17 +42,11 @@
 # work_dir: /path/to/ClickHouse
 
 # ── Origin (required) ──────────────────────────────────────────────
-# The fork / repo you work against. This is mandatory.
+# The repo you work against. This is the only repo RelEasy tracks
+# as a configured remote.
 origin:
   remote: https://github.com/Altinity/ClickHouse.git
   remote_name: origin
-
-# ── Upstream (optional) ────────────────────────────────────────────
-# The upstream repo. Omit this section entirely if you're forward-porting
-# or back-porting within your own fork and there's no separate upstream.
-upstream:
-  remote: https://github.com/ClickHouse/ClickHouse.git
-  remote_name: upstream
 
 # ── Project & target branch ────────────────────────────────────────
 # Short project identifier — used to name port branches as
@@ -71,7 +68,7 @@ target_branch: antalya-26.3
 
 # ── Static feature branches ────────────────────────────────────────
 # Each feature is rebased onto the base branch as a separate branch.
-# PRs can be auto-created into the base branch (if push + auto_pr).
+# PRs can be auto-created into the base branch (if push + pr_sources.auto_pr).
 features:
   - id: s3-disk
     description: "Custom S3 disk improvements"
@@ -108,18 +105,27 @@ features:
 #   must carry ALL listed labels). Multiple entries are unioned.
 #   Per-entry options:
 #     merged_only: true — skip open PRs, only cherry-pick merged ones.
-#     auto_pr: true — auto-create a PR into the base branch (needs push: true).
 #     if_exists: skip|recreate — overrides pr_sources.if_exists for this group.
 #     description: prefix prepended to the PR title for the feature name.
+#
+# auto_pr is global (top-level under pr_sources, default true): when true
+#   every pushed port branch — singleton, by_labels, include_prs, or
+#   group — gets a PR opened against the base. Set to false to push
+#   branches only and open PRs manually. Requires push: true.
 #
 # exclude_labels — drop any PR carrying at least one of these labels,
 #   even if it matched a by_labels entry.
 #
 # include_prs — always include these PRs by URL, even if they don't
-#   match any labels or carry an excluded label.
+#   match any labels or carry an excluded label. URLs may point to ANY
+#   public GitHub repo (not just origin); cross-repo PRs are fetched
+#   directly from the URL — no extra git remote is added. Their port
+#   branches get a slug-prefixed name (feature/<base>/<owner>-<repo>-pr-<N>)
+#   so a same-numbered origin PR can never clash.
 #
 # exclude_prs — always exclude these PRs by URL. Final override —
-#   a PR listed here is never processed.
+#   a PR listed here is never processed. Matched by full owner/repo/number,
+#   so excluding e.g. ClickHouse/ClickHouse#42 won't drop Altinity/ClickHouse#42.
 #
 # if_exists — what to do with stale local state from a previous run:
 #     "skip" (default) — leave the local branch alone, don't re-process.
@@ -139,11 +145,11 @@ features:
 #
 # pr_sources:
 #   if_exists: skip
+#   # auto_pr: true        # default; set false to push branches without opening PRs
 #   by_labels:
 #     - labels: ["forward-port", "v26.1"]
 #       description: "Forward-ported changes"
 #       merged_only: true
-#       auto_pr: true
 #       # if_exists: recreate    # override per-group
 #
 #   exclude_labels: ["do-not-port", "wontfix"]
@@ -151,6 +157,8 @@ features:
 #   include_prs:
 #     - https://github.com/Altinity/ClickHouse/pull/123
 #     - https://github.com/Altinity/ClickHouse/pull/456
+#     # Cross-repo PR — fetched directly from the source repo by URL.
+#     - https://github.com/ClickHouse/ClickHouse/pull/12345
 #
 #   exclude_prs:
 #     - https://github.com/Altinity/ClickHouse/pull/789
@@ -179,7 +187,6 @@ features:
 #         - https://github.com/Altinity/ClickHouse/pull/1500   # base change
 #         - https://github.com/Altinity/ClickHouse/pull/1512   # follow-up
 #         - https://github.com/Altinity/ClickHouse/pull/1530   # final fix
-#       # auto_pr: true       # default; set false to skip combined PR
 #       # if_exists: skip     # override the global pr_sources.if_exists
 
 # ── GitHub Project board ────────────────────────────────────────────
@@ -199,6 +206,37 @@ features:
 notifications:
   github_project: https://github.com/orgs/Altinity/projects/1
 
+# ── AI conflict resolver (Claude) ───────────────────────────────────
+# Optional. When enabled, releasy invokes `claude` to resolve cherry-
+# pick conflicts, build, and commit. If Claude prints UNRESOLVED or
+# BUILD FAILED (after exhausting `max_iterations` build attempts) or
+# fails outright, releasy treats the unit as "Conflict" — see
+# the "Conflict handling" section above.
+#
+# ai_resolve:
+#   enabled: false
+#   command: claude
+#   prompt_file: prompts/resolve_conflict.md
+#   # Hard cap (passed into the prompt) on how many build attempts
+#   # Claude is allowed to make per conflict before giving up.
+#   max_iterations: 5
+#   timeout_seconds: 7200
+#   build_command: cd build && ninja
+#   # Label automatically applied to PRs whose conflicts Claude
+#   # resolved cleanly.
+#   label: ai-resolved
+#   label_color: "8B5CF6"
+#   # Label applied to DRAFT PRs released by partial-group failures
+#   # (singleton failures don't get a PR — the local branch is dropped).
+#   needs_attention_label: ai-needs-attention
+#   needs_attention_label_color: "D93F0B"
+#   # How many times to re-invoke Claude when the Anthropic streaming
+#   # API drops the turn with a transient error (idle timeout, overload,
+#   # connection reset, …). Each retry is a fresh turn — independent of
+#   # `max_iterations`.
+#   api_retries: 3
+#   api_retry_backoff_seconds: 15
+
 # ─────────────────────────────────────────────────────────────────────
 # WORKFLOW
 #
@@ -208,13 +246,15 @@ notifications:
 #   releasy run --onto v26.3.4.234-lts   # (or just: releasy run, when
 #                                        #  target_branch is set above)
 #   → creates "feature/antalya-26.3/<id>" for each PR / feature
-#   → opens PRs into antalya-26.3 (if push + auto_pr)
+#   → opens PRs into antalya-26.3 (if push + pr_sources.auto_pr)
 #
-# On conflict:
-#   cd <work_dir>
-#   # resolve conflicts
-#   git add <files> && git cherry-pick --continue
-#   releasy continue --branch <name>
+# On unresolved conflict:
+#   * Singleton / first-of-group: nothing local survives — the entry is
+#     marked "Conflict" in the GitHub Project. Resolve manually
+#     in the source PR and re-run releasy.
+#   * Partial group: a draft PR is opened, labelled `ai-needs-attention`.
+#     Fix the conflict on that branch, push, mark the PR ready.
 #
-# Then run again to resume from where it stopped.
+# The pipeline never stalls on a single bad unit anymore — it just
+# flags it and moves on.
 # ─────────────────────────────────────────────────────────────────────

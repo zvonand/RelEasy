@@ -26,7 +26,7 @@ def _load_config_or_exit(config_path: str | None = None) -> "Config":
 @click.option("--config", "config_path", default=None, help="Path to config.yaml")
 @click.pass_context
 def cli(ctx: click.Context, config_path: str | None) -> None:
-    """RelEasy — manage fork rebases and release construction."""
+    """RelEasy — manage port branches and release construction."""
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config_path
 
@@ -38,8 +38,10 @@ def cli(ctx: click.Context, config_path: str | None) -> None:
 @click.option(
     "--onto",
     default=None,
-    help="Upstream ref/tag used to derive the base branch name "
-         "(<project>-<version>). Not needed when 'target_branch' is set in config.",
+    help="Version label used to derive the base branch name "
+         "(<project>-<version>). Just a string — never resolved as a git "
+         "ref; the base branch must already exist on origin. Not needed "
+         "when 'target_branch' is set in config.",
 )
 @click.option("--work-dir", default=None, help="Working directory for git operations")
 @click.option(
@@ -81,14 +83,16 @@ def run(
 @click.option(
     "--branch",
     default=None,
-    help="Branch or feature ID to mark resolved. If omitted, processes "
-         "every port in state: pushes + opens PRs for resolved ones, "
-         "highlights any still-unresolved conflicts.",
+    help="Branch or feature ID to mark resolved. If omitted, reconciles "
+         "every port in state: opens PRs for any clean branch that lacks "
+         "one (e.g. previous run had auto_pr off), pushes + opens PRs for "
+         "newly-resolved conflicts, highlights any still-unresolved ones, "
+         "and refreshes the GitHub Project board.",
 )
 @click.option("--work-dir", default=None, help="Working directory for git operations")
 @click.pass_context
 def continue_cmd(ctx: click.Context, branch: str | None, work_dir: str | None) -> None:
-    """Continue after manual conflict resolution."""
+    """Continue after manual conflict resolution / open any missing PRs."""
     from releasy.pipeline import continue_all, continue_branch
 
     config = _load_config_or_exit(ctx.obj["config_path"])
@@ -137,7 +141,11 @@ def status(ctx: click.Context) -> None:
 
 
 @cli.command()
-@click.option("--upstream-tag", required=True, help="Upstream tag to base release on")
+@click.option(
+    "--base-tag", "base_tag", required=True,
+    help="Tag/ref to base the release on (must be present locally or "
+         "fetchable from origin)",
+)
 @click.option("--name", required=True, help="Release branch name")
 @click.option("--strict", is_flag=True, help="Abort if any enabled feature is not ok")
 @click.option("--include-skipped", is_flag=True, help="Include skipped features in release")
@@ -145,18 +153,18 @@ def status(ctx: click.Context) -> None:
 @click.pass_context
 def release(
     ctx: click.Context,
-    upstream_tag: str,
+    base_tag: str,
     name: str,
     strict: bool,
     include_skipped: bool,
     work_dir: str | None,
 ) -> None:
-    """Create release base branch + per-feature PRs from an upstream tag."""
+    """Create release base branch + per-feature PRs from a tag/ref."""
     from releasy.release import build_release
 
     config = _load_config_or_exit(ctx.obj["config_path"])
     wd = Path(work_dir) if work_dir else None
-    if not build_release(config, upstream_tag, name, strict, include_skipped, wd):
+    if not build_release(config, base_tag, name, strict, include_skipped, wd):
         raise SystemExit(1)
 
 
@@ -171,20 +179,49 @@ def setup_project_cmd(ctx: click.Context) -> None:
     If notifications.github_project is set in config, verifies the project
     and its Status field. Otherwise, creates a new project and prints the URL
     to add to config.
+
+    The Status field is fully owned by RelEasy: any options that aren't
+    in the canonical set (Needs Review, Branch Created, Conflict,
+    Skipped) get dropped on every run. After dropping orphan options,
+    this command also triggers a project sync so any cards that were
+    sitting on a now-removed option get re-assigned to the right Status
+    based on local state.
     """
     from releasy.github_ops import setup_project
+    from releasy.pipeline import sync_to_project
 
     config = _load_config_or_exit(ctx.obj["config_path"])
     url = setup_project(config)
-    if url:
-        click.echo(f"Project ready: {url}")
-        if not config.notifications.github_project:
-            click.echo(
-                f"\nAdd this to your config.yaml:\n\n"
-                f"notifications:\n"
-                f"  github_project: {url}\n"
-            )
-    else:
+    if not url:
+        raise SystemExit(1)
+    click.echo(f"Project ready: {url}")
+    if not config.notifications.github_project:
+        click.echo(
+            f"\nAdd this to your config.yaml:\n\n"
+            f"notifications:\n"
+            f"  github_project: {url}\n"
+        )
+        # No project URL in config yet → nothing to sync against.
+        return
+    # Re-sync items so anything that was sitting on a dropped option
+    # (e.g. legacy "Ok" / "Resolved") lands on the right Status.
+    sync_to_project(config)
+
+
+@cli.command(name="sync-project")
+@click.pass_context
+def sync_project_cmd(ctx: click.Context) -> None:
+    """Push the current local state to the GitHub Project board.
+
+    Reads state.yaml and reconciles every known feature with the
+    configured project: attaches any missing PR cards, refreshes existing
+    ones, and updates their Status field. No git operations, no PRs —
+    just the project board.
+    """
+    from releasy.pipeline import sync_to_project
+
+    config = _load_config_or_exit(ctx.obj["config_path"])
+    if not sync_to_project(config):
         raise SystemExit(1)
 
 

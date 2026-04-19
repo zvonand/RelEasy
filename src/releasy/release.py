@@ -1,6 +1,7 @@
 """Release branch construction — PR-per-feature workflow.
 
-Creates a base release branch directly from an upstream tag, then for each
+Creates a base release branch directly from a tag (resolved against the
+origin remote, or the local repo if already present), then for each
 enabled feature creates a separate branch with a single squashed commit
 and opens a GitHub PR targeting the release branch.
 """
@@ -70,7 +71,7 @@ def _build_pr_body(
 
 def build_release(
     config: Config,
-    upstream_tag: str,
+    base_tag: str,
     branch_name: str,
     strict: bool = False,
     include_skipped: bool = False,
@@ -80,7 +81,7 @@ def build_release(
 
     Steps:
     1. Pre-flight checks on feature status
-    2. Create release base branch directly from upstream tag
+    2. Create release base branch directly from the given tag/ref
     3. Push the base branch
     4. For each feature: create a branch with squashed commit, push, open PR
     """
@@ -139,36 +140,31 @@ def build_release(
     console.print(f"[dim]Repo: {repo_path}[/dim]")
 
     from releasy.git_ops import fetch_remote, ref_exists_locally
-    if ref_exists_locally(repo_path, upstream_tag):
-        console.print(f"[dim]{upstream_tag} found locally — skipping upstream fetch[/dim]")
-    elif config.upstream:
-        console.print(f"Fetching [cyan]{config.upstream.remote_name}[/cyan]...", end=" ")
-        fetch_remote(repo_path, config.upstream.remote_name)
-        console.print("[green]done[/green]")
-
     console.print(f"Fetching [cyan]{config.origin.remote_name}[/cyan]...", end=" ")
     fetch_remote(repo_path, config.origin.remote_name)
     console.print("[green]done[/green]")
 
     console.print(
         f"\n[bold]Creating release branch[/bold] [cyan]{branch_name}[/cyan] "
-        f"from tag [yellow]{upstream_tag}[/yellow]"
+        f"from tag [yellow]{base_tag}[/yellow]"
     )
 
-    tag_sha = resolve_ref(repo_path, upstream_tag)
+    tag_sha = resolve_ref(repo_path, base_tag)
     if tag_sha is None:
-        console.print(f"[red]Tag {upstream_tag} not found[/red]")
+        console.print(
+            f"[red]Tag {base_tag} not found[/red] — fetch it into "
+            f"[cyan]{config.origin.remote_name}[/cyan] first."
+        )
         return False
+    if not ref_exists_locally(repo_path, base_tag):
+        console.print(f"[dim]{base_tag} resolved from {config.origin.remote_name}[/dim]")
 
     create_branch_from_ref(repo_path, branch_name, tag_sha)
     console.print(f"  [green]✓[/green] Branch created at {tag_sha[:12]}")
 
     if config.push:
         console.print(f"\n[bold]Pushing base branch[/bold] [cyan]{branch_name}[/cyan]")
-        force_push(
-            repo_path, branch_name, config.origin.remote_name,
-            upstream_name=config.upstream.remote_name if config.upstream else None,
-        )
+        force_push(repo_path, branch_name, config)
         console.print("  [green]✓[/green] Pushed")
     else:
         console.print("\n[dim]Skipping push of base branch (push not enabled)[/dim]")
@@ -236,10 +232,7 @@ def build_release(
 
         pr_url = None
         if config.push:
-            force_push(
-                repo_path, feat_pr_branch, config.origin.remote_name,
-                upstream_name=config.upstream.remote_name if config.upstream else None,
-            )
+            force_push(repo_path, feat_pr_branch, config)
             console.print(f"    [green]✓[/green] Pushed ({n_feat} commits squashed into 1)")
 
             original_body = fs.pr_body if fs.pr_body else None
@@ -266,7 +259,7 @@ def build_release(
         run_git(["checkout", branch_name], repo_path)
 
     console.print(f"\n[bold]Release summary for [cyan]{branch_name}[/cyan][/bold]")
-    console.print(f"  Base: {upstream_tag}")
+    console.print(f"  Base: {base_tag}")
 
     if pr_results:
         console.print("  Feature PRs:")
