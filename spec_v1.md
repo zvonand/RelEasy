@@ -1,5 +1,19 @@
 # RelEasy — Specification (v1)
 
+> **Outdated.** This document describes the original single-project,
+> in-repo-state design. RelEasy now supports multiple concurrent
+> projects per machine: each `config.yaml` carries a unique `name:`,
+> pipeline state lives outside the repo under
+> `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml`, there
+> is no `STATUS.md`, and a per-project lock keeps concurrent runs of
+> the same project serialized.
+>
+> See [README.md](README.md) for the current behaviour, including the
+> `releasy new` / `releasy list` / `releasy where` / `releasy adopt`
+> commands. The branch-naming, pipeline-phase, and PR-discovery design
+> below is still accurate; the "Repository Layout" and "State" sections
+> are not.
+
 ## 1. Overview
 
 A standalone CLI tool that ports features and PRs onto a stable **base branch** on origin. Rather than rebasing long-lived branches in place, each feature / PR is cherry-picked onto its own port branch (`feature/<base>/<id>`) and optionally opened as a PR. RelEasy tracks a single repo (`origin`); PRs from other repos can still be ported by listing their full URLs in `pr_sources.include_prs` / `pr_sources.groups[].prs`.

@@ -1,12 +1,13 @@
-"""``releasy import`` — rebuild ``state.yaml`` from GitHub.
+"""``releasy import`` — rebuild the per-project state file from GitHub.
 
-State never leaves a local ``state.yaml`` on disk (it's gitignored), so
-a fresh clone / new teammate / throwaway CI runner starts with nothing.
-Everything RelEasy actually *needs* to keep running (source PRs,
-rebase PRs, mergeability) is discoverable from GitHub, and the fields
-that aren't (``Skipped`` decisions, cumulative ``AI Cost``) live on the
-configured GitHub Project board. This module stitches those two reads
-together into a local ``state.yaml`` + ``STATUS.md``.
+The per-project state lives under ``$XDG_STATE_HOME/releasy/<name>.state.yaml``
+and isn't shared between machines, so a fresh checkout / new teammate /
+throwaway CI runner starts with nothing. Everything RelEasy actually
+*needs* to keep running (source PRs, rebase PRs, mergeability) is
+discoverable from GitHub, and the fields that aren't (``Skipped``
+decisions, cumulative ``AI Cost``) live on the configured GitHub
+Project board. This module stitches those two reads together into the
+local state file.
 
 Scope (deliberately narrow):
 
@@ -47,7 +48,6 @@ from releasy.github_ops import (
     pr_ref_label,
 )
 from releasy.state import FeatureState, PipelineState, load_state, save_state
-from releasy.status import write_status_md
 
 console = Console()
 
@@ -117,7 +117,7 @@ def _extract_feature_id_from_draft_title(title: str) -> str | None:
 
 
 def import_from_github(config: Config) -> bool:
-    """Rebuild ``state.yaml`` by reading back PRs + the project board.
+    """Rebuild the per-project state file by reading back PRs + the project board.
 
     Returns ``True`` on success. Returns ``False`` (caller propagates to a
     non-zero exit) when a precondition is missing: no token, no project
@@ -125,7 +125,7 @@ def import_from_github(config: Config) -> bool:
 
     The command is additive / idempotent: running it twice on a clean
     state produces the same file both times, and running it on top of a
-    hand-edited ``state.yaml`` only changes fields that the remote side
+    hand-edited state file only changes fields that the remote side
     is authoritative for.
     """
     if not get_github_token():
@@ -161,9 +161,9 @@ def import_from_github(config: Config) -> bool:
         )
         # Not a hard error — a legitimately empty board is possible (all
         # work has moved on to a different base). Fall through so we
-        # still refresh STATUS.md from whatever state already exists.
+        # still refresh state from whatever already exists.
 
-    state = load_state(config.repo_dir)
+    state = load_state(config)
     had_prior_state = bool(state.features)
 
     base_branch = state.base_branch
@@ -309,12 +309,11 @@ def import_from_github(config: Config) -> bool:
             (feature_id, kind, " — ".join(note_parts))
         )
 
-    save_state(state, config.repo_dir)
-    write_status_md(config, state)
+    save_state(state, config)
 
     _print_summary(summary)
     console.print(
-        "\n[green]Wrote state.yaml + STATUS.md.[/green]  "
+        f"\n[green]Wrote state to {config.state_path}.[/green]  "
         "Run [cyan]releasy refresh[/cyan] to re-probe merge conflicts, "
         "or [cyan]releasy continue[/cyan] to reconcile the project board."
     )
@@ -370,7 +369,7 @@ def _merge_preserving_local(
     """Fold local-only fields from ``existing`` into ``new_fs`` in place.
 
     ``new_fs`` is the freshly-built state from GitHub; ``existing`` is
-    whatever was already in ``state.yaml``. We want to keep the remote
+    whatever was already in the local state file. We want to keep the remote
     side authoritative for anything it knows about (status, rebase PR
     URL, source-PR metadata, AI cost) while preserving the bookkeeping
     the remote can't see:

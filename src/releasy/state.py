@@ -1,4 +1,21 @@
-"""Pipeline state management — read/write state.yaml."""
+"""Pipeline state management — read/write per-project state files.
+
+State no longer lives in the user's repo dir. Each project (identified
+by ``Config.name``) gets its own state file under
+``state_root() / "<name>.state.yaml"`` (XDG state location by default,
+overridable via ``$RELEASY_STATE_DIR``).
+
+The state file additionally carries the absolute ``config_path`` of the
+config that owns it, so we can:
+
+  * surface a friendly listing in ``releasy list``,
+  * detect "wait, this state belongs to a different config.yaml"
+    collisions when somebody copies a config without changing ``name:``.
+
+Use :func:`verify_ownership` before mutating; use :func:`adopt_ownership`
+to forcibly rebind state to the current config (the ``releasy adopt``
+command).
+"""
 
 from __future__ import annotations
 
@@ -9,6 +26,8 @@ from typing import Literal
 
 import yaml
 
+from releasy.config import Config, state_file_path
+
 BranchStatus = Literal[
     "needs_review",
     "branch_created",
@@ -18,8 +37,8 @@ BranchStatus = Literal[
 PipelinePhase = Literal["init", "ports_done"]
 
 
-# Order in which status groups are shown to humans (STATUS.md sections,
-# `releasy status` sub-tables). Highest-attention first.
+# Order in which status groups are shown to humans (``releasy status``
+# sub-tables, ``releasy list`` summary). Highest-attention first.
 STATUS_DISPLAY_ORDER: tuple[str, ...] = (
     "conflict",
     "branch_created",
@@ -28,26 +47,33 @@ STATUS_DISPLAY_ORDER: tuple[str, ...] = (
 )
 
 
-# Legacy values older state files (or older code paths) may carry.
-#   ok / resolved / pending / disabled  → ``needs_review``
-#                                         (catch-all "port done, human
-#                                         needs to review the PR" state;
-#                                         ``ai_resolved`` carries the
-#                                         AI-was-involved signal).
-#   needs_resolution                    → ``conflict``
-#                                         (used to be a separate "AI
-#                                         gave up" state; it's just an
-#                                         unresolved conflict — the
-#                                         ``failed_step_index`` /
-#                                         ``partial_pr_count`` fields
-#                                         still describe how it failed).
-_LEGACY_STATUS_ALIASES = {
-    "ok": "needs_review",
-    "resolved": "needs_review",
-    "pending": "needs_review",
-    "disabled": "needs_review",
-    "needs_resolution": "conflict",
-}
+# Most recent ``config_path`` history entries to keep in the state file.
+# Trimmed to a small window — the field is mostly an audit trail for
+# users who move a config repeatedly; nobody needs the full history.
+_CONFIG_PATH_HISTORY_MAX = 8
+
+
+class OwnershipCollisionError(Exception):
+    """Raised when a state file is owned by a different config than the one loaded."""
+
+    def __init__(
+        self,
+        name: str,
+        state_path: Path,
+        loaded_config: Path,
+        stored_config: Path,
+    ) -> None:
+        self.name = name
+        self.state_path = state_path
+        self.loaded_config = loaded_config
+        self.stored_config = stored_config
+        super().__init__(
+            f"Project name {name!r} is already tracked at "
+            f"{stored_config}, but you ran releasy with config "
+            f"{loaded_config}. Either pick a different 'name:' in the "
+            f"new config, delete the old config, or run "
+            f"`releasy adopt` to rebind state to the new config."
+        )
 
 
 @dataclass
@@ -93,6 +119,9 @@ class PipelineState:
     phase: PipelinePhase = "init"
     base_branch: str | None = None
     features: dict[str, FeatureState] = field(default_factory=dict)
+    # Provenance (filled by load_state / save_state, not user-visible config):
+    config_path: str | None = None
+    config_path_history: list[str] = field(default_factory=list)
 
     def set_started(self, onto: str) -> None:
         self.started_at = datetime.now(timezone.utc).isoformat()
@@ -105,32 +134,14 @@ class PipelineState:
         )
 
 
-def load_state(repo_dir: Path | None = None) -> PipelineState:
-    """Load pipeline state from state.yaml, returning empty state if file doesn't exist."""
-    if repo_dir is None:
-        repo_dir = Path.cwd()
-    state_path = repo_dir / "state.yaml"
-
-    if not state_path.exists():
-        return PipelineState()
-
-    with open(state_path) as f:
-        raw = yaml.safe_load(f)
-
-    if not raw or "last_run" not in raw:
-        return PipelineState()
-
-    run = raw["last_run"]
-
+def _parse_features(raw_features: dict) -> dict[str, FeatureState]:
     features: dict[str, FeatureState] = {}
-    for fid, fraw in run.get("features", {}).items():
-        raw_status = fraw.get("status", "needs_review")
-        status = _LEGACY_STATUS_ALIASES.get(raw_status, raw_status)
+    for fid, fraw in (raw_features or {}).items():
         features[fid] = FeatureState(
-            status=status,
+            status=fraw.get("status", "needs_review"),
             branch_name=fraw.get("branch_name"),
             base_commit=fraw.get("base_commit"),
-            conflict_files=fraw.get("conflict_files", []),
+            conflict_files=fraw.get("conflict_files", []) or [],
             pr_url=fraw.get("pr_url"),
             pr_number=fraw.get("pr_number"),
             pr_title=fraw.get("pr_title"),
@@ -145,6 +156,32 @@ def load_state(repo_dir: Path | None = None) -> PipelineState:
             failed_step_index=fraw.get("failed_step_index"),
             partial_pr_count=fraw.get("partial_pr_count"),
         )
+    return features
+
+
+def _read_raw_state(path: Path) -> dict:
+    """Read ``path`` as a state-file dict, returning ``{}`` if missing/empty."""
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        return {}
+    return raw
+
+
+def load_state(config: Config) -> PipelineState:
+    """Load the pipeline state for ``config``'s project.
+
+    Returns an empty :class:`PipelineState` (with provenance fields filled
+    from the config) when the state file does not exist yet — matches the
+    "first run" case so callers don't need to special-case it.
+    """
+    state_path = state_file_path(config.name)
+    raw = _read_raw_state(state_path)
+
+    run = raw.get("last_run") if isinstance(raw.get("last_run"), dict) else {}
+    features = _parse_features(run.get("features", {}) or {})
 
     phase = run.get("phase", "init")
     if phase not in ("init", "ports_done"):
@@ -156,14 +193,28 @@ def load_state(repo_dir: Path | None = None) -> PipelineState:
         phase=phase,
         base_branch=run.get("base_branch"),
         features=features,
+        config_path=raw.get("config_path"),
+        config_path_history=list(raw.get("config_path_history", []) or []),
     )
 
 
-def save_state(state: PipelineState, repo_dir: Path | None = None) -> None:
-    """Persist pipeline state to state.yaml."""
-    if repo_dir is None:
-        repo_dir = Path.cwd()
-    state_path = repo_dir / "state.yaml"
+def save_state(state: PipelineState, config: Config) -> None:
+    """Persist ``state`` to ``config``'s per-project state file.
+
+    Always rewrites ``config_path`` to the loaded config's absolute
+    location and appends to ``config_path_history`` if it changed.
+    """
+    state_path = state_file_path(config.name)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+
+    current_cfg = str(config.config_path.resolve())
+    history = list(state.config_path_history or [])
+    if state.config_path and state.config_path != current_cfg:
+        if state.config_path not in history:
+            history.append(state.config_path)
+        history = history[-_CONFIG_PATH_HISTORY_MAX:]
+    state.config_path = current_cfg
+    state.config_path_history = history
 
     features_data = {}
     for fid, fs in state.features.items():
@@ -202,15 +253,72 @@ def save_state(state: PipelineState, repo_dir: Path | None = None) -> None:
             entry["partial_pr_count"] = fs.partial_pr_count
         features_data[fid] = entry
 
-    data = {
-        "last_run": {
-            "started_at": state.started_at,
-            "onto": state.onto,
-            "phase": state.phase,
-            "base_branch": state.base_branch,
-            "features": features_data,
-        }
+    data: dict = {
+        "name": config.name,
+        "config_path": current_cfg,
+    }
+    if history:
+        data["config_path_history"] = history
+    data["last_run"] = {
+        "started_at": state.started_at,
+        "onto": state.onto,
+        "phase": state.phase,
+        "base_branch": state.base_branch,
+        "features": features_data,
     }
 
     with open(state_path, "w") as f:
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+
+def verify_ownership(config: Config) -> None:
+    """Raise :class:`OwnershipCollisionError` if state belongs to a different config.
+
+    No-op when:
+
+    * the state file does not yet exist (first-time run),
+    * the file exists but carries no ``config_path`` (legacy or hand-edited),
+    * the stored ``config_path`` matches the loaded config's path.
+    """
+    state_path = state_file_path(config.name)
+    raw = _read_raw_state(state_path)
+    stored = raw.get("config_path")
+    if not stored:
+        return
+    loaded_resolved = config.config_path.resolve()
+    try:
+        stored_resolved = Path(stored).resolve()
+    except (OSError, RuntimeError):
+        # If the stored path can no longer be resolved (deleted, missing
+        # mount, …) there's no meaningful collision to flag — treat the
+        # current config as the new owner.
+        return
+    if stored_resolved == loaded_resolved:
+        return
+    raise OwnershipCollisionError(
+        name=config.name,
+        state_path=state_path,
+        loaded_config=loaded_resolved,
+        stored_config=stored_resolved,
+    )
+
+
+def adopt_ownership(config: Config) -> tuple[Path | None, Path]:
+    """Forcibly rebind the state file's ``config_path`` to the current config.
+
+    Returns ``(previous_config_path, new_config_path)``. ``previous`` is
+    ``None`` when there was no state file yet (creates a fresh one) or
+    when the file already pointed at the current config.
+    """
+    state_path = state_file_path(config.name)
+    state = load_state(config)
+    previous: Path | None = None
+    if state.config_path:
+        try:
+            prev = Path(state.config_path).resolve()
+        except (OSError, RuntimeError):
+            prev = None
+        if prev and prev != config.config_path.resolve():
+            previous = prev
+    save_state(state, config)
+    return previous, state_path

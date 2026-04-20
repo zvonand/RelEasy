@@ -1,10 +1,9 @@
-"""GitHub operations: commit/push state, project board sync, PR creation, and PR search."""
+"""GitHub operations: project board sync, PR creation, and PR search."""
 
 from __future__ import annotations
 
 import logging
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -85,39 +84,6 @@ def _assert_writes_target_origin(
             f"({origin_slug!r}). This should never happen — please "
             "report it as a bug."
         )
-
-
-# ---------------------------------------------------------------------------
-# Git state commit/push
-# ---------------------------------------------------------------------------
-
-
-def commit_and_push_state(message: str, repo_dir: Path | None = None) -> bool:
-    """Commit state.yaml and STATUS.md in the tool repo and push."""
-    if repo_dir is None:
-        repo_dir = Path.cwd()
-    files = ["state.yaml", "STATUS.md"]
-    existing = [f for f in files if (repo_dir / f).exists()]
-    if not existing:
-        return False
-
-    try:
-        subprocess.run(["git", "add"] + existing, cwd=repo_dir, check=True, capture_output=True)
-        subprocess.run(
-            ["git", "commit", "-m", message],
-            cwd=repo_dir,
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "push"],
-            cwd=repo_dir,
-            check=False,
-            capture_output=True,
-        )
-        return True
-    except subprocess.CalledProcessError:
-        return False
 
 
 # ---------------------------------------------------------------------------

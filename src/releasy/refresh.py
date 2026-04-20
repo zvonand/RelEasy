@@ -2,7 +2,7 @@
 
 This is a strict maintenance loop. It does **not** create new branches,
 discover new source PRs, or open new pull requests. It only walks the
-PRs RelEasy is already tracking in ``state.yaml`` and tries to refresh
+PRs RelEasy is already tracking in its state file and tries to refresh
 each one against the latest target branch.
 
 After ``releasy run`` opens a batch of rebase PRs, the target branch
@@ -10,9 +10,9 @@ After ``releasy run`` opens a batch of rebase PRs, the target branch
 will eventually conflict with the new tip even though they were clean
 when first opened. That's what this command exists for:
 
-1. Iterate every PR RelEasy is tracking (entries in ``state.features``
-   that have a ``rebase_pr_url`` and a live ``branch_name``). No
-   discovery, no new entries, no new PRs.
+1. Iterate every tracked PR (entries in ``state.features`` that have a
+   ``rebase_pr_url`` and a live ``branch_name``). No discovery, no new
+   entries, no new PRs.
 2. Fetch the latest tips of the target branch and the PR branch from
    origin (so we don't operate on a stale local copy).
 3. Attempt ``git merge --no-ff origin/<base_branch>`` into the PR branch.
@@ -52,7 +52,6 @@ from releasy.github_ops import (
     sync_project,
 )
 from releasy.state import FeatureState, PipelineState, load_state, save_state
-from releasy.status import write_status_md
 
 console = Console()
 
@@ -63,22 +62,17 @@ console = Console()
 
 
 def _persist(config: Config, state: PipelineState) -> None:
-    """Mirror ``pipeline._update_state_and_status`` — kept local to avoid
-    a circular import (``pipeline`` itself imports nothing from here).
+    """Mirror ``pipeline._persist_state`` — kept local to avoid a circular
+    import (``pipeline`` itself imports nothing from here).
 
-    Always writes ``state.yaml`` + ``STATUS.md``. When ``push`` is on we
-    also push state and reconcile the GitHub Project board, so the
-    project view reflects the new ``conflict`` status as soon as we mark
-    it (instead of waiting for the next ``releasy continue`` pass).
+    Always writes the per-project state file. When ``push`` is on we
+    also reconcile the GitHub Project board so the project view reflects
+    the new ``conflict`` status as soon as we mark it (instead of
+    waiting for the next ``releasy continue`` pass).
     """
-    save_state(state, config.repo_dir)
-    write_status_md(config, state)
+    save_state(state, config)
     if config.push:
-        from releasy.github_ops import commit_and_push_state
         sync_project(config, state)
-        commit_and_push_state(
-            "releasy: refresh PR conflict status", config.repo_dir,
-        )
 
 
 def _synthesise_source_pr(fs: FeatureState) -> PRInfo | None:
@@ -170,7 +164,7 @@ def refresh_tracked_prs(
     # but it owns the shared repo-setup helper we want to reuse.
     from releasy.pipeline import _setup_repo
 
-    state = load_state(config.repo_dir)
+    state = load_state(config)
     if not state.features:
         console.print(
             "[yellow]No features in state. Run 'releasy run' first.[/yellow]"

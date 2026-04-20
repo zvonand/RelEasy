@@ -41,7 +41,6 @@ from releasy.git_ops import (
 from releasy.github_ops import (
     PRInfo,
     add_label_to_pr,
-    commit_and_push_state,
     create_pull_request,
     ensure_label,
     fetch_pr_by_number,
@@ -56,7 +55,6 @@ from releasy.github_ops import (
     update_pull_request,
 )
 from releasy.state import FeatureState, PipelineState, load_state, save_state
-from releasy.status import write_status_md
 
 console = Console()
 
@@ -66,13 +64,11 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 
-def _update_state_and_status(config: Config, state: PipelineState) -> None:
-    """Persist state + STATUS.md, and optionally sync project board / push."""
-    save_state(state, config.repo_dir)
-    write_status_md(config, state)
+def _persist_state(config: Config, state: PipelineState) -> None:
+    """Persist state to the per-project state file and (optionally) sync the project board."""
+    save_state(state, config)
     if config.push:
         sync_project(config, state)
-        commit_and_push_state(f"releasy: update state — onto {state.onto}", config.repo_dir)
 
 
 def _setup_repo(
@@ -521,7 +517,7 @@ def run_pipeline(
     ``resolve_conflicts`` is a CLI-level kill-switch. The AI resolver only
     runs when both this flag and ``config.ai_resolve.enabled`` are true.
     """
-    state = load_state(config.repo_dir)
+    state = load_state(config)
     _prune_superseded_singletons(config, state)
     repo_path = _setup_repo(config, work_dir, config.base_branch_name(onto))
 
@@ -566,7 +562,7 @@ def run_pipeline(
     state.set_started(onto)
     state.base_branch = base_branch
     state.phase = "init"
-    _update_state_and_status(config, state)
+    _persist_state(config, state)
 
     if config.push:
         ensure_label(
@@ -628,7 +624,7 @@ def run_pipeline(
         )
 
     state.phase = "ports_done"
-    _update_state_and_status(config, state)
+    _persist_state(config, state)
 
     # --- Summary ---
     console.print(f"\n[bold]Pipeline complete.[/bold] Phase: {state.phase}")
@@ -1282,7 +1278,7 @@ def _ensure_pr_for_existing_remote_branch(
         _apply_releasy_label_to_pr(config, pr_url)
         if fs.ai_resolved:
             _apply_ai_label_to_pr(config, pr_url)
-    _update_state_and_status(config, state)
+    _persist_state(config, state)
 
 
 def _finish_clean_unit(
@@ -1347,7 +1343,7 @@ def _finish_clean_unit(
             state.features[unit.feature_id].rebase_pr_url = existing.url
             state.features[unit.feature_id].status = "needs_review"
 
-    _update_state_and_status(config, state)
+    _persist_state(config, state)
 
 
 def _ensure_pr_for_branch(
@@ -1523,7 +1519,7 @@ def _handle_unresolved_conflict(
             ai_cost_usd=unit.ai_cost_usd_total,
             **pr_meta,
         )
-        _update_state_and_status(config, state)
+        _persist_state(config, state)
         return
 
     # Partial group: keep the n-1 successful commits, push, draft PR.
@@ -1582,7 +1578,7 @@ def _handle_unresolved_conflict(
     if rebase_pr_url:
         fs.rebase_pr_url = rebase_pr_url
     state.features[unit.feature_id] = fs
-    _update_state_and_status(config, state)
+    _persist_state(config, state)
 
 
 def _try_ai_resolve_step(
@@ -1679,7 +1675,7 @@ def _resolve_branch_target(
 
 def continue_branch(config: Config, branch_name: str) -> bool:
     """Mark a previously-conflicted port as resolved."""
-    state = load_state(config.repo_dir)
+    state = load_state(config)
     feat = _resolve_branch_target(config, state, branch_name)
 
     if feat is None:
@@ -1711,7 +1707,7 @@ def continue_branch(config: Config, branch_name: str) -> bool:
         state.features[feat.id].rebase_pr_url
     )
     state.features[feat.id].conflict_files = []
-    _update_state_and_status(config, state)
+    _persist_state(config, state)
     console.print(
         f"[green]✓[/green] Feature [cyan]{feat.id}[/cyan] "
         f"({fs.branch_name}) → {state.features[feat.id].status}"
@@ -1904,7 +1900,7 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
     Project reflects the current state (and stale draft stubs get replaced
     by the real PR cards).
     """
-    state = load_state(config.repo_dir)
+    state = load_state(config)
     if not state.features:
         console.print(
             "[yellow]No features in state. Run 'releasy run' first.[/yellow]"
@@ -1912,7 +1908,7 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
         return False
 
     if _prune_superseded_singletons(config, state):
-        _update_state_and_status(config, state)
+        _persist_state(config, state)
 
     repo_path = _setup_repo(config, work_dir, state.base_branch)
 
@@ -1995,7 +1991,7 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
                 f"{header} — [green]branch-created[/green], opening PR"
             )
             _open_pr_for_resolved(config, repo_path, state, fs, base_branch)
-            _update_state_and_status(config, state)
+            _persist_state(config, state)
             continue
 
         # Conflict path needs the branch locally so we can inspect / continue.
@@ -2031,7 +2027,7 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
         fs.status = _success_status(fs.rebase_pr_url)
         state.features[feat_id] = fs
         _open_pr_for_resolved(config, repo_path, state, fs, base_branch)
-        _update_state_and_status(config, state)
+        _persist_state(config, state)
 
     _reconcile_project_board(config, state)
 
@@ -2049,7 +2045,7 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
 def sync_to_project(config: Config) -> bool:
     """Standalone reconciliation: push current local state to the board.
 
-    Loads ``state.yaml`` from the repo and calls the same reconciliation
+    Loads the per-project state file and calls the same reconciliation
     used at the end of ``releasy continue``, so the user can refresh the
     project board without running the whole pipeline (handy after editing
     state by hand, after rotating tokens, or right after wiring up a new
@@ -2068,7 +2064,7 @@ def sync_to_project(config: Config) -> bool:
         )
         return False
 
-    state = load_state(config.repo_dir)
+    state = load_state(config)
     if not state.features and not config.features:
         console.print(
             "[yellow]Nothing to sync.[/yellow] No features in state and "
@@ -2112,7 +2108,7 @@ def _reconcile_project_board(config: Config, state: PipelineState) -> None:
     """Make sure every local port is reflected on the GitHub Project board.
 
     Per-feature state changes during the run already trigger
-    ``sync_project`` from ``_update_state_and_status`` (when ``push`` is
+    ``sync_project`` from ``_persist_state`` (when ``push`` is
     on). This is the belt-and-braces pass: even with ``push: false``, or
     when the project URL was added to config after some ports were
     already in state, we still want ``releasy continue`` to leave the
@@ -2150,7 +2146,7 @@ def _reconcile_project_board(config: Config, state: PipelineState) -> None:
 
 def skip_branch(config: Config, branch_name: str) -> bool:
     """Mark a port branch as skipped."""
-    state = load_state(config.repo_dir)
+    state = load_state(config)
     feat = _resolve_branch_target(config, state, branch_name)
 
     if feat is None:
@@ -2164,16 +2160,16 @@ def skip_branch(config: Config, branch_name: str) -> bool:
 
     state.features[feat.id].status = "skipped"
     state.features[feat.id].conflict_files = []
-    _update_state_and_status(config, state)
+    _persist_state(config, state)
     console.print(f"[yellow]⏭[/yellow] Feature [cyan]{feat.id}[/cyan] skipped")
     return True
 
 
 def abort_run(config: Config) -> None:
     """Abort the current run, leaving all branches as-is."""
-    state = load_state(config.repo_dir)
+    state = load_state(config)
     console.print("[yellow]Aborting current run. All branches left as-is.[/yellow]")
-    _update_state_and_status(config, state)
+    _persist_state(config, state)
 
 
 def print_status(config: Config) -> None:
@@ -2186,7 +2182,7 @@ def print_status(config: Config) -> None:
     from releasy.state import STATUS_DISPLAY_ORDER
     from releasy.status import STATUS_HEADINGS, STATUS_ICONS
 
-    state = load_state(config.repo_dir)
+    state = load_state(config)
 
     console.print()
     console.print(

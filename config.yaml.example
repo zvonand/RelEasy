@@ -1,3 +1,13 @@
+# ── Project identity (required) ─────────────────────────────────────
+# Unique slug for this project on this machine. Doubles as the filename
+# of the per-project state file under
+#   ${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml
+# Allowed characters: A-Z a-z 0-9 . _ - (1-64 chars). Pick something
+# stable like the target branch you are porting onto. Renaming this
+# orphans the old state file — use `releasy adopt` to rebind state to a
+# moved/renamed config.
+name: antalya-26.3
+
 # ── Push & PR control ───────────────────────────────────────────────
 # Push branches to origin and open PRs.
 # Default is false — everything stays local until you enable this.
@@ -16,9 +26,6 @@
 #     records "Conflict" in the GitHub Project. Remaining PRs in
 #     the group are not attempted.
 # Either way the pipeline keeps going with the next unit.
-#
-# `wip_commit_on_conflict` is no longer supported. If present in this
-# file, releasy logs a warning and ignores it.
 
 # ── Existing-PR behaviour ───────────────────────────────────────────
 # When a PR for the port branch already exists on GitHub:
@@ -270,7 +277,7 @@ notifications:
 #   releasy refresh
 #   → strictly maintenance: never opens new PRs, never creates new
 #     branches, never discovers new sources. Only refreshes entries
-#     already in state.yaml.
+#     already in the per-project state file.
 #   → for each tracked PR with a branch + rebase PR URL:
 #       fetch latest tips, attempt `git merge --no-ff origin/<base>`
 #       into the PR branch. Clean merge: leave the PR alone. Conflict

@@ -4,12 +4,16 @@ CLI tool for managing port branches, feature branches, and release construction.
 
 RelEasy automates porting features and PRs onto a stable **base branch** (a tag/commit you pin to) inside a single repo. Instead of rebasing long-lived branches (which accumulates conflicts), each feature / PR is cherry-picked onto its own port branch and opened as a PR — all in a resumable workflow.
 
+A single machine can drive **multiple ongoing porting projects in parallel** (e.g. an antalya-26.3 forward-port and an antalya-25.8 backport). Each project has its own `config.yaml` with a unique `name:`; pipeline state lives outside your repo under `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml`, and a per-project lock keeps concurrent runs of the same project serialized while runs of *different* projects truly run in parallel.
+
 ## TL;DR
 
 ```bash
 export RELEASY_GITHUB_TOKEN="ghp_..."
 
-# target_branch is set in config.yaml — the base branch must already exist on origin:
+mkdir -p ~/work/antalya-26.3 && cd ~/work/antalya-26.3
+releasy new --target-branch antalya-26.3 --project antalya
+$EDITOR config.yaml          # fill in origin remote, work_dir, push: true, …
 releasy run
 ```
 
@@ -58,20 +62,30 @@ pip install -e .
 
 ## Quick Start
 
-1. Copy the example config and edit it:
+1. Scaffold a config in a fresh directory (one per project):
 
 ```bash
-cp config.yaml.example config.yaml
+mkdir -p ~/work/antalya-26.3 && cd ~/work/antalya-26.3
+releasy new --target-branch antalya-26.3 --project antalya
+# /home/<you>/work/antalya-26.3/config.yaml
 ```
 
-2. Set up authentication:
+`releasy new` writes a minimal `config.yaml` and prints its absolute path
+to stdout (everything else goes to stderr) so it composes cleanly with
+shell substitution. See [`config.yaml.example`](config.yaml.example) for
+the fully-documented reference of every available option.
+
+2. Edit `config.yaml` to fill in `origin.remote`, optionally `work_dir`,
+   `push: true`, `pr_sources`, `ai_resolve`, and `notifications`.
+
+3. Set up authentication:
 
 ```bash
 export RELEASY_GITHUB_TOKEN="ghp_..."      # for PR discovery & creation
 export RELEASY_SSH_KEY_PATH="~/.ssh/id_rsa" # optional
 ```
 
-3. Run the pipeline:
+4. Run the pipeline:
 
 ```bash
 # With an explicit target_branch in config:
@@ -83,11 +97,61 @@ releasy run
 releasy run --onto 26.3
 ```
 
+## Multiple projects in parallel
+
+Each `config.yaml` carries a required `name:` slug. That name keys a
+per-project state file under `${XDG_STATE_HOME:-~/.local/state}/releasy/`
+(overridable with `$RELEASY_STATE_DIR`) and a per-project lockfile next
+to it, so two projects with different names can run truly concurrently
+on the same machine:
+
+```bash
+# Project A
+mkdir -p ~/work/antalya-26.3 && cd ~/work/antalya-26.3
+releasy new --target-branch antalya-26.3 --project antalya
+$EDITOR config.yaml
+
+# Project B
+mkdir -p ~/work/antalya-25.8 && cd ~/work/antalya-25.8
+releasy new --target-branch antalya-25.8 --project antalya
+$EDITOR config.yaml
+
+# Two terminals, two pipelines running concurrently:
+(cd ~/work/antalya-26.3 && releasy run) &
+(cd ~/work/antalya-25.8 && releasy run) &
+
+# See everything releasy knows about on this machine:
+releasy list
+# Name           | Phase       | Features          | Last run            | Config
+# antalya-26.3   | ports_done  | 3 ok / 0 conflict | 2026-04-20 08:35Z   | ~/work/antalya-26.3/config.yaml
+# antalya-25.8   | init        | 0 ok / 0 conflict | —                   | ~/work/antalya-25.8/config.yaml
+```
+
+Two `releasy` invocations against the **same** project (same `name:`)
+serialize on the project lock — the second one prints the holder's PID,
+host, and command and exits non-zero. Two invocations against
+**different** projects don't contend at all.
+
+> **One work_dir per project.** RelEasy does not police shared
+> `work_dir` settings between projects — git itself isn't safe with two
+> processes mutating the same checkout. Give each project its own clone
+> directory.
+
+If you move or rename a config, the next command will trip an
+ownership-collision check (the state file remembers the absolute path
+of the config that owns it). Run `releasy adopt` from the new location
+to rebind state to the new path.
+
 ## Configuration
 
 See [`config.yaml.example`](config.yaml.example) for a fully documented template.
 
 ```yaml
+# Unique slug for this project on this machine (required).
+# Keys the per-project state file under
+#   ${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml
+name: antalya-26.3
+
 # Push branches and open PRs (default: false — everything stays local)
 push: true
 
@@ -157,6 +221,7 @@ pr_sources:
 
 | Option | Description | Default |
 |--------|-------------|---------|
+| `name` | Unique slug identifying this project on this machine (required). Keys `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml`. Allowed: `A-Z a-z 0-9 . _ -` (1-64 chars). | — |
 | `push` | Push branches and open PRs | `false` |
 | `work_dir` | Path to existing repo clone (or where to clone) | cwd |
 | `origin.remote` | Origin repo URL (required) | — |
@@ -190,6 +255,7 @@ pr_sources:
 |----------|---------|
 | `RELEASY_GITHUB_TOKEN` | GitHub PAT for PR discovery, PR creation, Project sync |
 | `RELEASY_SSH_KEY_PATH` | SSH key for git operations (optional, defaults to agent) |
+| `RELEASY_STATE_DIR` | Override the directory holding per-project state and lock files. Defaults to `${XDG_STATE_HOME:-~/.local/state}/releasy`. Useful for tests / CI runners. |
 
 ## CLI Reference
 
@@ -216,7 +282,7 @@ this matrix is the quickest way to pick the right one.
 | Opens new rebase PRs | ✅ for new ports | ✅ for branches that missed PR creation last time | — |
 | AI-resolves **cherry-pick** conflicts (initial port) | ✅ | — | — |
 | AI-resolves **merge** conflicts (target branch moved on) | — | — | ✅ |
-| Iterates entries already in `state.yaml` | only to skip / ensure-PR | ✅ all of them | ✅ all tracked PRs |
+| Iterates entries already in the project state file | only to skip / ensure-PR | ✅ all of them | ✅ all tracked PRs |
 | Mutates your local work-dir | ✅ (cherry-picks) | ✅ (push only) | ✅ (merges) |
 | Pushes to origin | ✅ | ✅ | ✅ (only merge commits, on conflict-resolution) |
 
@@ -225,14 +291,14 @@ In one-line summaries:
 - **`run`** — *"do new work."* Walks `pr_sources`, discovers PRs, creates port
   branches, cherry-picks, opens rebase PRs.
 - **`continue`** — *"I fixed something by hand; reconcile state."* Walks
-  `state.yaml`: pushes / opens any PRs that should have been created but
-  weren't (e.g. previous run had `auto_pr: false`, or a conflict you've now
-  manually resolved in the work-dir), refreshes the project board. No git
-  ops beyond `push` + status checks.
+  the project state file: pushes / opens any PRs that should have been
+  created but weren't (e.g. previous run had `auto_pr: false`, or a
+  conflict you've now manually resolved in the work-dir), refreshes the
+  project board. No git ops beyond `push` + status checks.
 - **`refresh`** — *"keep open PRs current with the moved-on base."* Walks
-  `state.yaml`: for each tracked PR, attempts `git merge origin/<base>` into
-  the PR branch and AI-resolves any conflicts. Doesn't open new PRs, doesn't
-  discover new sources.
+  the project state file: for each tracked PR, attempts
+  `git merge origin/<base>` into the PR branch and AI-resolves any
+  conflicts. Doesn't open new PRs, doesn't discover new sources.
 
 > **Why both `run` and `continue`?** `run` only acts on entries it's
 > cherry-picking *right now*. If you fix a conflict by hand later in the
@@ -282,7 +348,7 @@ Exit code: `1` if any port ended up in `conflict` status, `0` otherwise.
 
 Strictly a maintenance pass — **never opens new PRs, never creates new
 branches, never discovers new PR sources, never re-runs cherry-picks**.
-Only operates on entries already in `state.yaml`. For each tracked PR
+Only operates on entries already in the project state file. For each tracked PR
 with a branch + rebase PR URL, fetches latest tips, attempts
 `git merge --no-ff origin/<base_branch>` into the PR branch, and:
 
@@ -363,10 +429,10 @@ releasy skip --branch <branch-or-feature-id>
 
 #### `releasy abort` — abort the current run
 
-Persists the current state and writes `STATUS.md`, but leaves all
-branches and PRs exactly as they are. There's no "undo" for ports that
-already pushed; this is for telling RelEasy "stop tracking this run as
-in-progress" without rolling anything back.
+Persists the current state, but leaves all branches and PRs exactly as
+they are. There's no "undo" for ports that already pushed; this is for
+telling RelEasy "stop tracking this run as in-progress" without rolling
+anything back.
 
 ```bash
 releasy abort
@@ -376,15 +442,74 @@ releasy abort
 
 #### `releasy status` — print current pipeline state
 
-Renders the same per-status grouping as `STATUS.md` directly to the
-terminal: one sub-table per status section (in
+Renders one rich-text sub-table per status section (in
 [`STATUS_DISPLAY_ORDER`](src/releasy/state.py)) so the highest-attention
 entries (conflicts) surface at the top. No git operations, no network
-calls — just reads `state.yaml` and prints.
+calls — just reads the project state file and prints.
 
 ```bash
 releasy status
 ```
+
+### Multi-project ergonomics
+
+#### `releasy new` — scaffold a fresh project config
+
+Writes a minimal `config.yaml` from the bundled template and prints its
+absolute path on stdout (everything else goes to stderr) so it
+composes:
+
+```bash
+cd $(dirname "$(releasy new --target-branch antalya-25.8 --project antalya)")
+```
+
+```bash
+releasy new [--name <slug>] [--target-branch <branch>] [--project <id>] [--out <path>]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--name <slug>` | Project name. Validated against `[A-Za-z0-9._-]{1,64}`. | auto-generated |
+| `--target-branch <branch>` | Seeds `target_branch:` in the new config. Also drives the auto-generated name (`<target-branch>-<6hex>`) when `--name` is omitted. | empty |
+| `--project <id>` | Seeds `project:` in the new config. | empty |
+| `--out <path>` | Where to write the new file. Refuses to overwrite an existing file. | `./config.yaml` |
+
+When `--name` is omitted, the new project gets a 6-hex suffix from a
+CSPRNG so back-to-back `releasy new --target-branch X` calls produce
+distinct names.
+
+#### `releasy list` (alias `releasy ls`) — every project on this machine
+
+Walks the state directory and renders one row per project: name, phase,
+feature counts (ok / conflict, plus skipped when present), last-run
+timestamp, and the absolute path of the config file that owns the
+state.
+
+```bash
+releasy list
+```
+
+#### `releasy where` — print the state-file path for the current config
+
+```bash
+releasy where
+# /home/<you>/.local/state/releasy/antalya-26.3.state.yaml
+```
+
+#### `releasy adopt` — rebind state to the current config
+
+If you move or rename a `config.yaml`, the next mutating command will
+trip an ownership-collision check (the state file remembers the
+absolute path of the config that owned it). Run `releasy adopt` from
+the new location to rebind state to the current config; the old path
+is appended to a small history list for audit.
+
+```bash
+releasy adopt
+```
+
+If no state file exists yet, `releasy adopt` creates an empty one — so
+it doubles as "register this config without doing anything else".
 
 ### Project board sync
 
@@ -411,10 +536,10 @@ releasy setup-project
 
 #### `releasy sync-project` — push local state to the project board
 
-Reads `state.yaml` and reconciles every known feature with the
-configured project: attaches missing PR cards, refreshes existing ones,
-updates the Status field. Use this after editing state by hand, after
-rotating tokens, or right after wiring up a new project URL on an
+Reads the project state file and reconciles every known feature with
+the configured project: attaches missing PR cards, refreshes existing
+ones, updates the Status field. Use this after editing state by hand,
+after rotating tokens, or right after wiring up a new project URL on an
 in-flight rebase. No git operations, no PRs — only the board.
 
 ```bash
@@ -535,8 +660,7 @@ ready for review.
 > `failed_step_index` / `partial_pr_count` / `rebase_pr_url`, and the
 > project card body explains what happened). The `ai_resolved` field on
 > the entry (and the `ai-resolved` PR label) carries the "AI was
-> involved" signal. Old state files with `ok` / `resolved` / `pending` /
-> `disabled` / `needs_resolution` are migrated silently on load.
+> involved" signal.
 
 ## PR title & labels
 
@@ -567,11 +691,27 @@ Cross-repo PR URLs (`pr_sources.include_prs`, `pr_sources.groups[].prs`) are rea
 
 If you ever see RelEasy attempting to write to anything other than your configured origin, it's a bug — please report it.
 
-## State Files
+## Files RelEasy reads & writes
 
-- `state.yaml` — pipeline phase, branch names, statuses (auto-managed)
-- `STATUS.md` — human-readable status table (auto-managed)
-- `config.yaml` — your configuration (gitignored, not committed)
+- `config.yaml` — your per-project configuration. The user provides
+  this; `releasy new` scaffolds it. Gitignored by default; nothing
+  prevents you from versioning it elsewhere.
+- `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml` — the
+  per-project pipeline state file (phase, branch names, statuses,
+  AI cost, source PR metadata). Auto-managed; not user-editable in
+  normal operation. Override the parent dir with `$RELEASY_STATE_DIR`.
+- `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.lock` — POSIX
+  advisory lock used to serialize concurrent invocations on the same
+  project. Auto-removed on clean shutdown; harmless if a crashed run
+  leaves one behind (next run reclaims it).
+
+The state file additionally remembers the absolute path of the
+`config.yaml` that owns it, so `releasy list` can show the back-link
+and so an accidentally-copied config (with the same `name:`) trips a
+clear ownership-collision error instead of silently sharing state.
+
+There is **no** `STATUS.md` anymore — `releasy status` renders the same
+information directly to the terminal as a rich-text table.
 
 ## GitHub Project Integration
 
@@ -635,14 +775,14 @@ the first time `releasy setup-project` or any sync runs against it. It
 holds the sum of `total_cost_usd` reported by Claude across every
 resolve invocation that touched the entry — both successful and failed
 attempts (a failed turn is still billed). The same value is persisted
-in `state.yaml` as `ai_cost_usd`, so re-syncing a board after restoring
+in the per-project state file as `ai_cost_usd`, so re-syncing a board after restoring
 state keeps the column accurate.
 
 One project, multiple views — each rebase gets its own tab. You don't need to create any cards or views manually.
 
 ### Recommended view setup: group by Status
 
-To get the same grouped layout as `STATUS.md` and `releasy status` on the project board, set the view to **Group by → Status** in the GitHub UI:
+To get the same grouped layout as `releasy status` on the project board, set the view to **Group by → Status** in the GitHub UI:
 
 1. Open the view (the tab named after your base branch).
 2. Click the **⋯** menu in the view header → **Group**.

@@ -10,6 +10,54 @@ from pathlib import Path
 import yaml
 
 
+# Slug constraints for the per-project ``name:`` field. The name doubles
+# as a filename (``<name>.state.yaml``) so it must be filesystem-safe and
+# short enough to be readable in ``releasy list`` output.
+_VALID_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_STATE_SUBDIR = "releasy"
+
+
+def state_root() -> Path:
+    """Resolve the per-user releasy state directory (created on demand).
+
+    Priority:
+
+    1. ``$RELEASY_STATE_DIR`` — escape hatch for tests / CI / power users.
+    2. ``$XDG_STATE_HOME/releasy`` — defaults to ``~/.local/state/releasy``
+       per the XDG Base Directory spec.
+    """
+    override = os.environ.get("RELEASY_STATE_DIR")
+    if override:
+        root = Path(override).expanduser().resolve()
+    else:
+        xdg = os.environ.get("XDG_STATE_HOME") or str(
+            Path.home() / ".local" / "state"
+        )
+        root = (Path(xdg).expanduser() / _STATE_SUBDIR).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def state_file_path(name: str) -> Path:
+    """Path to the per-project pipeline state file."""
+    return state_root() / f"{name}.state.yaml"
+
+
+def lock_file_path(name: str) -> Path:
+    """Path to the per-project lock file used by ``locks.project_lock``."""
+    return state_root() / f"{name}.lock"
+
+
+def validate_project_name(name: str) -> str:
+    """Validate ``name`` matches the slug regex; return it unchanged on success."""
+    if not isinstance(name, str) or not _VALID_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid project name {name!r}. Must match "
+            f"{_VALID_NAME_RE.pattern} (1-64 chars, letters/digits/._-)."
+        )
+    return name
+
+
 def extract_version_suffix(onto: str) -> str:
     """Extract a version suffix from a tag or ref for branch naming.
 
@@ -245,6 +293,7 @@ class AIResolveConfig:
 
 @dataclass
 class Config:
+    name: str  # unique slug identifying this project (state file key)
     origin: OriginConfig
     project: str  # short project identifier, e.g. "antalya"
     target_branch: str | None = None  # explicit base/target branch override
@@ -268,8 +317,23 @@ class Config:
 
     @property
     def repo_dir(self) -> Path:
-        """Directory containing config.yaml (and state.yaml, STATUS.md)."""
+        """Directory containing ``config.yaml``.
+
+        Used as the base for resolving relative paths embedded in config
+        (e.g. ``ai_resolve.prompt_file``). Pipeline state and lock files
+        no longer live here — see :func:`state_root`.
+        """
         return self.config_path.parent
+
+    @property
+    def state_path(self) -> Path:
+        """Path to this project's state file (under the user's state dir)."""
+        return state_file_path(self.name)
+
+    @property
+    def lock_path(self) -> Path:
+        """Path to this project's lock file (under the user's state dir)."""
+        return lock_file_path(self.name)
 
     def resolve_work_dir(self, cli_override: Path | None = None) -> Path:
         """Resolve the working directory for git clone operations.
@@ -343,16 +407,15 @@ def load_config(config_path: Path | None = None) -> Config:
     if not raw:
         raise ValueError("Config file is empty")
 
-    if "wip_commit_on_conflict" in raw:
-        import logging
-        logging.getLogger(__name__).warning(
-            "config: 'wip_commit_on_conflict' is no longer supported and will be "
-            "ignored. Unresolved conflicts now drop the local branch (singletons "
-            "/ first-of-group) or open a draft PR labelled "
-            "'ai-needs-attention' (partial groups), and mark the entry as "
-            "'Conflict' in the GitHub Project. Remove the option from "
-            "config.yaml to silence this warning."
+    name = raw.get("name")
+    if not name:
+        raise ValueError(
+            "Config must set 'name:' — a unique slug identifying this "
+            "project on this machine. It keys the per-project state file "
+            f"under {state_root()}/<name>.state.yaml. Pick something "
+            "stable like 'antalya-26.3'."
         )
+    validate_project_name(name)
 
     origin = OriginConfig(
         remote=raw["origin"]["remote"],
@@ -578,6 +641,7 @@ def load_config(config_path: Path | None = None) -> Config:
     work_dir = Path(raw_work_dir).resolve() if raw_work_dir else None
 
     return Config(
+        name=name,
         origin=origin,
         project=project,
         target_branch=raw.get("target_branch") or None,
@@ -598,6 +662,7 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         config_path = config.config_path
 
     data: dict = {
+        "name": config.name,
         "origin": {
             "remote": config.origin.remote,
             "remote_name": config.origin.remote_name,
@@ -743,13 +808,3 @@ def get_github_token() -> str | None:
 
 def get_ssh_key_path() -> str | None:
     return os.environ.get("RELEASY_SSH_KEY_PATH")
-
-
-def get_repo_dir(config: Config | None = None) -> Path:
-    """Get the repo root directory (where config.yaml lives).
-
-    Prefer using config.repo_dir directly when a Config is available.
-    """
-    if config is not None:
-        return config.repo_dir
-    return Path.cwd()

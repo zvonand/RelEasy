@@ -1,0 +1,42 @@
+# RelEasy project config. See config.yaml.example in the source tree
+# for the fully-documented reference covering every option.
+
+# Unique slug identifying this project on this machine. Keys the
+# per-project state file under
+#   ${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml
+# Allowed: A-Z a-z 0-9 . _ - (1-64 chars). Don't rename without
+# `releasy adopt` (or just edit the state file path).
+name: {{ name }}
+
+# Where the local clone of the origin repo lives. Defaults to CWD.
+# work_dir: /path/to/clone
+
+# Push branches to origin and open PRs. Default: false (everything
+# stays local until enabled).
+# push: false
+
+origin:
+  remote: <set me — https or ssh URL of the origin repo>
+  remote_name: origin
+
+# Short project identifier. Used in derived branch names like
+# feature/<base>/<id>.
+project: {{ project }}
+
+# Explicit target/base branch. PRs are opened against this branch and
+# port branches are created from origin/<target_branch>. Must already
+# exist on origin.
+target_branch: {{ target_branch }}
+
+# pr_sources: PR discovery and filtering. See config.yaml.example.
+# pr_sources:
+#   include_prs:
+#     - https://github.com/owner/repo/pull/123
+
+# ai_resolve: Claude-driven conflict resolution. See config.yaml.example.
+# ai_resolve:
+#   enabled: false
+
+# notifications: GitHub Project board sync. See config.yaml.example.
+# notifications:
+#   github_project: https://github.com/orgs/<org>/projects/<n>

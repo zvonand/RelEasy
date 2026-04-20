@@ -85,7 +85,7 @@ def build_release(
     3. Push the base branch
     4. For each feature: create a branch with squashed commit, push, open PR
     """
-    state = load_state(config.repo_dir)
+    state = load_state(config)
 
     existing_ids = {f.id for f in config.features}
     for fid, fs in state.features.items():
