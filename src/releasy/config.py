@@ -314,6 +314,12 @@ class Config:
     config_path: Path = field(default_factory=lambda: Path.cwd() / "config.yaml")
     work_dir: Path | None = None
     push: bool = False
+    # Sequential mode: process the merged-time-sorted PR queue one PR per
+    # invocation. Each `releasy run` / `releasy continue` either confirms
+    # the previous rebase PR was merged into target_branch and ports the
+    # next one, or stops with an error. Incompatible with
+    # ``pr_sources.groups`` (rejected at load time).
+    sequential: bool = False
 
     @property
     def repo_dir(self) -> Path:
@@ -640,6 +646,13 @@ def load_config(config_path: Path | None = None) -> Config:
     raw_work_dir = raw.get("work_dir")
     work_dir = Path(raw_work_dir).resolve() if raw_work_dir else None
 
+    sequential = bool(raw.get("sequential", False))
+    if sequential and groups:
+        raise ValueError(
+            "sequential: true is incompatible with pr_sources.groups — "
+            "remove the groups or set sequential: false"
+        )
+
     return Config(
         name=name,
         origin=origin,
@@ -653,6 +666,7 @@ def load_config(config_path: Path | None = None) -> Config:
         config_path=config_path,
         work_dir=work_dir,
         push=raw.get("push", False),
+        sequential=sequential,
     )
 
 
@@ -797,6 +811,9 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
 
     if config.push:
         data["push"] = True
+
+    if config.sequential:
+        data["sequential"] = True
 
     with open(config_path, "w") as f:
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)

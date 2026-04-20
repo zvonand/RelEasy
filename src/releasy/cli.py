@@ -138,7 +138,7 @@ def run(
     resolve_conflicts: bool,
 ) -> None:
     """Discover and port new PRs onto the base branch (cherry-pick + open PR)."""
-    from releasy.pipeline import run_pipeline
+    from releasy.pipeline import run_pipeline, run_sequential
 
     with _locked_config(ctx) as config:
         if not onto:
@@ -149,6 +149,11 @@ def run(
             onto = config.target_branch
 
         wd = Path(work_dir) if work_dir else None
+
+        if config.sequential:
+            run_sequential(config, onto, wd, resolve_conflicts=resolve_conflicts)
+            return
+
         state = run_pipeline(config, onto, wd, resolve_conflicts=resolve_conflicts)
 
         has_conflicts = any(
@@ -175,16 +180,27 @@ def run(
 @click.pass_context
 def continue_cmd(ctx: click.Context, branch: str | None, work_dir: str | None) -> None:
     """Reconcile state after a manual fix (push + open any missing PRs)."""
-    from releasy.pipeline import continue_all, continue_branch
+    from releasy.pipeline import continue_all, continue_branch, run_sequential
 
     with _locked_config(ctx) as config:
         wd = Path(work_dir) if work_dir else None
         if branch:
             if not continue_branch(config, branch):
                 raise SystemExit(1)
-        else:
-            if not continue_all(config, wd):
-                raise SystemExit(1)
+            return
+
+        if config.sequential:
+            if not config.target_branch:
+                raise click.ClickException(
+                    "Sequential mode requires 'target_branch:' to be set in config.yaml."
+                )
+            run_sequential(
+                config, config.target_branch, wd, resolve_conflicts=True,
+            )
+            return
+
+        if not continue_all(config, wd):
+            raise SystemExit(1)
 
 
 @cli.command(short_help="Mark a port as skipped (state-only).")

@@ -347,6 +347,26 @@ def fetch_pr_by_url(
     )
 
 
+def is_pr_merged(config: Config, pr_url: str) -> bool | None:
+    """Has the PR at ``pr_url`` been merged?
+
+    Returns:
+      * ``True``  — PR is merged into its base branch.
+      * ``False`` — PR exists but is still open (or closed without merging).
+      * ``None``  — couldn't determine state (network failure, missing
+                    token, malformed URL). The caller should treat
+                    ``None`` as "do not advance" rather than as an
+                    implicit "not merged".
+    """
+    parsed = parse_pr_url(pr_url)
+    if parsed is None:
+        return None
+    info = fetch_pr_by_url(config, pr_url)
+    if info is None:
+        return None
+    return info.state == "merged"
+
+
 def pr_ref_label(pr_slug: str, number: int, origin_slug: str | None) -> str:
     """Format a PR reference as ``#N`` for origin and ``owner/repo#N`` otherwise."""
     if origin_slug and pr_slug == origin_slug:
@@ -1299,6 +1319,7 @@ STATUS_OPTIONS = [
     "Branch Created",
     "Conflict",
     "Skipped",
+    "Merged",
 ]
 
 STATUS_COLORS = {
@@ -1306,6 +1327,7 @@ STATUS_COLORS = {
     "Branch Created": "YELLOW",
     "Conflict": "RED",
     "Skipped": "YELLOW",
+    "Merged": "GREEN",
 }
 
 
@@ -1614,6 +1636,7 @@ STATUS_MAP = {
     "branch_created": "Branch Created",
     "conflict": "Conflict",
     "skipped": "Skipped",
+    "merged": "Merged",
     # Legacy aliases — state.load_state() already migrates these on read,
     # but keep the mapping in case a raw status string slips through.
     "ok": "Needs Review",

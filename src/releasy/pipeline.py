@@ -46,6 +46,7 @@ from releasy.github_ops import (
     fetch_pr_by_number,
     find_pr_for_branch,
     get_origin_repo_slug,
+    is_pr_merged,
     parse_pr_url,
     pr_ref_label,
     require_origin_repo_slug,
@@ -649,6 +650,270 @@ def run_pipeline(
             f"{conflicts} conflict ({ai_assisted} ai-assisted)"
         )
 
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Sequential mode
+# ---------------------------------------------------------------------------
+
+
+def run_sequential(
+    config: Config,
+    onto: str,
+    work_dir: Path | None = None,
+    resolve_conflicts: bool = True,
+) -> PipelineState:
+    """Process the merged-time-sorted PR queue one PR per invocation.
+
+    Loop semantics — for each unit in ``discover_feature_units(config)``
+    order (already sorted by ``merged_at``):
+
+      * state ``merged`` / ``skipped``     → already done, skip.
+      * state ``needs_review`` /
+        ``branch_created`` with rebase PR  → ask GitHub if the PR is
+                                            merged. Yes → mark
+                                            ``merged`` in state and
+                                            continue. No → exit 1 with
+                                            the in-flight PR URL.
+                                            Lookup failure → exit 1.
+      * state ``branch_created`` with no
+        rebase PR                           → exit 1 (something went
+                                            wrong opening the PR — fix
+                                            it and retry).
+      * state ``conflict``                  → exit 1 with the conflict
+                                            files (sequential mode never
+                                            auto-retries).
+      * no state at all                    → port it (cherry-pick onto
+                                            the freshly-fetched
+                                            ``origin/<base>``, push, open
+                                            PR), then return so the
+                                            caller exits cleanly.
+
+    ``releasy run`` and ``releasy continue`` (no ``--branch``) both
+    dispatch here when ``config.sequential`` is true; the function
+    is the single source of truth for sequential-mode behaviour.
+    """
+    state = load_state(config)
+    _prune_superseded_singletons(config, state)
+    repo_path = _setup_repo(config, work_dir, config.base_branch_name(onto))
+
+    if is_operation_in_progress(repo_path):
+        if config.pr_sources.if_exists == "recreate":
+            kind = abort_in_progress_op(repo_path)
+            console.print(
+                f"\n[yellow]↻ Aborted in-progress {kind} in [cyan]{repo_path}[/cyan][/yellow] "
+                f"(pr_sources.if_exists: recreate)"
+            )
+        else:
+            console.print(
+                f"\n[red]✗[/red] A cherry-pick/merge/rebase is already in progress "
+                f"in [cyan]{repo_path}[/cyan]."
+            )
+            console.print(
+                "  Resolve it first (or run `git cherry-pick --abort`), then re-run.\n"
+                "  Or set [cyan]pr_sources.if_exists: recreate[/cyan] in config to "
+                "auto-abort it."
+            )
+            raise SystemExit(2)
+
+    base_branch = config.base_branch_name(onto)
+    remote = config.origin.remote_name
+
+    if not branch_exists(repo_path, base_branch, remote):
+        console.print(
+            f"\n[red]✗[/red] Base branch [cyan]{base_branch}[/cyan] does not exist "
+            f"on remote [cyan]{remote}[/cyan].\n"
+            f"  Create and push it first, then re-run."
+        )
+        raise SystemExit(2)
+
+    base_ref = f"{remote}/{base_branch}"
+    console.print(f"Base: [cyan]{base_ref}[/cyan]")
+    console.print(
+        "[bold]Mode:[/bold] [cyan]sequential[/cyan] "
+        "(one PR per invocation; previous PR must merge before the next)"
+    )
+    console.print(
+        f"PRs will be opened against [bold cyan]{require_origin_repo_slug(config)}[/bold cyan] "
+        "(origin) — RelEasy never opens PRs against any other repo."
+    )
+
+    state.set_started(onto)
+    state.base_branch = base_branch
+    state.phase = "init"
+    _persist_state(config, state)
+
+    if config.push:
+        ensure_label(
+            config, RELEASY_LABEL, RELEASY_LABEL_COLOR, RELEASY_LABEL_DESCRIPTION,
+        )
+
+    ai_active = resolve_conflicts and config.ai_resolve.enabled
+    if ai_active:
+        console.print(
+            f"[dim]AI conflict resolver: enabled "
+            f"(command='{config.ai_resolve.command}', "
+            f"label='{config.ai_resolve.label}', "
+            f"max_iterations={config.ai_resolve.max_iterations})[/dim]"
+        )
+        if config.push:
+            ensure_label(
+                config,
+                config.ai_resolve.label,
+                config.ai_resolve.label_color,
+                "Port conflict auto-resolved by Claude",
+            )
+    else:
+        why = (
+            "disabled via --no-resolve-conflicts" if not resolve_conflicts
+            else "disabled in config"
+        )
+        console.print(f"[dim]AI conflict resolver: {why}[/dim]")
+
+    if config.push:
+        ensure_label(
+            config,
+            config.ai_resolve.needs_attention_label,
+            config.ai_resolve.needs_attention_label_color,
+            "Releasy stopped on a conflict it could not resolve — needs human review",
+        )
+
+    console.print(
+        f"\n[bold]Phase:[/bold] Sequential porting onto [cyan]{base_branch}[/cyan]"
+    )
+
+    units = discover_feature_units(config)
+    if not units:
+        console.print("\n  [dim]No PRs to process after filtering[/dim]")
+        state.phase = "ports_done"
+        _persist_state(config, state)
+        return state
+
+    origin_slug = get_origin_repo_slug(config)
+
+    for unit in units:
+        fs = state.features.get(unit.feature_id)
+        primary = unit.primary_pr()
+        ref = pr_ref_label(primary.repo_slug, primary.number, origin_slug)
+
+        if fs is not None and fs.status in ("merged", "skipped"):
+            console.print(
+                f"  [dim]{unit.feature_id} ({ref}) — {fs.status}, skipping[/dim]"
+            )
+            continue
+
+        if fs is not None and fs.status == "conflict":
+            console.print(
+                f"\n[red]✗[/red] [cyan]{unit.feature_id}[/cyan] ({ref}) is in "
+                "[red]conflict[/red] state — sequential mode will not advance "
+                "until it is resolved."
+            )
+            if fs.conflict_files:
+                for cf in fs.conflict_files:
+                    console.print(f"      [red]•[/red] {cf}")
+            console.print(
+                "  Resolve it manually, then re-run [cyan]releasy continue[/cyan]."
+            )
+            raise SystemExit(1)
+
+        if fs is not None and fs.status in ("needs_review", "branch_created"):
+            if not fs.rebase_pr_url:
+                console.print(
+                    f"\n[red]✗[/red] [cyan]{unit.feature_id}[/cyan] ({ref}) has "
+                    f"status [yellow]{fs.status}[/yellow] but no rebase PR URL "
+                    "on file — cannot determine merge state."
+                )
+                console.print(
+                    "  Open the PR manually (or run "
+                    "[cyan]releasy continue --branch <id>[/cyan]) and try again."
+                )
+                raise SystemExit(1)
+
+            console.print(
+                f"\n  Checking in-flight PR for [cyan]{unit.feature_id}[/cyan] "
+                f"({ref}): [link={fs.rebase_pr_url}]{fs.rebase_pr_url}[/link]"
+            )
+            merged = is_pr_merged(config, fs.rebase_pr_url)
+            if merged is None:
+                console.print(
+                    f"\n[red]✗[/red] Could not determine merge state of "
+                    f"[link={fs.rebase_pr_url}]{fs.rebase_pr_url}[/link]. "
+                    "Check RELEASY_GITHUB_TOKEN / network and retry."
+                )
+                raise SystemExit(1)
+            if not merged:
+                console.print(
+                    f"\n[red]✗[/red] Rebase PR "
+                    f"[link={fs.rebase_pr_url}]{fs.rebase_pr_url}[/link] is "
+                    "[yellow]not merged yet[/yellow]."
+                )
+                console.print(
+                    "  Sequential mode requires it to merge into "
+                    f"[cyan]{base_branch}[/cyan] before the next port. "
+                    "Approve and merge it, then re-run."
+                )
+                raise SystemExit(1)
+
+            fs.status = "merged"
+            fs.conflict_files = []
+            console.print(
+                f"    [green]✓[/green] PR merged — advancing the queue"
+            )
+            _persist_state(config, state)
+            continue
+
+        # No state yet — this is the next unit to port. Refresh remote so
+        # the new branch is created off the latest base (which now
+        # includes any previously-merged sequential ports).
+        console.print(
+            f"\n[bold]Porting next unit:[/bold] [cyan]{unit.feature_id}[/cyan] ({ref})"
+        )
+        console.print(
+            f"  [dim]Re-fetching {remote} so the port branch is based on "
+            f"the current {base_ref}...[/dim]"
+        )
+        fetch_remote(repo_path, remote)
+
+        existing_ids = {f.id for f in config.features}
+        if unit.feature_id in existing_ids:
+            console.print(
+                f"  [yellow]![/yellow] feature {unit.feature_id!r} already "
+                "in config.features — skipping config-list mutation"
+            )
+            # _process_feature_unit appends to config.features; guard against
+            # a duplicate by short-circuiting if it would clash. This matches
+            # the run_pipeline behaviour (which also skips in this case).
+            continue
+
+        _process_feature_unit(
+            config, repo_path, state, unit, base_branch, base_ref, onto,
+            remote, ai_active,
+        )
+
+        # _process_feature_unit may have ended in either a clean port or
+        # an unresolved conflict. Either way, sequential mode stops here:
+        # the user reviews the PR (or fixes the conflict) before invoking
+        # again.
+        new_fs = state.features.get(unit.feature_id)
+        if new_fs is not None and new_fs.status == "conflict":
+            console.print(
+                "\n[yellow]Sequential run stopped on an unresolved conflict.[/yellow] "
+                "Fix it manually, then re-run [cyan]releasy continue[/cyan]."
+            )
+        else:
+            console.print(
+                "\n[bold]Sequential run paused.[/bold] Review and merge the new "
+                "PR, then re-run [cyan]releasy continue[/cyan] to port the next one."
+            )
+        return state
+
+    # Queue exhausted — nothing left.
+    state.phase = "ports_done"
+    _persist_state(config, state)
+    console.print(
+        "\n[green]✓ All sequential ports processed[/green] — queue is empty."
+    )
     return state
 
 

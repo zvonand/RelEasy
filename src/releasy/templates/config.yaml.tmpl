@@ -15,6 +15,13 @@ name: {{ name }}
 # stays local until enabled).
 # push: false
 
+# Sequential mode: process the merged-time-sorted PR queue one PR per
+# `releasy run` / `releasy continue` invocation. Each invocation either
+# confirms the previous rebase PR was merged into target_branch and ports
+# the next PR, or stops with an error. Default: false (batch mode).
+# Incompatible with pr_sources.groups.
+# sequential: false
+
 origin:
   remote: <set me — https or ssh URL of the origin repo>
   remote_name: origin

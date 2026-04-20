@@ -178,6 +178,15 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
     elif len(body) > 4000:
         body = body[:4000] + "\n\n_(truncated)_"
 
+    # SHA Claude can use to inspect the EXACT diff being applied (cherry-pick
+    # of a merge commit uses the first-parent diff, which is what `git show -m
+    # --first-parent` prints). For open PRs we fall back to head_sha so Claude
+    # still has a concrete ref; the prompt also tells it to use `gh pr diff`
+    # as a cross-check.
+    source_pr_merge_sha = (
+        ctx.source_pr.merge_commit_sha or ctx.source_pr.head_sha or ""
+    )
+
     placeholders = {
         "repo_slug": repo_slug,
         "cwd": str(repo_path),
@@ -187,6 +196,7 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
         "source_pr_title": ctx.source_pr.title,
         "source_pr_number": str(ctx.source_pr.number),
         "source_pr_body": body,
+        "source_pr_merge_sha": source_pr_merge_sha,
         "conflict_files": conflict_files_md,
         "build_command": config.ai_resolve.build_command,
         "build_script": _BUILD_SCRIPT,

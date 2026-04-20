@@ -15,6 +15,7 @@ STATUS_ICONS: dict[str, str] = {
     "branch_created": "\U0001f7e1 branch-created",
     "conflict": "\U0001f534 conflict",
     "skipped": "\u23ed skipped",
+    "merged": "\u2705 merged",
 }
 
 STATUS_HEADINGS: dict[str, str] = {
@@ -22,4 +23,5 @@ STATUS_HEADINGS: dict[str, str] = {
     "branch_created": "Branch Created \u2014 PR not opened yet",
     "conflict": "Conflict \u2014 unresolved (manual fix required)",
     "skipped": "Skipped",
+    "merged": "Merged \u2014 landed on target branch",
 }

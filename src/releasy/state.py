@@ -33,6 +33,7 @@ BranchStatus = Literal[
     "branch_created",
     "conflict",
     "skipped",
+    "merged",
 ]
 PipelinePhase = Literal["init", "ports_done"]
 
@@ -44,6 +45,7 @@ STATUS_DISPLAY_ORDER: tuple[str, ...] = (
     "branch_created",
     "needs_review",
     "skipped",
+    "merged",
 )
 
 

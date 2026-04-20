@@ -13,6 +13,22 @@ name: antalya-26.3
 # Default is false — everything stays local until you enable this.
 # push: true
 
+# ── Sequential mode ─────────────────────────────────────────────────
+# When true, RelEasy processes the merged-time-sorted PR queue one PR
+# per `releasy run` / `releasy continue` invocation:
+#   1. The first invocation ports the earliest-merged PR, pushes it,
+#      opens a rebase PR, and exits.
+#   2. You review the PR; once CI is green you approve & merge it
+#      manually into target_branch.
+#   3. The next `releasy continue` checks GitHub: if the previous
+#      rebase PR was merged, it ports the next PR (created from the
+#      now-updated target_branch). If not yet merged, it exits with a
+#      non-zero status and changes nothing.
+#
+# Default: false (batch mode — every discovered PR is ported in one go).
+# Incompatible with pr_sources.groups (config load will fail).
+# sequential: false
+
 # ── Conflict handling ───────────────────────────────────────────────
 # When a cherry-pick conflicts and the AI resolver is disabled or gives
 # up (after exhausting `ai_resolve.max_iterations` build attempts), the

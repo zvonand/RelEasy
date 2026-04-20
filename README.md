@@ -227,6 +227,7 @@ pr_sources:
 | `origin.remote` | Origin repo URL (required) | — |
 | `project` | Short project identifier (used in derived branch names) | — |
 | `target_branch` | Explicit base branch; makes `--onto` optional | derived |
+| `sequential` | Process the merged-time-sorted PR queue one PR per `releasy run` / `releasy continue` invocation. Each invocation requires the previously opened rebase PR to have been merged into `target_branch` before porting the next one. Incompatible with `pr_sources.groups`. | `false` |
 | `update_existing_prs` | When a PR already exists for a port branch: `true` = reuse it and overwrite its title/body; `false` = leave it exactly as-is | `false` |
 | `ai_resolve.max_iterations` | Hard cap (passed to Claude) on build attempts per conflict | `5` |
 | `ai_resolve.api_retries` | Re-invoke Claude on transient Anthropic API errors (separate from `max_iterations`) | `3` |
@@ -413,6 +414,50 @@ releasy continue [--branch <branch-or-feature-id>] [--work-dir <path>]
 
 Exit code: `1` if any port still has unresolved conflicts (full-pass
 mode) or if the targeted branch couldn't be marked resolved.
+
+#### Sequential mode
+
+When `sequential: true` is set in `config.yaml`, both `releasy run` and
+`releasy continue` (without `--branch`) switch to a strict one-PR-at-a-
+time pipeline. The discovered PR queue is sorted by `merged_at` (same
+order as the default mode) and processed exactly one entry per
+invocation:
+
+1. **First invocation** — port the earliest-merged PR: cherry-pick onto
+   the current `origin/<target_branch>` (resolving conflicts via
+   `ai_resolve` if enabled), push, open the rebase PR, and exit.
+2. **Manual review** — you wait for CI, review, approve, and merge that
+   PR into `target_branch` yourself.
+3. **Next invocation** — `releasy continue` (or `releasy run`) checks
+   GitHub:
+   - Previous rebase PR **merged** → marks the entry as `merged` in
+     state, re-fetches `origin`, and ports the next PR off the now
+     up-to-date base. Stops again after opening the new PR.
+   - Previous rebase PR **not merged** (still open / closed without
+     merge / API lookup failed) → exits with status `1` and changes
+     nothing. Re-run after merging the in-flight PR.
+4. Repeat until the queue is empty (or a port hits a conflict the AI
+   can't resolve, in which case the run stops in `conflict` state and
+   the next invocation refuses to advance until you fix it manually and
+   call `releasy continue --branch <id>`).
+
+Constraints:
+
+- **Incompatible with `pr_sources.groups`** — config load fails with a
+  clear error. Use `include_prs` instead (or split the group into
+  individual PRs).
+- Requires `target_branch:` in config (no `--onto` derivation in
+  sequential mode for `releasy continue`).
+- The `merged` status is reflected on the GitHub Project board too
+  (re-run `releasy setup-project` once to provision the new option).
+
+```bash
+# First port:
+releasy run
+
+# (review, approve, merge the opened PR on GitHub, then:)
+releasy continue
+```
 
 #### `releasy skip` — drop a conflicted port from this run
 
