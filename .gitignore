@@ -1,6 +1,7 @@
 # RelEasy runtime files
 config.yaml
 state.yaml
+STATUS.md
 
 # Python
 __pycache__/

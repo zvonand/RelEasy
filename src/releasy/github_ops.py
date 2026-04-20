@@ -1048,7 +1048,15 @@ def _set_item_number_field(
     GitHub's GraphQL API takes a ``Float`` for ``value.number``; passing
     a Python float is fine — the JSON encoder serialises it correctly
     and integers are accepted too.
+
+    GitHub rejects values with more than 8 decimal places (``VALIDATION``
+    error). Accumulated AI costs (``$4.5365`` becoming
+    ``4.536499999999999`` after summing several Claude usage entries)
+    routinely trip this, so the value is rounded to 8 fractional digits
+    before being sent. Eight is the API ceiling — well above the
+    cents-level precision we actually care about.
     """
+    safe_value = round(float(value), 8)
     mutation = """
     mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: Float!) {
       updateProjectV2ItemFieldValue(input: {
@@ -1065,7 +1073,7 @@ def _set_item_number_field(
         "projectId": project_id,
         "itemId": item_id,
         "fieldId": field_id,
-        "value": float(value),
+        "value": safe_value,
     })
     return data is not None
 
