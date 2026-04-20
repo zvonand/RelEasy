@@ -31,7 +31,13 @@ _CLI_CONTEXT_SETTINGS = {"max_content_width": 120}
 
 @click.group(context_settings=_CLI_CONTEXT_SETTINGS)
 @click.version_option(version=__version__, prog_name="releasy")
-@click.option("--config", "config_path", default=None, help="Path to config.yaml")
+@click.option(
+    "--config",
+    "--config-file",
+    "config_path",
+    default=None,
+    help="Path to config.yaml (defaults to ./config.yaml in the current directory)",
+)
 @click.pass_context
 def cli(ctx: click.Context, config_path: str | None) -> None:
     """RelEasy — manage port branches and release construction."""
@@ -146,6 +152,38 @@ def status(ctx: click.Context) -> None:
 
     config = _load_config_or_exit(ctx.obj["config_path"])
     print_status(config)
+
+
+@cli.command(
+    name="import",
+    short_help="Rebuild state.yaml from GitHub + the project board.",
+)
+@click.pass_context
+def import_cmd(ctx: click.Context) -> None:
+    """Rebuild state.yaml from GitHub + the GitHub Project board.
+
+    Use this when state.yaml is missing or out of date (fresh clone,
+    teammate takeover, new machine, throwaway CI runner) but the rest
+    of the world is unchanged — source PRs still live on GitHub, rebase
+    PRs are still open on origin, and the configured project board still
+    carries the Skipped / AI Cost history.
+
+    Read-only: no git checkouts, no clones, no pushes, no new PRs. The
+    command only hits the GitHub REST / GraphQL APIs. It merges into
+    any existing state.yaml — local-only fields (ai_iterations,
+    failed_step_index, partial_pr_count) are preserved verbatim; the
+    board wins for `Skipped` decisions and `AI Cost`; every other field
+    is refreshed from the authoritative source.
+
+    Requires notifications.github_project in config — without a project
+    board there's no durable source for the Skipped / cost values that
+    can't be re-derived from PRs alone.
+    """
+    from releasy.import_state import import_from_github
+
+    config = _load_config_or_exit(ctx.obj["config_path"])
+    if not import_from_github(config):
+        raise SystemExit(1)
 
 
 @cli.command(short_help="Merge target branch into each tracked PR.")

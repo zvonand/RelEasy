@@ -357,108 +357,22 @@ def _prune_superseded_singletons(config: Config, state: PipelineState) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Main pipeline
+# PR discovery (shared by run_pipeline and import_state)
 # ---------------------------------------------------------------------------
 
 
-def run_pipeline(
-    config: Config,
-    onto: str,
-    work_dir: Path | None = None,
-    resolve_conflicts: bool = True,
-) -> PipelineState:
-    """Port PRs onto ``origin/<base_branch>``.
+def discover_feature_units(config: Config) -> list["FeatureUnit"]:
+    """Discover the PR units defined by ``config.pr_sources``.
 
-    ``resolve_conflicts`` is a CLI-level kill-switch. The AI resolver only
-    runs when both this flag and ``config.ai_resolve.enabled`` are true.
+    Pure discovery: hits GitHub but touches no git worktree. Returns the
+    fully-filtered, ordered list of :class:`FeatureUnit`s the pipeline
+    would attempt to port, so other commands (``releasy import``) can
+    rebuild state from the same source-of-truth definition.
+
+    Output (``console.print``) mirrors ``releasy run``'s "Phase: Porting"
+    discovery block — this helper is called in place of the inline block
+    that used to live in :func:`run_pipeline`.
     """
-    state = load_state(config.repo_dir)
-    _prune_superseded_singletons(config, state)
-    repo_path = _setup_repo(config, work_dir, config.base_branch_name(onto))
-
-    if is_operation_in_progress(repo_path):
-        if config.pr_sources.if_exists == "recreate":
-            kind = abort_in_progress_op(repo_path)
-            console.print(
-                f"\n[yellow]↻ Aborted in-progress {kind} in [cyan]{repo_path}[/cyan][/yellow] "
-                f"(pr_sources.if_exists: recreate)"
-            )
-        else:
-            console.print(
-                f"\n[red]✗[/red] A cherry-pick/merge/rebase is already in progress "
-                f"in [cyan]{repo_path}[/cyan]."
-            )
-            console.print(
-                "  Resolve it first (or run `git cherry-pick --abort`), then re-run.\n"
-                "  Or set [cyan]pr_sources.if_exists: recreate[/cyan] in config to "
-                "auto-abort it."
-            )
-            raise SystemExit(2)
-
-    base_branch = config.base_branch_name(onto)
-    remote = config.origin.remote_name
-
-    # Verify the base branch already exists on origin.
-    if not branch_exists(repo_path, base_branch, remote):
-        console.print(
-            f"\n[red]✗[/red] Base branch [cyan]{base_branch}[/cyan] does not exist "
-            f"on remote [cyan]{remote}[/cyan].\n"
-            f"  Create and push it first, then re-run."
-        )
-        raise SystemExit(2)
-
-    base_ref = f"{remote}/{base_branch}"
-    console.print(f"Base: [cyan]{base_ref}[/cyan]")
-    console.print(
-        f"PRs will be opened against [bold cyan]{require_origin_repo_slug(config)}[/bold cyan] "
-        "(origin) — RelEasy never opens PRs against any other repo."
-    )
-
-    state.set_started(onto)
-    state.base_branch = base_branch
-    state.phase = "init"
-    _update_state_and_status(config, state)
-
-    if config.push:
-        ensure_label(
-            config, RELEASY_LABEL, RELEASY_LABEL_COLOR, RELEASY_LABEL_DESCRIPTION,
-        )
-
-    ai_active = resolve_conflicts and config.ai_resolve.enabled
-    if ai_active:
-        console.print(
-            f"[dim]AI conflict resolver: enabled "
-            f"(command='{config.ai_resolve.command}', "
-            f"label='{config.ai_resolve.label}', "
-            f"max_iterations={config.ai_resolve.max_iterations})[/dim]"
-        )
-        if config.push:
-            ensure_label(
-                config,
-                config.ai_resolve.label,
-                config.ai_resolve.label_color,
-                "Port conflict auto-resolved by Claude",
-            )
-    else:
-        why = "disabled via --no-resolve-conflicts" if not resolve_conflicts else "disabled in config"
-        console.print(f"[dim]AI conflict resolver: {why}[/dim]")
-
-    # The needs-attention label is used for partial-group draft PRs whenever
-    # an unresolved conflict surfaces, regardless of whether the AI resolver
-    # was enabled — pre-create it so the PR-creation path doesn't fail on a
-    # missing label.
-    if config.push:
-        ensure_label(
-            config,
-            config.ai_resolve.needs_attention_label,
-            config.ai_resolve.needs_attention_label_color,
-            "Releasy stopped on a conflict it could not resolve — needs human review",
-        )
-
-    console.print(
-        f"\n[bold]Phase:[/bold] Porting PRs onto [cyan]{base_branch}[/cyan]"
-    )
-
     origin_slug = get_origin_repo_slug(config)
 
     # --- Collect PRs from all sources (union) ---
@@ -588,6 +502,113 @@ def run_pipeline(
         _build_singleton_units(config, collected) + group_units
     )
     units.sort(key=lambda u: u.sort_key)
+    return units
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+
+def run_pipeline(
+    config: Config,
+    onto: str,
+    work_dir: Path | None = None,
+    resolve_conflicts: bool = True,
+) -> PipelineState:
+    """Port PRs onto ``origin/<base_branch>``.
+
+    ``resolve_conflicts`` is a CLI-level kill-switch. The AI resolver only
+    runs when both this flag and ``config.ai_resolve.enabled`` are true.
+    """
+    state = load_state(config.repo_dir)
+    _prune_superseded_singletons(config, state)
+    repo_path = _setup_repo(config, work_dir, config.base_branch_name(onto))
+
+    if is_operation_in_progress(repo_path):
+        if config.pr_sources.if_exists == "recreate":
+            kind = abort_in_progress_op(repo_path)
+            console.print(
+                f"\n[yellow]↻ Aborted in-progress {kind} in [cyan]{repo_path}[/cyan][/yellow] "
+                f"(pr_sources.if_exists: recreate)"
+            )
+        else:
+            console.print(
+                f"\n[red]✗[/red] A cherry-pick/merge/rebase is already in progress "
+                f"in [cyan]{repo_path}[/cyan]."
+            )
+            console.print(
+                "  Resolve it first (or run `git cherry-pick --abort`), then re-run.\n"
+                "  Or set [cyan]pr_sources.if_exists: recreate[/cyan] in config to "
+                "auto-abort it."
+            )
+            raise SystemExit(2)
+
+    base_branch = config.base_branch_name(onto)
+    remote = config.origin.remote_name
+
+    # Verify the base branch already exists on origin.
+    if not branch_exists(repo_path, base_branch, remote):
+        console.print(
+            f"\n[red]✗[/red] Base branch [cyan]{base_branch}[/cyan] does not exist "
+            f"on remote [cyan]{remote}[/cyan].\n"
+            f"  Create and push it first, then re-run."
+        )
+        raise SystemExit(2)
+
+    base_ref = f"{remote}/{base_branch}"
+    console.print(f"Base: [cyan]{base_ref}[/cyan]")
+    console.print(
+        f"PRs will be opened against [bold cyan]{require_origin_repo_slug(config)}[/bold cyan] "
+        "(origin) — RelEasy never opens PRs against any other repo."
+    )
+
+    state.set_started(onto)
+    state.base_branch = base_branch
+    state.phase = "init"
+    _update_state_and_status(config, state)
+
+    if config.push:
+        ensure_label(
+            config, RELEASY_LABEL, RELEASY_LABEL_COLOR, RELEASY_LABEL_DESCRIPTION,
+        )
+
+    ai_active = resolve_conflicts and config.ai_resolve.enabled
+    if ai_active:
+        console.print(
+            f"[dim]AI conflict resolver: enabled "
+            f"(command='{config.ai_resolve.command}', "
+            f"label='{config.ai_resolve.label}', "
+            f"max_iterations={config.ai_resolve.max_iterations})[/dim]"
+        )
+        if config.push:
+            ensure_label(
+                config,
+                config.ai_resolve.label,
+                config.ai_resolve.label_color,
+                "Port conflict auto-resolved by Claude",
+            )
+    else:
+        why = "disabled via --no-resolve-conflicts" if not resolve_conflicts else "disabled in config"
+        console.print(f"[dim]AI conflict resolver: {why}[/dim]")
+
+    # The needs-attention label is used for partial-group draft PRs whenever
+    # an unresolved conflict surfaces, regardless of whether the AI resolver
+    # was enabled — pre-create it so the PR-creation path doesn't fail on a
+    # missing label.
+    if config.push:
+        ensure_label(
+            config,
+            config.ai_resolve.needs_attention_label,
+            config.ai_resolve.needs_attention_label_color,
+            "Releasy stopped on a conflict it could not resolve — needs human review",
+        )
+
+    console.print(
+        f"\n[bold]Phase:[/bold] Porting PRs onto [cyan]{base_branch}[/cyan]"
+    )
+
+    units = discover_feature_units(config)
 
     if not units:
         console.print("\n  [dim]No PRs or groups to process after filtering[/dim]")

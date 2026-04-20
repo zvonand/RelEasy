@@ -258,6 +258,14 @@ class PRInfo:
     merged_at: str | None = None  # ISO timestamp of merge
     labels: list[str] = None  # type: ignore[assignment]
     author: str | None = None  # GitHub login of the PR author
+    # GitHub's ``mergeable_state`` for OPEN PRs. Set on the lookups used
+    # by ``releasy import`` so we can decide whether a rebase PR is
+    # currently clean or conflicting without a trial merge. Values seen
+    # in the wild: "clean", "dirty" (= conflicting), "unstable" (CI red
+    # but no conflicts), "blocked" (branch-protection / review wait),
+    # "behind" (base moved — needs update), "draft", "unknown" (GitHub
+    # still computing). ``None`` when we didn't bother to look it up.
+    mergeable_state: str | None = None
 
     def __post_init__(self) -> None:
         if self.labels is None:
@@ -573,6 +581,7 @@ def find_pr_for_branch(
                 merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
                 labels=[lbl.name for lbl in pr.labels],
                 author=_pr_author(pr),
+                mergeable_state=getattr(pr, "mergeable_state", None),
             )
         return None
     except GithubException as exc:
@@ -580,6 +589,67 @@ def find_pr_for_branch(
         return None
     except Exception as exc:
         log.warning("Unexpected error looking up PR for branch %s: %s", head_branch, exc)
+        return None
+
+
+def find_latest_pr_for_branch(
+    config: Config, head_branch: str, base: str | None = None,
+) -> PRInfo | None:
+    """Return the most recent PR (any state) from ``head_branch`` → ``base``.
+
+    Unlike :func:`find_pr_for_branch` which is scoped to open PRs, this
+    looks across ``state="all"`` and returns whichever PR was updated
+    most recently. ``releasy import`` uses it so a rebase PR that's
+    already been merged (or closed in favour of a replacement) still
+    gets surfaced in reconstructed state — otherwise the feature would
+    silently reappear as "never ported" on a fresh checkout.
+    """
+    token = get_github_token()
+    if not token:
+        return None
+
+    slug = get_origin_repo_slug(config)
+    if not slug:
+        return None
+
+    owner = slug.split("/")[0]
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        kwargs: dict = {
+            "state": "all", "head": f"{owner}:{head_branch}",
+            "sort": "updated", "direction": "desc",
+        }
+        if base:
+            kwargs["base"] = base
+        for pr in repo.get_pulls(**kwargs):
+            pr_state = (
+                "merged" if pr.merged
+                else ("open" if pr.state == "open" else "closed")
+            )
+            return PRInfo(
+                number=pr.number,
+                title=pr.title,
+                body=pr.body or "",
+                state=pr_state,
+                merge_commit_sha=pr.merge_commit_sha if pr.merged else None,
+                head_sha=pr.head.sha,
+                url=pr.html_url,
+                repo_slug=slug,
+                merged_at=pr.merged_at.isoformat() if pr.merged_at else None,
+                labels=[lbl.name for lbl in pr.labels],
+                author=_pr_author(pr),
+                mergeable_state=getattr(pr, "mergeable_state", None) if pr_state == "open" else None,
+            )
+        return None
+    except GithubException as exc:
+        log.warning("Failed to look up PR history for branch %s: %s", head_branch, exc)
+        return None
+    except Exception as exc:
+        log.warning("Unexpected error looking up PR history for branch %s: %s", head_branch, exc)
         return None
 
 
@@ -855,6 +925,174 @@ def _ensure_ai_cost_field(project_id: str) -> str | None:
     if existing:
         return existing
     return _create_number_field(project_id, AI_COST_FIELD_NAME)
+
+
+@dataclass
+class ProjectBoardCard:
+    """One card we read back from the GitHub Project board.
+
+    Produced by :func:`fetch_project_board_snapshot`. Used by ``releasy
+    import`` to promote the board to source-of-truth for the two fields
+    local state can't recover from PRs alone: the ``Skipped`` decision
+    (set by humans via ``releasy skip``) and the cumulative ``AI Cost``
+    (billed to Claude and mirrored to the board on every sync).
+    """
+    item_id: str
+    # When the card is a real PR attachment: ``url`` + ``number`` are
+    # populated. For DraftIssue fallback cards (features that have no PR
+    # yet — e.g. dropped-singleton conflicts) only ``draft_title`` is set.
+    pr_url: str | None
+    pr_number: int | None
+    draft_title: str | None
+    # Status option as configured on the board ("Needs Review", "Skipped",
+    # …). ``None`` if the card has no Status value or the field is missing.
+    status: str | None
+    # ``AI Cost`` number field. ``None`` means "never billed" (distinct
+    # from 0.0 which RelEasy writes on sync for cards that ran the
+    # resolver but paid nothing, though GitHub itself reports unset as
+    # None — we preserve that distinction).
+    ai_cost_usd: float | None
+
+
+def _list_project_items_with_fields(project_id: str) -> list[dict]:
+    """Paginate every item on a project with its field values attached.
+
+    Companion to :func:`_list_project_items` — same shape, plus a
+    ``fieldValues`` node carrying each item's Status option and AI Cost
+    number. Broken out as a separate query so we don't slow down the hot
+    write-path in :func:`sync_project` (which doesn't need field values
+    to match items). ``releasy import`` is the sole caller today.
+    """
+    query = """
+    query($projectId: ID!, $cursor: String) {
+      node(id: $projectId) {
+        ... on ProjectV2 {
+          items(first: 100, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              content {
+                __typename
+                ... on DraftIssue { id title }
+                ... on Issue { id number url }
+                ... on PullRequest { id number url }
+              }
+              fieldValues(first: 20) {
+                nodes {
+                  __typename
+                  ... on ProjectV2ItemFieldSingleSelectValue {
+                    name
+                    field {
+                      ... on ProjectV2FieldCommon { name }
+                    }
+                  }
+                  ... on ProjectV2ItemFieldNumberValue {
+                    number
+                    field {
+                      ... on ProjectV2FieldCommon { name }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    items: list[dict] = []
+    cursor: str | None = None
+    while True:
+        data = _gql(query, {"projectId": project_id, "cursor": cursor})
+        if not data:
+            return items
+        try:
+            page = data["node"]["items"]
+        except (KeyError, TypeError):
+            return items
+        items.extend(page.get("nodes") or [])
+        info = page.get("pageInfo") or {}
+        if not info.get("hasNextPage"):
+            return items
+        cursor = info.get("endCursor")
+        if not cursor:
+            return items
+
+
+def fetch_project_board_snapshot(
+    config: Config,
+) -> list[ProjectBoardCard] | None:
+    """Read every card off the configured GitHub Project.
+
+    Returns ``None`` when sync can't even start — no project configured,
+    no token, unparseable URL, or GraphQL couldn't resolve the project
+    id. Returns an empty list for an empty (but valid) board.
+
+    Consumers (``releasy import``) match returned cards against local
+    features by ``pr_url`` first and fall back to ``draft_title``
+    parsing — see :func:`_project_item_body`'s title convention
+    (``"<branch_name> (<feature_id>)"``).
+    """
+    project_url = config.notifications.github_project
+    if not project_url:
+        return None
+    if not get_github_token():
+        return None
+    parsed = _parse_project_url(project_url)
+    if not parsed:
+        return None
+    owner, number, is_org = parsed
+    project_id = _get_project_id(owner, number, is_org)
+    if not project_id:
+        return None
+
+    raw = _list_project_items_with_fields(project_id)
+    cards: list[ProjectBoardCard] = []
+    for item in raw:
+        content = item.get("content") or {}
+        kind = content.get("__typename")
+        pr_url: str | None = None
+        pr_number: int | None = None
+        draft_title: str | None = None
+        if kind == "PullRequest":
+            pr_url = content.get("url")
+            pr_number = content.get("number")
+        elif kind == "DraftIssue":
+            draft_title = content.get("title")
+        else:
+            # Issue or some other content — not something RelEasy
+            # itself creates. Skip (we won't be able to map it back to
+            # a feature anyway).
+            continue
+
+        status: str | None = None
+        ai_cost: float | None = None
+        for fv in (item.get("fieldValues") or {}).get("nodes", []) or []:
+            field = (fv.get("field") or {}).get("name") or ""
+            fname = field.lower()
+            tn = fv.get("__typename")
+            if tn == "ProjectV2ItemFieldSingleSelectValue" and fname == "status":
+                status = fv.get("name")
+            elif (
+                tn == "ProjectV2ItemFieldNumberValue"
+                and fname == AI_COST_FIELD_NAME.lower()
+            ):
+                raw_num = fv.get("number")
+                if raw_num is not None:
+                    try:
+                        ai_cost = float(raw_num)
+                    except (TypeError, ValueError):
+                        ai_cost = None
+
+        cards.append(ProjectBoardCard(
+            item_id=item.get("id") or "",
+            pr_url=pr_url,
+            pr_number=pr_number,
+            draft_title=draft_title,
+            status=status,
+            ai_cost_usd=ai_cost,
+        ))
+    return cards
 
 
 def _list_project_items(project_id: str) -> list[dict]:
