@@ -819,6 +819,67 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
 
+def make_stateless_config(
+    origin_url: str,
+    *,
+    work_dir: Path | None = None,
+    push: bool = True,
+    auto_pr: bool = False,
+    ai_enabled: bool = False,
+    ai_command: str = "claude",
+    ai_build_command: str = "",
+    ai_prompt_file: str | None = None,
+    ai_timeout_seconds: int = 7200,
+    ai_max_iterations: int = 5,
+) -> Config:
+    """Build an in-memory ``Config`` for the stateless cherry-pick command.
+
+    No YAML is read or written. The resulting ``Config`` has a sentinel
+    ``name`` (``"_stateless"``) — callers MUST NOT pass it to
+    ``load_state`` / ``save_state`` / ``project_lock``; the stateless
+    flow deliberately bypasses all per-project persistence.
+
+    ``ai_prompt_file`` defaults to the bundled
+    ``src/releasy/prompts/resolve_conflict.md`` so users running
+    ``releasy cherry-pick --resolve-conflicts`` don't need to ship a
+    template alongside the install.
+
+    ``config_path`` is set to ``<cwd>/<stateless>`` so any relative-path
+    resolution that goes through ``config.repo_dir`` (e.g.
+    ``ai_resolve.prompt_file`` rendering) lands in a sane place even
+    though no real file is read.
+    """
+    if ai_prompt_file is None:
+        bundled = (
+            Path(__file__).parent / "prompts" / "resolve_conflict.md"
+        ).resolve()
+        ai_prompt_file = str(bundled)
+
+    project_slug = "stateless"
+    return Config(
+        name="_stateless",
+        origin=OriginConfig(remote=origin_url),
+        project=project_slug,
+        target_branch=None,
+        update_existing_prs=False,
+        features=[],
+        pr_sources=PRSourcesConfig(auto_pr=auto_pr),
+        notifications=NotificationsConfig(),
+        ai_resolve=AIResolveConfig(
+            enabled=ai_enabled,
+            command=ai_command,
+            prompt_file=ai_prompt_file,
+            build_command=ai_build_command,
+            max_iterations=ai_max_iterations,
+            timeout_seconds=ai_timeout_seconds,
+        ),
+        config_path=(Path.cwd() / "<stateless>").resolve(),
+        work_dir=work_dir.resolve() if work_dir is not None else None,
+        push=push,
+        sequential=False,
+    )
+
+
 def get_github_token() -> str | None:
     return os.environ.get("RELEASY_GITHUB_TOKEN")
 

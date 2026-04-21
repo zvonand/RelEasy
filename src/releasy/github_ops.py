@@ -268,6 +268,62 @@ def parse_pr_url(url: str) -> tuple[str, str, int] | None:
     return m.group(1), m.group(2), int(m.group(3))
 
 
+def parse_source_url(
+    url: str,
+) -> tuple[str, str, str, str] | None:
+    """Classify a GitHub URL as a PR, commit, or tag reference.
+
+    Returns ``(kind, owner, repo, identifier)`` where:
+
+    - ``kind == "pr"``     → identifier is the PR number as a string
+    - ``kind == "commit"`` → identifier is the commit SHA (any length)
+    - ``kind == "tag"``    → identifier is the tag name
+
+    Recognised URL shapes (trailing ``.git`` on the repo segment is
+    tolerated, query strings / fragments are ignored):
+
+    - ``https://github.com/<owner>/<repo>/pull/<N>``
+    - ``https://github.com/<owner>/<repo>/commit/<sha>``
+    - ``https://github.com/<owner>/<repo>/releases/tag/<tag>``
+    - ``https://github.com/<owner>/<repo>/tree/<tag>``     (only when the
+      ref is a tag — caller resolves it via ``git ls-remote`` and
+      decides if it points at a commit)
+
+    Returns ``None`` if the URL doesn't match any of the above.
+    """
+    cleaned = url.split("?", 1)[0].split("#", 1)[0]
+
+    m = re.match(
+        r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/pull/(\d+)\b",
+        cleaned,
+    )
+    if m:
+        return "pr", m.group(1), m.group(2), m.group(3)
+
+    m = re.match(
+        r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/commit/([0-9a-fA-F]{4,40})\b",
+        cleaned,
+    )
+    if m:
+        return "commit", m.group(1), m.group(2), m.group(3).lower()
+
+    m = re.match(
+        r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/releases/tag/(.+?)/?$",
+        cleaned,
+    )
+    if m:
+        return "tag", m.group(1), m.group(2), m.group(3)
+
+    m = re.match(
+        r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/tree/(.+?)/?$",
+        cleaned,
+    )
+    if m:
+        return "tag", m.group(1), m.group(2), m.group(3)
+
+    return None
+
+
 def slug_to_https_url(slug: str) -> str:
     """Build the canonical HTTPS git URL for a ``owner/repo`` slug."""
     return f"https://github.com/{slug}.git"

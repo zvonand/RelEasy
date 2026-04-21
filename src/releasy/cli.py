@@ -164,6 +164,163 @@ def run(
 
 
 @cli.command(
+    name="cherry-pick",
+    short_help="One-off cross-repo cherry-pick (no config / state file).",
+)
+@click.option(
+    "--origin",
+    "origin",
+    required=True,
+    help="Origin remote URL (ssh or https) — the repo to clone, push to, "
+         "and open the PR against. e.g. git@github.com:owner/repo.git",
+)
+@click.option(
+    "--target",
+    "target",
+    required=True,
+    help="Branch on origin to base the port on and (optionally) open a "
+         "PR against. Must already exist on the origin remote.",
+)
+@click.option(
+    "--commit",
+    "source_url",
+    required=True,
+    help="GitHub URL of the source to cherry-pick. Accepts a PR "
+         "(.../pull/N — uses the merge commit with -m 1), a commit "
+         "(.../commit/<sha>), or a tag (.../releases/tag/<tag> or "
+         ".../tree/<tag>). May reference any public repo (e.g. a fork).",
+)
+@click.option("--work-dir", default=None, help="Working directory for git operations")
+@click.option(
+    "--branch-name",
+    "branch_name",
+    default=None,
+    help="Name of the port branch. Defaults to "
+         "releasy/port/<short-id>-<6hex>.",
+)
+@click.option(
+    "--push/--no-push",
+    default=True,
+    help="Push the resulting branch to origin. Default: on.",
+)
+@click.option(
+    "--with-pr",
+    "with_pr",
+    is_flag=True,
+    default=False,
+    help="Open a PR from the port branch back to --target on origin. "
+         "Requires --push (implied) and RELEASY_GITHUB_TOKEN.",
+)
+@click.option(
+    "--resolve-conflicts",
+    is_flag=True,
+    default=False,
+    help="On conflict, invoke Claude (or whatever --claude-command points "
+         "at) to resolve. Requires --build-command so Claude can verify "
+         "the resolution compiles.",
+)
+@click.option(
+    "--build-command",
+    "build_command",
+    default="",
+    help="Shell command Claude runs to verify the resolution compiles. "
+         "Required when --resolve-conflicts is set. Example: "
+         "'cd build && ninja'.",
+)
+@click.option(
+    "--claude-command",
+    "claude_command",
+    default="claude",
+    show_default=True,
+    help="Executable used to invoke Claude.",
+)
+@click.option(
+    "--prompt-file",
+    "prompt_file",
+    default=None,
+    help="Path to the AI-resolve prompt template. Defaults to the "
+         "prompt bundled with the releasy package.",
+)
+@click.option(
+    "--timeout",
+    "timeout_seconds",
+    type=int,
+    default=7200,
+    show_default=True,
+    help="Per-attempt Claude timeout (seconds).",
+)
+@click.option(
+    "--max-iterations",
+    "max_iterations",
+    type=int,
+    default=5,
+    show_default=True,
+    help="Maximum build attempts Claude may make per resolve invocation.",
+)
+def cherry_pick_cmd(
+    origin: str,
+    target: str,
+    source_url: str,
+    work_dir: str | None,
+    branch_name: str | None,
+    push: bool,
+    with_pr: bool,
+    resolve_conflicts: bool,
+    build_command: str,
+    claude_command: str,
+    prompt_file: str | None,
+    timeout_seconds: int,
+    max_iterations: int,
+) -> None:
+    """One-off cross-repo cherry-pick — no config file, no state file.
+
+    Cherry-picks a PR / commit / tag from any public GitHub repo onto a
+    fresh branch off ``--target`` in ``--origin``, optionally lets
+    Claude resolve any conflicts, optionally pushes the branch and
+    opens a PR back against ``--target``.
+
+    Nothing is persisted: this command does not read or write any
+    releasy config / state / lock / project board. Re-running it makes
+    a brand-new branch every time (use ``--branch-name`` to control it).
+    """
+    if resolve_conflicts and not build_command.strip():
+        raise click.UsageError(
+            "--resolve-conflicts requires --build-command (the shell "
+            "command Claude will run to verify the resolution compiles). "
+            "Pass --build-command 'cd build && ninja' (or similar)."
+        )
+    if with_pr and not push:
+        raise click.UsageError(
+            "--with-pr requires --push; cannot open a PR for an "
+            "unpushed branch."
+        )
+
+    from releasy.stateless import StatelessOptions, run_stateless_cherry_pick
+
+    opts = StatelessOptions(
+        origin=origin,
+        target=target,
+        source_url=source_url,
+        work_dir=Path(work_dir) if work_dir else None,
+        branch_name=branch_name,
+        push=push,
+        open_pr=with_pr,
+        resolve_conflicts=resolve_conflicts,
+        build_command=build_command,
+        claude_command=claude_command,
+        prompt_file=prompt_file,
+        timeout_seconds=timeout_seconds,
+        max_iterations=max_iterations,
+    )
+
+    result = run_stateless_cherry_pick(opts)
+    if not result.success:
+        if result.error:
+            raise click.ClickException(result.error)
+        raise SystemExit(1)
+
+
+@cli.command(
     name="continue",
     short_help="Reconcile state after manual fixes.",
 )

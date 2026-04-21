@@ -422,6 +422,40 @@ def fetch_pr_ref(repo_path: Path, remote_or_url: str, pr_number: int) -> bool:
     return result.returncode == 0
 
 
+def resolve_remote_tag(
+    repo_path: Path, remote_or_url: str, tag: str,
+) -> str | None:
+    """Resolve a tag name on a remote (or full URL) to a commit SHA.
+
+    Uses ``git ls-remote --tags <remote_or_url> <tag>``. For annotated
+    tags this returns the tag-object SHA on the bare line and the
+    commit SHA on the dereferenced (``^{}``) line; we prefer the
+    dereferenced commit when present so the caller always cherry-picks
+    a real commit, never a tag object.
+
+    Returns the commit SHA, or ``None`` if the tag couldn't be found.
+    """
+    result = run_git(
+        ["ls-remote", "--tags", remote_or_url, tag, f"{tag}^{{}}"],
+        repo_path,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    sha_for_tag: str | None = None
+    sha_dereferenced: str | None = None
+    for line in result.stdout.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        sha, ref = parts[0].strip(), parts[1].strip()
+        if ref.endswith("^{}"):
+            sha_dereferenced = sha
+        else:
+            sha_for_tag = sha
+    return sha_dereferenced or sha_for_tag
+
+
 def fetch_commit(repo_path: Path, remote_or_url: str, sha: str) -> bool:
     """Fetch a single commit by SHA from a remote name or URL.
 
@@ -434,19 +468,30 @@ def fetch_commit(repo_path: Path, remote_or_url: str, sha: str) -> bool:
     return result.returncode == 0
 
 
-def cherry_pick_merge_commit(
-    repo_path: Path, commit: str, *, abort_on_conflict: bool = True,
+def cherry_pick_sha(
+    repo_path: Path,
+    commit: str,
+    *,
+    mainline: int | None = None,
+    abort_on_conflict: bool = True,
 ) -> OperationResult:
-    """Cherry-pick a merge commit using its first-parent diff.
+    """Cherry-pick a single commit (merge or non-merge) onto HEAD.
 
-    When abort_on_conflict is False the working tree is left in the
-    conflicted state so the caller can commit the conflict markers.
+    ``mainline`` selects the merge parent for merge commits (1 = the
+    "into" side, which is what GitHub's ``Merge pull request`` button
+    produces, so cherry-picking a PR uses ``mainline=1``). Pass
+    ``None`` for a non-merge commit; ``git cherry-pick`` rejects ``-m``
+    on non-merge commits, so we omit the flag entirely.
+
+    When ``abort_on_conflict`` is False the working tree is left in the
+    conflicted state so the caller can drive resolution (Claude, manual
+    fixup, or commit the markers as WIP).
     """
-    result = run_git(
-        ["cherry-pick", "-m", "1", "--no-edit", commit],
-        repo_path,
-        check=False,
-    )
+    argv = ["cherry-pick"]
+    if mainline is not None:
+        argv += ["-m", str(mainline)]
+    argv += ["--no-edit", commit]
+    result = run_git(argv, repo_path, check=False)
     if result.returncode == 0:
         return OperationResult(success=True, conflict_files=[])
 
@@ -457,6 +502,20 @@ def cherry_pick_merge_commit(
         success=False,
         conflict_files=conflict_files,
         error_message=result.stderr.strip() if result.stderr else None,
+    )
+
+
+def cherry_pick_merge_commit(
+    repo_path: Path, commit: str, *, abort_on_conflict: bool = True,
+) -> OperationResult:
+    """Cherry-pick a merge commit using its first-parent diff.
+
+    Thin wrapper around :func:`cherry_pick_sha` with ``mainline=1``,
+    kept as the canonical entry-point for the PR-port flow (which only
+    ever cherry-picks GitHub merge commits).
+    """
+    return cherry_pick_sha(
+        repo_path, commit, mainline=1, abort_on_conflict=abort_on_conflict,
     )
 
 
