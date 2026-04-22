@@ -130,12 +130,22 @@ def cli(ctx: click.Context, config_path: str | None) -> None:
     help="Invoke the AI resolver on conflicts (requires ai_resolve.enabled in config). "
          "Default: on.",
 )
+@click.option(
+    "--retry-failed/--no-retry-failed",
+    default=None,
+    help="Re-attempt PR units whose previous run ended in `conflict` "
+         "status: discard the existing branch and re-run the cherry-pick "
+         "from base. With --no-retry-failed those entries are left "
+         "exactly as-is. Defaults to the `pr_sources.retry_failed` value "
+         "in config (true unless overridden).",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
     onto: str | None,
     work_dir: str | None,
     resolve_conflicts: bool,
+    retry_failed: bool | None,
 ) -> None:
     """Discover and port new PRs onto the base branch (cherry-pick + open PR)."""
     from releasy.pipeline import run_pipeline, run_sequential
@@ -149,12 +159,24 @@ def run(
             onto = config.target_branch
 
         wd = Path(work_dir) if work_dir else None
+        effective_retry_failed = (
+            config.pr_sources.retry_failed
+            if retry_failed is None else retry_failed
+        )
 
         if config.sequential:
-            run_sequential(config, onto, wd, resolve_conflicts=resolve_conflicts)
+            run_sequential(
+                config, onto, wd,
+                resolve_conflicts=resolve_conflicts,
+                retry_failed=effective_retry_failed,
+            )
             return
 
-        state = run_pipeline(config, onto, wd, resolve_conflicts=resolve_conflicts)
+        state = run_pipeline(
+            config, onto, wd,
+            resolve_conflicts=resolve_conflicts,
+            retry_failed=effective_retry_failed,
+        )
 
         has_conflicts = any(
             fs.status == "conflict" for fs in state.features.values()

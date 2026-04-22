@@ -273,11 +273,24 @@ Rules for this step:
 - Do not redirect output to other files. The script already tees into
   `{build_log}`.
 
-If the build fails:
-- The Bash tool result may be truncated. The full log is at
-  `{build_log}`. Use the **Read** tool on it (with `offset` / `limit`)
-  or the **Grep** tool (e.g. `pattern: "error:"`, `pattern: "FAILED"`)
-  to find the actual failure.
+How to inspect `{build_log}` efficiently:
+- **If the build succeeded** (`bash {build_script}` exited 0): do NOT
+  read the log. Move on to Step 7. There is no useful information in a
+  green log.
+- **If the build failed**: the failure cause is at the **end** of the
+  log. Do NOT use the **Read** tool on the whole file — it is routinely
+  >25k tokens and the call will be rejected.
+  - Start with `tail -n 200 {build_log}` via Bash. That almost always
+    contains the first compiler error and the `FAILED:` / `ninja: build
+    stopped` lines.
+  - If 200 lines isn't enough, double it: `tail -n 400`, then `-n 800`,
+    etc.
+  - Use Grep with `pattern: "error:"` or `pattern: "^FAILED:"` only as a
+    fallback when tail-doubling has not surfaced the cause within ~2k
+    lines (e.g. failure happens mid-build and is buried under later
+    output).
+  - Only fall back to **Read** with explicit `offset` / `limit` when you
+    already know the line range you want (e.g. from a Grep hit).
 - Fix the offending code — the same scope rule still applies. Your fix
   must remain inside the source PR's diff plus the base branch's recent
   diff plus minimal mechanical adaptations. Do not "fix" the build by

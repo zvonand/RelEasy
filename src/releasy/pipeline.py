@@ -47,8 +47,11 @@ from releasy.github_ops import (
     find_pr_for_branch,
     get_origin_repo_slug,
     is_pr_merged,
+    mark_pr_ready_for_review,
     parse_pr_url,
+    pr_has_label,
     pr_ref_label,
+    remove_label_from_pr,
     require_origin_repo_slug,
     search_prs_by_labels,
     slug_to_https_url,
@@ -141,10 +144,17 @@ class FeatureUnit:
     ai_iterations_total: int = 0
     # Sum of USD cost reported by Claude across every cherry-pick step
     # in this unit (groups accumulate; singletons hit at most one step).
-    # ``None`` until Claude reports a cost at least once — keeps
-    # downstream code able to distinguish "AI ran but produced no cost
-    # data" (None) from "AI ran and the bill was 0.0".
+    # Also includes the changelog-synthesis cost when ``ai_changelog``
+    # is enabled. ``None`` until Claude reports a cost at least once —
+    # keeps downstream code able to distinguish "AI ran but produced no
+    # cost data" (None) from "AI ran and the bill was 0.0".
     ai_cost_usd_total: float | None = None
+    # Cached AI-synthesized CHANGELOG entry for multi-PR groups. Filled
+    # by :func:`_maybe_synthesize_changelog` once per run and read by
+    # :func:`_build_changelog_block`. ``None`` means "use the source
+    # PRs' own entries" (singletons, ai_changelog disabled, or a
+    # synthesis failure).
+    synthesized_changelog: str | None = None
 
     @property
     def sort_key(self) -> tuple[str, int]:
@@ -512,11 +522,19 @@ def run_pipeline(
     onto: str,
     work_dir: Path | None = None,
     resolve_conflicts: bool = True,
+    retry_failed: bool = True,
 ) -> PipelineState:
     """Port PRs onto ``origin/<base_branch>``.
 
     ``resolve_conflicts`` is a CLI-level kill-switch. The AI resolver only
     runs when both this flag and ``config.ai_resolve.enabled`` are true.
+
+    ``retry_failed`` controls what happens when a discovered unit already
+    has a ``conflict`` entry in state from a previous run: when true, the
+    existing local / remote port branch is discarded and the cherry-pick
+    is re-attempted from base; when false, the entry is skipped entirely
+    (no cherry-pick, no PR side-effects). Defaults to true to match the
+    config-level default.
     """
     state = load_state(config)
     _prune_superseded_singletons(config, state)
@@ -621,7 +639,7 @@ def run_pipeline(
         # can't strand the whole queue.
         _process_feature_unit(
             config, repo_path, state, unit, base_branch, base_ref, onto,
-            remote, ai_active,
+            remote, ai_active, retry_failed=retry_failed,
         )
 
     state.phase = "ports_done"
@@ -663,6 +681,7 @@ def run_sequential(
     onto: str,
     work_dir: Path | None = None,
     resolve_conflicts: bool = True,
+    retry_failed: bool = True,
 ) -> PipelineState:
     """Process the merged-time-sorted PR queue one PR per invocation.
 
@@ -804,18 +823,29 @@ def run_sequential(
             continue
 
         if fs is not None and fs.status == "conflict":
+            if not retry_failed:
+                console.print(
+                    f"\n[red]✗[/red] [cyan]{unit.feature_id}[/cyan] ({ref}) is in "
+                    "[red]conflict[/red] state — sequential mode will not advance "
+                    "until it is resolved."
+                )
+                if fs.conflict_files:
+                    for cf in fs.conflict_files:
+                        console.print(f"      [red]•[/red] {cf}")
+                console.print(
+                    "  Resolve it manually and re-run "
+                    "[cyan]releasy continue[/cyan], or pass "
+                    "[cyan]--retry-failed[/cyan] (or set "
+                    "[cyan]pr_sources.retry_failed: true[/cyan] in config) "
+                    "to force a fresh cherry-pick attempt."
+                )
+                raise SystemExit(1)
             console.print(
-                f"\n[red]✗[/red] [cyan]{unit.feature_id}[/cyan] ({ref}) is in "
-                "[red]conflict[/red] state — sequential mode will not advance "
-                "until it is resolved."
+                f"\n  [yellow]↻[/yellow] [cyan]{unit.feature_id}[/cyan] ({ref}) "
+                "was in [red]conflict[/red] — retrying (retry_failed: true)"
             )
-            if fs.conflict_files:
-                for cf in fs.conflict_files:
-                    console.print(f"      [red]•[/red] {cf}")
-            console.print(
-                "  Resolve it manually, then re-run [cyan]releasy continue[/cyan]."
-            )
-            raise SystemExit(1)
+            # Fall through: _process_feature_unit will see the conflict
+            # state below, force-recreate the branch, and re-cherry-pick.
 
         if fs is not None and fs.status in ("needs_review", "branch_created"):
             if not fs.rebase_pr_url:
@@ -888,7 +918,7 @@ def run_sequential(
 
         _process_feature_unit(
             config, repo_path, state, unit, base_branch, base_ref, onto,
-            remote, ai_active,
+            remote, ai_active, retry_failed=retry_failed,
         )
 
         # _process_feature_unit may have ended in either a clean port or
@@ -1095,6 +1125,110 @@ def _extract_md_section(body: str, keyword: str) -> str | None:
     return None
 
 
+def _extract_md_section_with_subsections(
+    body: str, keyword: str,
+) -> str | None:
+    """Like :func:`_extract_md_section` but keeps the heading line and
+    any nested subheadings.
+
+    Boundary rule: the section runs from its heading line to the next
+    heading of *equal or higher* level (fewer or equal ``#``s), or to
+    end-of-document. So ``### CI/CD Options`` followed by
+    ``#### Exclude tests:`` + ``#### Regression jobs to run:`` is
+    returned as a single block instead of being cut off at the first
+    ``####``. Returns ``None`` when no matching heading exists.
+    """
+    if not body:
+        return None
+    key = keyword.lower()
+    headings = list(_MD_HEADING_RE.finditer(body))
+    for i, m in enumerate(headings):
+        if key not in m.group(2).lower():
+            continue
+        level = len(m.group(1))
+        start = m.start()
+        end = len(body)
+        for j in range(i + 1, len(headings)):
+            n = headings[j]
+            if len(n.group(1)) <= level:
+                end = n.start()
+                break
+        section = body[start:end].rstrip()
+        return section or None
+    return None
+
+
+def _strip_md_sections(body: str, keywords: list[str]) -> str:
+    """Remove every markdown section whose heading contains any of ``keywords``.
+
+    Section boundaries follow the same equal-or-higher-level rule used
+    by :func:`_extract_md_section_with_subsections`, so removing
+    ``CI/CD Options`` takes its ``####`` subheadings (Exclude tests /
+    Regression jobs to run) along with it instead of leaving orphans.
+
+    Used by :func:`_unit_body` to keep per-source-PR bodies from
+    re-inserting Changelog / CI/CD blocks the combined PR already
+    presents once at the top.
+    """
+    if not body:
+        return body
+    headings = list(_MD_HEADING_RE.finditer(body))
+    if not headings:
+        return body
+    keys_lc = [k.lower() for k in keywords]
+    spans: list[tuple[int, int]] = []
+    for i, m in enumerate(headings):
+        if not any(k in m.group(2).lower() for k in keys_lc):
+            continue
+        level = len(m.group(1))
+        start = m.start()
+        end = len(body)
+        for j in range(i + 1, len(headings)):
+            if len(headings[j].group(1)) <= level:
+                end = headings[j].start()
+                break
+        spans.append((start, end))
+    if not spans:
+        return body
+    out = body
+    for start, end in sorted(spans, reverse=True):
+        out = out[:start] + out[end:]
+    # Collapse runs of blank lines created by the deletions so the
+    # remaining body doesn't end up with awkward 3-line gaps.
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
+_GFM_CHECKBOX_RE = re.compile(
+    r"^(\s*[-*+]\s*)\[[xX]\]", flags=re.MULTILINE,
+)
+
+
+def _reset_ci_checkboxes(block: str) -> str:
+    """Reset every GFM task checkbox in ``block`` to unchecked.
+
+    The CI options block we propagate into the rebase PR is built from
+    one of the source PR's bodies, but the checkbox values reviewers
+    set there were specific to that source PR's testing needs. Resetting
+    them gives the rebase PR neutral template defaults so the rebase
+    reviewer makes their own choices rather than inheriting random
+    overrides.
+    """
+    return _GFM_CHECKBOX_RE.sub(r"\1[ ]", block)
+
+
+# Per-PR body sections that the combined PR already presents once at
+# the top (changelog) or that we deliberately deduplicate / reset (CI
+# options). Stripping them from each per-PR body keeps the combined
+# rebase PR readable instead of repeating the same template scaffolding
+# N times.
+_DEDUP_PR_BODY_SECTIONS = (
+    "changelog category",
+    "changelog entry",
+    "ci/cd options",
+)
+
+
 def _extract_changelog_category(body: str) -> str | None:
     """Pull the single chosen 'Changelog category' value from a PR body.
 
@@ -1141,14 +1275,20 @@ def _build_changelog_block(unit: FeatureUnit) -> str | None:
     """Synthesise a 'Changelog category' + 'Changelog entry' block for
     the combined PR body.
 
-    Rules (from user spec):
+    Rules:
     - Category = first PR's category (fallback: any PR in the unit
       that does specify one, in listed order).
-    - Entry = the first PR's changelog entry, with a ``(<url1> by
-      <author1>, <url2> by <author2>, …)`` suffix listing every PR in
-      the unit (regardless of whether a given PR contributed its own
-      changelog entry). The suffix is added even for singletons — it
-      gives reviewers one-click access to the source PR and its author.
+    - Entry source order:
+        1. ``unit.synthesized_changelog`` when set — the AI-composed
+           summary for groups (see :func:`_maybe_synthesize_changelog`).
+           Only ever populated for multi-PR groups when
+           ``ai_changelog.enabled`` is true.
+        2. Otherwise the first PR's own changelog entry, in listed
+           cherry-pick order. For singletons that's always the
+           authoritative wording (1:1 from source — no Claude call).
+    - Suffix = ``(<url1> by <author1>, …)`` listing every PR in the
+      unit, appended even for singletons so reviewers have one-click
+      access to the source PR and its author.
 
     Returns ``None`` when no PR in the unit has either a category or
     an entry, so we don't clutter the body with empty headings.
@@ -1160,12 +1300,13 @@ def _build_changelog_block(unit: FeatureUnit) -> str | None:
             category = cat
             break
 
-    entry_text: str | None = None
-    for pr in unit.prs:
-        entry = _extract_changelog_entry(pr.body or "")
-        if entry:
-            entry_text = entry.strip()
-            break
+    entry_text: str | None = unit.synthesized_changelog
+    if not entry_text:
+        for pr in unit.prs:
+            entry = _extract_changelog_entry(pr.body or "")
+            if entry:
+                entry_text = entry.strip()
+                break
 
     if not category and not entry_text:
         return None
@@ -1195,6 +1336,133 @@ def _build_changelog_block(unit: FeatureUnit) -> str | None:
         out.append(final_entry)
         out.append("")
     return "\n".join(out).rstrip()
+
+
+def _truncate_for_prompt(text: str, max_chars: int) -> str:
+    """Trim ``text`` to ``max_chars`` with a visible truncation marker.
+
+    Used when packing source-PR bodies into the changelog-synthesis
+    prompt so a single long-winded PR can't blow the prompt size out
+    for a group with many entries.
+    """
+    if not text:
+        return ""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "\n\n…(truncated)"
+
+
+def _build_pr_blocks_for_synthesis(unit: FeatureUnit, max_pr_body_chars: int) -> str:
+    """Render each PR's title + author + body into a markdown block.
+
+    Output is fed directly into the ``{pr_blocks}`` placeholder in the
+    changelog-synthesis prompt. PRs appear in cherry-pick order so
+    Claude can reason about which fixes supersede which.
+    """
+    blocks: list[str] = []
+    for idx, pr in enumerate(unit.prs, start=1):
+        body = _truncate_for_prompt((pr.body or "").strip(), max_pr_body_chars)
+        author = f"@{pr.author}" if pr.author else "(unknown author)"
+        blocks.append(
+            f"### PR {idx}/{len(unit.prs)}: {pr.title}\n"
+            f"- Author: {author}\n"
+            f"- URL: {pr.url}\n\n"
+            f"{body if body else '_(empty body)_'}"
+        )
+    return "\n\n---\n\n".join(blocks)
+
+
+def _maybe_synthesize_changelog(
+    config: Config, unit: FeatureUnit, base_branch: str,
+) -> None:
+    """Populate ``unit.synthesized_changelog`` for multi-PR groups.
+
+    Idempotent: returns early when already populated, when
+    ``ai_changelog.enabled`` is false, or when the unit has fewer than
+    two PRs (singletons take the source PR's wording verbatim — no
+    Claude call, no token spend, no surprises).
+
+    Failures are non-fatal: a synthesis error logs a warning and
+    leaves ``unit.synthesized_changelog`` as ``None``, which means
+    :func:`_build_changelog_block` falls back to the first PR's own
+    changelog entry — the pre-AI behaviour.
+    """
+    if unit.synthesized_changelog is not None:
+        return
+    if not config.ai_changelog.enabled:
+        return
+    if not unit.is_group or len(unit.prs) <= 1:
+        return
+
+    from releasy.ai_resolve import synthesize_changelog_entry
+
+    pr_blocks = _build_pr_blocks_for_synthesis(
+        unit, config.ai_changelog.max_pr_body_chars,
+    )
+    label = unit.group_id or unit.feature_id
+    source_repo = unit.primary_pr().repo_slug
+
+    result = synthesize_changelog_entry(
+        config,
+        unit_label=label,
+        pr_blocks=pr_blocks,
+        n_prs=len(unit.prs),
+        base_branch=base_branch,
+        source_repo=source_repo,
+    )
+
+    if result.cost_usd is not None:
+        unit.ai_cost_usd_total = (
+            (unit.ai_cost_usd_total or 0.0) + result.cost_usd
+        )
+
+    if not result.success or not result.text:
+        reason = result.error or (
+            "timed out" if result.timed_out else "unknown failure"
+        )
+        cost_note = (
+            f" [dim](cost: ${result.cost_usd:.4f})[/dim]"
+            if result.cost_usd is not None else ""
+        )
+        console.print(
+            f"    [yellow]changelog synthesis failed:[/yellow] {reason} "
+            f"— falling back to first PR's entry{cost_note}"
+        )
+        return
+
+    unit.synthesized_changelog = result.text.strip()
+    cost_note = (
+        f" [dim](cost: ${result.cost_usd:.4f})[/dim]"
+        if result.cost_usd is not None else ""
+    )
+    console.print(
+        f"    [green]\u2713[/green] Synthesized CHANGELOG entry for "
+        f"[cyan]{label}[/cyan]{cost_note}"
+    )
+
+
+def _build_ci_options_block(unit: FeatureUnit) -> str | None:
+    """Return a single ``### CI/CD Options`` block for the combined PR body.
+
+    Strategy: scan the unit's PRs in order and lift the CI options
+    section out of the first one that has it (so we keep whatever
+    schema the source repo's PR template currently uses, even as it
+    evolves). Every checkbox in the lifted block is reset to ``[ ]``
+    via :func:`_reset_ci_checkboxes` so the rebase PR ships with
+    template defaults instead of inheriting per-source-PR overrides.
+
+    Returns ``None`` when no PR in the unit carries a CI options
+    section — in that case the combined body just doesn't include
+    one (we don't fabricate a block from thin air, since the schema
+    can drift between projects).
+    """
+    for pr in unit.prs:
+        section = _extract_md_section_with_subsections(
+            pr.body or "", "ci/cd options",
+        )
+        if section:
+            return _reset_ci_checkboxes(section).rstrip()
+    return None
 
 
 def _format_pr_attribution(prs: "list[PRInfo]") -> str:
@@ -1269,6 +1537,11 @@ def _unit_body(
         lines.append(changelog)
         lines.append("")  # blank separator before the rest
 
+    ci_block = _build_ci_options_block(unit)
+    if ci_block:
+        lines.append(ci_block)
+        lines.append("")  # blank separator before the rest
+
     refs = [pr_ref_label(pr.repo_slug, pr.number, origin_slug) for pr in unit.prs]
     source_refs = ", ".join(refs)
     if unit.is_group or len(unit.prs) > 1:
@@ -1281,13 +1554,19 @@ def _unit_body(
             lines.append(f"- {ref} — {pr.title}")
         lines.append("")  # blank
         for pr, ref in zip(unit.prs, refs):
-            if pr.body:
-                lines.append(f"\n---\n### {ref}: {pr.title}\n\n{pr.body}")
+            cleaned = _strip_md_sections(
+                pr.body or "", list(_DEDUP_PR_BODY_SECTIONS),
+            )
+            if cleaned:
+                lines.append(f"\n---\n### {ref}: {pr.title}\n\n{cleaned}")
     else:
         pr = unit.prs[0]
         lines.append(f"Cherry-picked from {source_refs}.")
-        if pr.body:
-            lines.append(f"\n---\n\n{pr.body}")
+        cleaned = _strip_md_sections(
+            pr.body or "", list(_DEDUP_PR_BODY_SECTIONS),
+        )
+        if cleaned:
+            lines.append(f"\n---\n\n{cleaned}")
     return "\n".join(lines)
 
 
@@ -1362,6 +1641,7 @@ def _process_feature_unit(
     onto: str,
     remote: str,
     ai_active: bool,
+    retry_failed: bool = True,
 ) -> str:
     """Process one feature unit (single PR or sequential group).
 
@@ -1369,6 +1649,12 @@ def _process_feature_unit(
     in-place by :func:`_handle_unresolved_conflict` (drop the local branch
     for singletons / first-of-group, or open a draft PR for partial
     groups), and the pipeline keeps moving.
+
+    ``retry_failed`` controls behaviour for units whose previous run
+    ended in ``conflict`` status: when true, any existing local / remote
+    port branch is force-recreated from base and the cherry-pick is
+    re-attempted; when false, the unit is left exactly as-is (no
+    cherry-pick, no PR side-effects).
     """
     origin_slug = get_origin_repo_slug(config)
     new_branch = config.feature_branch_name(unit.feature_id, onto)
@@ -1383,7 +1669,29 @@ def _process_feature_unit(
         )
     )
 
-    if on_remote:
+    prev_state = state.features.get(unit.feature_id)
+    is_failed_prev = prev_state is not None and prev_state.status == "conflict"
+    force_retry = is_failed_prev and retry_failed
+
+    if is_failed_prev and not retry_failed:
+        # User opted out of retries — leave the conflicted entry exactly
+        # as it is so manual fix-ups (or a later --retry-failed run) can
+        # take over without us touching the PR / branch / project board.
+        console.print(
+            f"\n    [dim]{new_branch} ({label}) — previously conflicted, "
+            "skipping (pr_sources.retry_failed: false / "
+            "--no-retry-failed)[/dim]"
+        )
+        return "continue"
+
+    if force_retry and (on_remote or on_local):
+        console.print(
+            f"\n    [yellow]↻[/yellow] [cyan]{new_branch}[/cyan] ({label}) — "
+            "previously conflicted, force-recreating from base "
+            "(pr_sources.retry_failed: true)"
+        )
+
+    if on_remote and not force_retry:
         console.print(
             f"\n    [cyan]{new_branch}[/cyan] ({label}) — already exists on "
             f"[cyan]{remote}[/cyan], skipping cherry-pick "
@@ -1394,14 +1702,14 @@ def _process_feature_unit(
         )
         return "continue"
 
-    if on_local and unit.if_exists == "skip":
+    if on_local and unit.if_exists == "skip" and not force_retry:
         console.print(
             f"\n    [cyan]{new_branch}[/cyan] ({label}) — local branch "
             "exists, skipping (set pr_sources.if_exists: recreate to rebuild)"
         )
         return "continue"
 
-    if on_local:
+    if on_local and not force_retry:
         console.print(
             f"\n    [yellow]↻[/yellow] [cyan]{new_branch}[/cyan] exists "
             "locally, recreating from base"
@@ -1473,8 +1781,15 @@ def _process_feature_unit(
         return "continue"
 
     # --- All PRs cherry-picked cleanly (possibly via AI) ---
+    # Synthesise the combined-port CHANGELOG entry now (groups only,
+    # ai_changelog enabled). Done after the cherry-pick succeeded so
+    # we don't burn tokens on units that ended up in conflict — those
+    # already produced a draft PR with the per-PR fallback wording, and
+    # a successful retry will hit this same path.
+    _maybe_synthesize_changelog(config, unit, base_branch)
     _finish_clean_unit(
         config, repo_path, state, unit, new_branch, base_branch, onto, pr_meta,
+        was_failed_prev=is_failed_prev,
     )
     return "continue"
 
@@ -1517,11 +1832,40 @@ def _ensure_pr_for_existing_remote_branch(
         return
 
     fs = state.features.get(unit.feature_id)
+
+    # Heal stale "needs human attention" state on already-pushed PRs.
+    # This catches the case where a previous retry succeeded at the
+    # cherry-pick / push step but didn't run the recovery treatment
+    # (e.g. ran with older code, or `_reconcile_recovered_pr` hadn't
+    # been added yet). Without this, re-running `releasy run` would
+    # skip the cherry-pick (branch is on remote) and never touch the
+    # body / labels / draft state — leaving the PR perpetually stuck
+    # with the "needs intervention" banner. We detect the stuck-ness
+    # by reading the live PR's labels: if `ai-needs-attention` is
+    # still attached, the PR clearly wasn't reconciled and we treat
+    # this re-run as a deferred recovery (force-update body + title,
+    # remove the label, add `ai-resolved`, flip draft → ready).
+    needs_recovery = False
+    existing_pr_url = fs.rebase_pr_url if fs else None
+    if existing_pr_url:
+        existing_pr_number = _pr_number_from_url(existing_pr_url)
+        if existing_pr_number and pr_has_label(
+            config, existing_pr_number,
+            config.ai_resolve.needs_attention_label,
+        ):
+            needs_recovery = True
+            console.print(
+                f"    [yellow]\u21bb[/yellow] PR carries stale "
+                f"[cyan]{config.ai_resolve.needs_attention_label}[/cyan] "
+                "label \u2014 treating this re-run as a deferred recovery"
+            )
+
     if config.pr_sources.auto_pr:
         title = _unit_title(unit, config.project, base_branch)
         body = _unit_body(unit, get_origin_repo_slug(config))
         pr_url, outcome = _ensure_pr_for_branch(
             config, new_branch, base_branch, title, body,
+            force_update=needs_recovery,
         )
         _log_pr_action(outcome, pr_url)
     else:
@@ -1543,6 +1887,10 @@ def _ensure_pr_for_existing_remote_branch(
         _apply_releasy_label_to_pr(config, pr_url)
         if fs.ai_resolved:
             _apply_ai_label_to_pr(config, pr_url)
+        if needs_recovery:
+            relabelled = _reconcile_recovered_pr(config, pr_url)
+            if relabelled and not fs.ai_resolved:
+                fs.ai_resolved = True
     _persist_state(config, state)
 
 
@@ -1555,11 +1903,21 @@ def _finish_clean_unit(
     base_branch: str,
     onto: str,
     pr_meta: dict,
+    *,
+    was_failed_prev: bool = False,
 ) -> None:
     """Push and (optionally) open a single combined PR for the unit.
 
     If any PR in the unit was AI-resolved, the resulting PR is tagged with
     ``ai_resolve.label`` and the feature state is marked accordingly.
+
+    ``was_failed_prev`` is set by ``_process_feature_unit`` when this
+    unit's previous run ended in ``conflict`` status (and we just retried
+    it). When true, the existing PR is treated as stale: title + body
+    are force-rewritten regardless of ``update_existing_prs``, the
+    ``ai-needs-attention`` label (if any) is removed, and a draft PR is
+    flipped to ready-for-review — so reviewers don't see a "needs
+    intervention" banner on a port that is now actually clean.
     """
     ai_used = unit.ai_resolved_count > 0
 
@@ -1588,6 +1946,7 @@ def _finish_clean_unit(
         rebase_pr_url, outcome = _ensure_pr_for_branch(
             config, new_branch, base_branch, title,
             _unit_body(unit, get_origin_repo_slug(config)),
+            force_update=was_failed_prev,
         )
         _log_pr_action(outcome, rebase_pr_url)
         if rebase_pr_url:
@@ -1596,6 +1955,14 @@ def _finish_clean_unit(
             _apply_releasy_label_to_pr(config, rebase_pr_url)
             if ai_used:
                 _apply_ai_label_to_pr(config, rebase_pr_url)
+            if was_failed_prev:
+                relabelled = _reconcile_recovered_pr(config, rebase_pr_url)
+                # The previous failed run flagged this PR for human
+                # attention — mirror the first-run-resolved appearance
+                # so reviewers can't tell it apart: status `ai_resolved`
+                # in state, and the `ai-resolved` label on the PR.
+                if relabelled and not state.features[unit.feature_id].ai_resolved:
+                    state.features[unit.feature_id].ai_resolved = True
     elif config.push and ai_used:
         # Branch pushed but pr_sources.auto_pr disabled — try to label any
         # pre-existing PR for this branch.
@@ -1607,8 +1974,76 @@ def _finish_clean_unit(
             _apply_ai_label_to_pr(config, existing.url, pr_number=existing.number)
             state.features[unit.feature_id].rebase_pr_url = existing.url
             state.features[unit.feature_id].status = "needs_review"
+            if was_failed_prev:
+                _reconcile_recovered_pr(
+                    config, existing.url, pr_number=existing.number,
+                )
 
     _persist_state(config, state)
+
+
+def _reconcile_recovered_pr(
+    config: Config, pr_url: str, pr_number: int | None = None,
+) -> bool:
+    """Bring a previously-conflicted PR back into a clean reviewable shape.
+
+    Called after a successful retry of a unit whose previous run had
+    landed in ``conflict`` status. Side effects:
+
+      * remove the ``ai_resolve.needs_attention_label`` (no-op if the
+        label was never attached — e.g. the partial-group draft path
+        wasn't taken),
+      * apply the ``ai_resolve.label`` (``ai-resolved``) so the
+        recovered PR is visually indistinguishable from one that
+        landed cleanly with AI on its very first run — the user
+        explicitly asked for this to keep dashboards consistent,
+      * mark the PR ready-for-review (no-op if it isn't draft).
+
+    Returns ``True`` when the PR carried the needs-attention label
+    (and thus genuinely went through the AI-failure path) so the
+    caller can promote ``FeatureState.ai_resolved`` to ``True``;
+    returns ``False`` when the label wasn't there (nothing to mirror).
+
+    All GitHub calls are best-effort: failures are logged but never
+    raised, so a transient GitHub blip can't undo an otherwise-
+    successful retry.
+    """
+    if pr_number is None:
+        pr_number = _pr_number_from_url(pr_url)
+    if pr_number is None:
+        return False
+
+    needs_attention_label = config.ai_resolve.needs_attention_label
+    had_needs_attention = pr_has_label(
+        config, pr_number, needs_attention_label,
+    )
+
+    if had_needs_attention:
+        if remove_label_from_pr(config, pr_number, needs_attention_label):
+            console.print(
+                f"    [green]✓[/green] Removed [cyan]"
+                f"{needs_attention_label}[/cyan] label "
+                "from previously-conflicted PR"
+            )
+        # Mirror first-run-resolved appearance: tag with the
+        # ``ai-resolved`` label so dashboards / filters that key off
+        # it can't tell a recovered PR apart from one that cleared on
+        # its very first attempt.
+        _apply_ai_label_to_pr(config, pr_url, pr_number=pr_number)
+
+    ready = mark_pr_ready_for_review(config, pr_number)
+    if ready is True:
+        console.print(
+            "    [green]✓[/green] Marked PR ready for review "
+            "(was draft after previous failure)"
+        )
+    elif ready is False:
+        console.print(
+            "    [yellow]![/yellow] Could not mark PR ready for review — "
+            "flip it manually on GitHub if it's still in draft"
+        )
+
+    return had_needs_attention
 
 
 def _ensure_pr_for_branch(
@@ -1617,21 +2052,31 @@ def _ensure_pr_for_branch(
     base_branch: str,
     title: str,
     body: str,
+    *,
+    force_update: bool = False,
 ) -> tuple[str | None, str]:
     """Create a PR for ``branch`` or reuse / update an existing one.
 
     Behaviour:
       - If GitHub already has an open PR from ``branch`` → ``base_branch``:
-          * with ``update_existing_prs: true`` in config, edit its title
-            and body to match what releasy would have set, then return
-            ``(url, "updated")``.
+          * with ``update_existing_prs: true`` in config OR
+            ``force_update=True``, edit its title and body to match what
+            releasy would have set, then return ``(url, "updated")``.
           * otherwise return ``(url, "reused")`` without touching the PR.
       - If no matching PR is open, create a new one and return
         ``(url, "created")``. On creation failure returns ``(None, "failed")``.
+
+    ``force_update`` is the per-call override the pipeline uses when it
+    *knows* the existing PR is stale (e.g. carries a "needs intervention"
+    banner from a previous failed run that we just successfully retried) —
+    in that case we always rewrite title + body, regardless of the global
+    ``update_existing_prs`` switch, because leaving misleading copy on a
+    PR that's now actually clean would be worse than the configured
+    "leave PRs alone" default.
     """
     existing = find_pr_for_branch(config, branch, base_branch)
     if existing:
-        if config.update_existing_prs:
+        if config.update_existing_prs or force_update:
             ok = update_pull_request(
                 config, existing.number, title=title, body=body,
             )
@@ -1812,23 +2257,51 @@ def _handle_unresolved_conflict(
             failed_pr=failed_pr,
             conflict_files=conflict_files,
         )
-        rebase_pr_url = create_pull_request(
-            config, new_branch, base_branch, title, body,
-            draft=True,
-            labels=[config.ai_resolve.needs_attention_label],
-        )
-        if rebase_pr_url:
-            console.print(
-                f"    [green]✓[/green] Draft PR opened: "
-                f"[link={rebase_pr_url}]{rebase_pr_url}[/link] "
-                f"[dim](label: {config.ai_resolve.needs_attention_label})[/dim]"
+        # On a retry of a previously-failed unit a draft PR may already
+        # exist for this branch — `create_pull_request` would 422 in that
+        # case. Look it up first and refresh title/body/labels in place;
+        # only call `create_pull_request` when no PR is open.
+        existing = find_pr_for_branch(config, new_branch, base_branch)
+        if existing is not None:
+            rebase_pr_url = existing.url
+            updated = update_pull_request(
+                config, existing.number, title=title, body=body,
             )
-            _apply_releasy_label_to_pr(config, rebase_pr_url)
+            if updated:
+                console.print(
+                    f"    [green]✓[/green] Refreshed banner on existing "
+                    f"draft PR: [link={rebase_pr_url}]{rebase_pr_url}[/link]"
+                )
+            else:
+                console.print(
+                    f"    [yellow]![/yellow] Could not refresh existing "
+                    f"PR {rebase_pr_url} (see warnings above)"
+                )
+            add_label_to_pr(
+                config, existing.number,
+                config.ai_resolve.needs_attention_label,
+            )
+            _apply_releasy_label_to_pr(
+                config, rebase_pr_url, pr_number=existing.number,
+            )
         else:
-            console.print(
-                "    [yellow]![/yellow] Could not open draft PR for "
-                f"[cyan]{new_branch}[/cyan] (see warnings above)"
+            rebase_pr_url = create_pull_request(
+                config, new_branch, base_branch, title, body,
+                draft=True,
+                labels=[config.ai_resolve.needs_attention_label],
             )
+            if rebase_pr_url:
+                console.print(
+                    f"    [green]✓[/green] Draft PR opened: "
+                    f"[link={rebase_pr_url}]{rebase_pr_url}[/link] "
+                    f"[dim](label: {config.ai_resolve.needs_attention_label})[/dim]"
+                )
+                _apply_releasy_label_to_pr(config, rebase_pr_url)
+            else:
+                console.print(
+                    "    [yellow]![/yellow] Could not open draft PR for "
+                    f"[cyan]{new_branch}[/cyan] (see warnings above)"
+                )
 
     fs = FeatureState(
         status="conflict",
@@ -2002,7 +2475,10 @@ def _branch_resolution_state(
         files = sorted({line.split("\t", 1)[1] for line in unmerged.stdout.splitlines()})
         return False, "unmerged files: " + ", ".join(files)
 
-    porc = run_git(["status", "--porcelain"], repo_path, check=False)
+    porc = run_git(
+        ["status", "--porcelain", "--untracked-files=no"],
+        repo_path, check=False,
+    )
     if porc.stdout.strip():
         return False, "working tree has uncommitted changes"
 

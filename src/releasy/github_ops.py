@@ -588,6 +588,160 @@ def add_label_to_pr(config: Config, pr_number: int, label: str) -> bool:
         return False
 
 
+def pr_has_label(config: Config, pr_number: int, label: str) -> bool:
+    """Return whether PR ``pr_number`` currently carries ``label`` on origin.
+
+    Returns ``False`` (silently) when we can't even talk to GitHub — a
+    missing token / unresolvable origin slug / API error all collapse
+    to ``False`` so callers can treat "label is definitely not there"
+    and "we don't know" the same way: don't take the
+    label-was-present-side-effect.
+
+    Used by the recovery path to decide whether a previously-conflicted
+    PR carried ``ai-needs-attention`` (and therefore deserves to be
+    promoted to ``ai-resolved`` after a successful retry, mirroring the
+    appearance of PRs that landed cleanly on their first run).
+    """
+    label_lc = label.lower()
+    token = get_github_token()
+    if not token:
+        return False
+
+    slug = get_origin_repo_slug(config)
+    if not slug:
+        return False
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        issue = repo.get_issue(pr_number)
+        for lbl in issue.labels:
+            if lbl.name.lower() == label_lc:
+                return True
+        return False
+    except GithubException as exc:
+        log.warning(
+            "Failed to read labels for PR %s#%d: %s", slug, pr_number, exc,
+        )
+        return False
+    except Exception as exc:
+        log.warning(
+            "Unexpected error reading labels for PR %s#%d: %s",
+            slug, pr_number, exc,
+        )
+        return False
+
+
+def remove_label_from_pr(config: Config, pr_number: int, label: str) -> bool:
+    """Strip a label from a PR **on the origin repo**.
+
+    Returns True when the label is gone after the call (whether we
+    removed it or it was already absent), False on any unexpected
+    GitHub error. Used to clean up state markers like
+    ``ai-needs-attention`` once a previously-conflicted port has been
+    re-resolved.
+    """
+    token = get_github_token()
+    if not token:
+        log.warning(
+            "RELEASY_GITHUB_TOKEN not set \u2014 cannot remove label "
+            "from PR #%d", pr_number,
+        )
+        return False
+
+    try:
+        slug = require_origin_repo_slug(config)
+    except ValueError as exc:
+        log.warning("%s", exc)
+        return False
+    _assert_writes_target_origin(
+        config, slug, f"remove label from PR #{pr_number}",
+    )
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        issue = repo.get_issue(pr_number)
+        try:
+            issue.remove_from_labels(label)
+        except GithubException as exc:
+            # 404 = the label wasn't on the PR; treat as success.
+            if exc.status == 404:
+                return True
+            raise
+        return True
+    except GithubException as exc:
+        log.warning(
+            "Failed to remove label %s from PR %s#%d: %s",
+            label, slug, pr_number, exc,
+        )
+        return False
+    except Exception as exc:
+        log.warning(
+            "Unexpected error removing label from PR %s#%d: %s",
+            slug, pr_number, exc,
+        )
+        return False
+
+
+def mark_pr_ready_for_review(
+    config: Config, pr_number: int,
+) -> bool | None:
+    """Flip a draft PR to ready-for-review **on the origin repo**.
+
+    Returns:
+      * ``True``  — the PR is ready-for-review after this call (we flipped
+        it, or it was already non-draft).
+      * ``False`` — GitHub rejected the change (label not gone? token
+        scope?) — caller may want to log it.
+      * ``None``  — couldn't even talk to GitHub (no token, slug
+        unresolvable). Distinguished from ``False`` so the caller can
+        stay quiet on transient setup gaps without misreporting failure.
+
+    PyGithub's ``PullRequest.mark_ready_for_review()`` wraps the
+    GraphQL ``markPullRequestReadyForReview`` mutation and is available
+    on the versions we already depend on.
+    """
+    token = get_github_token()
+    if not token:
+        return None
+
+    try:
+        slug = require_origin_repo_slug(config)
+    except ValueError:
+        return None
+    _assert_writes_target_origin(
+        config, slug, f"mark PR #{pr_number} ready for review",
+    )
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        pr = repo.get_pull(pr_number)
+        if not getattr(pr, "draft", False):
+            return True
+        pr.mark_ready_for_review()
+        return True
+    except GithubException as exc:
+        log.warning(
+            "Failed to mark PR %s#%d ready for review: %s",
+            slug, pr_number, exc,
+        )
+        return False
+    except Exception as exc:
+        log.warning(
+            "Unexpected error marking PR %s#%d ready for review: %s",
+            slug, pr_number, exc,
+        )
+        return False
+
+
 def find_pr_for_branch(
     config: Config, head_branch: str, base: str | None = None,
 ) -> PRInfo | None:

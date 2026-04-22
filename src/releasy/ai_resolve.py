@@ -605,7 +605,14 @@ def _verify_postconditions(
             "cherry-pick/merge/rebase still in progress after claude exited"
         )
 
-    porc = run_git(["status", "--porcelain"], repo_path, check=False)
+    # Ignore untracked files: scratch dirs the AI agent leaves behind
+    # (e.g. tmp/, build artifacts) don't affect the cherry-pick's
+    # correctness. We only care about unstaged/staged changes to tracked
+    # files, which would indicate unfinished conflict resolution.
+    porc = run_git(
+        ["status", "--porcelain", "--untracked-files=no"],
+        repo_path, check=False,
+    )
     if porc.stdout.strip():
         files = ", ".join(
             line[3:] for line in porc.stdout.splitlines()[:5]
@@ -765,6 +772,167 @@ def resolve_with_claude(
 # ---------------------------------------------------------------------------
 # High-level wrapper used by every caller (cherry-pick + merge resolvers)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Stand-alone text generation (changelog entry synthesis)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AITextResult:
+    """Outcome of a one-shot Claude text-generation call.
+
+    Used by callers (e.g. CHANGELOG entry synthesis) that just want a
+    short text back without any tool use or post-condition checks.
+    """
+    success: bool
+    text: str | None = None
+    error: str | None = None
+    timed_out: bool = False
+    cost_usd: float | None = None
+
+
+def _resolve_changelog_prompt_path(config: Config) -> Path:
+    """Resolve the changelog-synthesis prompt template path.
+
+    Same convention as :func:`_resolve_prompt_template`: relative paths
+    are anchored at ``config.repo_dir`` so per-project overrides drop
+    into a ``prompts/`` directory next to ``config.yaml``.
+    """
+    raw = config.ai_changelog.prompt_file
+    p = Path(raw)
+    if not p.is_absolute():
+        p = (config.repo_dir / p).resolve()
+    return p
+
+
+def synthesize_text(
+    config: Config,
+    prompt: str,
+    *,
+    label: str,
+    timeout_seconds: int,
+    command: str,
+) -> AITextResult:
+    """Run Claude on ``prompt`` and return the assistant's reply text.
+
+    No tools are made available — this is pure text generation. Cost is
+    extracted from the stream-json transcript when present; the call is
+    routed through :func:`_spawn_claude` so the user sees the same
+    streaming heartbeat / Ctrl-C semantics as the conflict resolver.
+
+    The CWD passed to Claude is a throwaway temp dir so it has nowhere
+    interesting to write into even if the model misinterprets the
+    no-tools constraint.
+    """
+    if shutil.which(command) is None:
+        return AITextResult(
+            success=False,
+            error=f"'{command}' not found on PATH",
+        )
+
+    argv = [
+        command,
+        "-p", prompt,
+        "--output-format", "stream-json",
+        "--verbose",
+        # Explicit empty allowed-tools list keeps Claude in pure
+        # text-generation mode for this call.
+        "--allowedTools", "",
+    ]
+
+    console.print(
+        f"    [magenta]\U0001f916 synthesizing text via "
+        f"{command} for [cyan]{label}[/cyan] "
+        f"(timeout {timeout_seconds}s)[/magenta]"
+    )
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="releasy-ai-text-") as td:
+        try:
+            exit_code, output, timed_out = _spawn_claude(
+                argv, Path(td), timeout_seconds,
+            )
+        except KeyboardInterrupt:
+            raise
+
+    cost = _extract_cost_usd(output)
+
+    if timed_out:
+        return AITextResult(
+            success=False, timed_out=True, cost_usd=cost,
+            error=f"claude timed out after {timeout_seconds}s",
+        )
+
+    if exit_code != 0:
+        transient = _find_transient_api_error(output)
+        suffix = f" ({transient})" if transient else ""
+        return AITextResult(
+            success=False, cost_usd=cost,
+            error=f"claude exited with code {exit_code}{suffix}",
+        )
+
+    text = _extract_assistant_text(output).strip()
+    if not text:
+        return AITextResult(
+            success=False, cost_usd=cost,
+            error="claude returned empty output",
+        )
+
+    return AITextResult(success=True, text=text, cost_usd=cost)
+
+
+def synthesize_changelog_entry(
+    config: Config,
+    *,
+    unit_label: str,
+    pr_blocks: str,
+    n_prs: int,
+    base_branch: str,
+    source_repo: str,
+) -> AITextResult:
+    """Render the changelog-synthesis prompt and ask Claude to fill it.
+
+    Caller (``releasy.pipeline``) is responsible for building
+    ``pr_blocks`` — a markdown chunk containing each source PR's
+    title + body in cherry-pick order, already truncated to a
+    reasonable size — so the prompt template stays decoupled from the
+    project-specific PR-info dataclass.
+    """
+    prompt_path = _resolve_changelog_prompt_path(config)
+    if not prompt_path.exists():
+        return AITextResult(
+            success=False,
+            error=(
+                "changelog-synthesis prompt template not found: "
+                f"{prompt_path}. Set ai_changelog.prompt_file in config "
+                "to point at a real file (or copy the bundled "
+                "prompts/synthesize_changelog.md alongside config.yaml)."
+            ),
+        )
+
+    template = prompt_path.read_text(encoding="utf-8")
+    placeholders = {
+        "n_prs": str(n_prs),
+        "base_branch": base_branch,
+        "source_repo": source_repo,
+        "pr_blocks": pr_blocks,
+    }
+
+    def _replace(match: re.Match[str]) -> str:
+        key = match.group(1)
+        return placeholders.get(key, match.group(0))
+
+    rendered = re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _replace, template)
+
+    return synthesize_text(
+        config, rendered,
+        label=unit_label,
+        timeout_seconds=config.ai_changelog.timeout_seconds,
+        command=config.ai_changelog.command,
+    )
 
 
 def attempt_ai_resolve(

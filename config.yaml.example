@@ -164,10 +164,23 @@ features:
 # regardless of this setting. Resolve those manually so you don't
 # clobber someone else's work.
 #
+# retry_failed — when a PR unit has a `conflict` entry in state from a
+#   previous run:
+#     true  (default) — discard the existing local / remote port branch
+#                       and re-run the cherry-pick from base. Handy
+#                       after fixing a bug, topping up Anthropic credits,
+#                       or otherwise resolving whatever caused the
+#                       original failure.
+#     false           — leave the conflicted entry exactly as-is; no
+#                       cherry-pick, no PR side-effects.
+#   The CLI flag `--retry-failed / --no-retry-failed` overrides this
+#   per-invocation.
+#
 # PRs are processed in merge order (earliest merged first).
 #
 # pr_sources:
 #   if_exists: skip
+#   # retry_failed: true   # default; set false to leave conflicted entries alone
 #   # auto_pr: true        # default; set false to push branches without opening PRs
 #   by_labels:
 #     - labels: ["forward-port", "v26.1"]
@@ -265,6 +278,33 @@ notifications:
 #   # `max_iterations`.
 #   api_retries: 3
 #   api_retry_backoff_seconds: 15
+
+# ── AI changelog entry synthesis (Claude) ────────────────────────────
+# Optional. When enabled, multi-PR groups get a single user-facing
+# CHANGELOG entry composed by Claude based on the constituent PRs'
+# titles + bodies. Singletons (one PR per port branch) ALWAYS reuse
+# the source PR's `Changelog entry` verbatim — Claude is never invoked
+# in that case, so the singleton flow has zero API cost.
+#
+# The synthesizer is told to:
+#   - drop intermediate fix-ups inside the group (B fixes a bug A
+#     introduced earlier in the same group → the user never saw the
+#     bug, so it doesn't belong in the changelog),
+#   - drop refactors / internal cleanup with no user-visible effect,
+#   - keep the entry to one or two terse, imperative-present-tense
+#     sentences matching typical CHANGELOG.md tone.
+#
+# Failures are non-fatal: the per-PR fallback (first-PR-in-group's own
+# changelog entry) is used and a warning is logged.
+#
+# ai_changelog:
+#   enabled: false
+#   command: claude
+#   prompt_file: prompts/synthesize_changelog.md
+#   timeout_seconds: 300
+#   # Per-PR body trimmed to this many characters before being inlined
+#   # into the prompt (keeps payloads bounded for chatty source PRs).
+#   max_pr_body_chars: 3000
 
 # ─────────────────────────────────────────────────────────────────────
 # WORKFLOW

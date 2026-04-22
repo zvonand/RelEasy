@@ -159,6 +159,14 @@ class PRSourcesConfig:
     if_exists: str = "skip"
     # Global switch: open a PR for every pushed port branch.
     auto_pr: bool = True
+    # Re-attempt PR units whose previous run ended in `conflict` status.
+    # When true (the default), `releasy run` discards any existing local /
+    # remote port branch for a conflicted entry and re-runs the cherry-pick
+    # from base — useful after fixing a bug, topping up Anthropic credits,
+    # or otherwise resolving whatever caused the original failure. When
+    # false, conflicted entries are left exactly as they are (no new
+    # cherry-pick, no PR side-effects), and `releasy run` walks past them.
+    retry_failed: bool = True
 
 
 def _default_assignee_dev_options() -> list[str]:
@@ -260,6 +268,33 @@ def _default_allowed_tools() -> list[str]:
 
 
 @dataclass
+class AIChangelogConfig:
+    """Claude-driven CHANGELOG entry synthesis for grouped PR ports.
+
+    For singleton ports the changelog entry is taken verbatim from the
+    source PR's own ``Changelog entry`` section — Claude is never
+    invoked, no API cost, no surprises. The synthesizer only kicks in
+    for multi-PR groups, where the per-PR entries can include
+    intermediate fix-ups that aren't user-visible once the whole group
+    is ported as a single change.
+
+    Defaults to disabled because it costs API tokens; enable it
+    explicitly when you want polished combined-port CHANGELOG entries.
+    Reuses the same Claude binary (and ``ai_resolve.command`` defaults
+    so users running with one resolver setup don't have to configure
+    two paths) but is otherwise independent of conflict resolution.
+    """
+    enabled: bool = False
+    command: str = "claude"
+    prompt_file: str = "prompts/synthesize_changelog.md"
+    timeout_seconds: int = 300  # 5 min — should be a few seconds in practice
+    # Per-PR body trimmed to this many characters before being inlined
+    # into the synthesis prompt. Keeps the request payload bounded for
+    # groups that drag in long source-PR descriptions.
+    max_pr_body_chars: int = 3000
+
+
+@dataclass
 class AIResolveConfig:
     """Claude-driven conflict resolver configuration."""
     enabled: bool = False
@@ -311,6 +346,7 @@ class Config:
     pr_sources: PRSourcesConfig = field(default_factory=PRSourcesConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     ai_resolve: AIResolveConfig = field(default_factory=AIResolveConfig)
+    ai_changelog: AIChangelogConfig = field(default_factory=AIChangelogConfig)
     config_path: Path = field(default_factory=lambda: Path.cwd() / "config.yaml")
     work_dir: Path | None = None
     push: bool = False
@@ -455,6 +491,7 @@ def load_config(config_path: Path | None = None) -> Config:
             f"got {global_if_exists!r}"
         )
     global_auto_pr = bool(ps_raw.get("auto_pr", True))
+    global_retry_failed = bool(ps_raw.get("retry_failed", True))
     by_labels = []
     for entry in ps_raw.get("by_labels", []):
         raw_labels = entry.get("labels", [])
@@ -546,6 +583,7 @@ def load_config(config_path: Path | None = None) -> Config:
         groups=groups,
         if_exists=global_if_exists,
         auto_pr=global_auto_pr,
+        retry_failed=global_retry_failed,
     )
 
     notif_raw = raw.get("notifications", {}) or {}
@@ -618,6 +656,17 @@ def load_config(config_path: Path | None = None) -> Config:
         assignee_dev_login_map=login_map,
     )
 
+    ai_changelog_raw = raw.get("ai_changelog", {}) or {}
+    ai_changelog = AIChangelogConfig(
+        enabled=bool(ai_changelog_raw.get("enabled", False)),
+        command=ai_changelog_raw.get("command", "claude"),
+        prompt_file=ai_changelog_raw.get(
+            "prompt_file", "prompts/synthesize_changelog.md",
+        ),
+        timeout_seconds=int(ai_changelog_raw.get("timeout_seconds", 300)),
+        max_pr_body_chars=int(ai_changelog_raw.get("max_pr_body_chars", 3000)),
+    )
+
     ai_raw = raw.get("ai_resolve", {}) or {}
     ai_resolve = AIResolveConfig(
         enabled=ai_raw.get("enabled", False),
@@ -663,6 +712,7 @@ def load_config(config_path: Path | None = None) -> Config:
         pr_sources=pr_sources,
         notifications=notifications,
         ai_resolve=ai_resolve,
+        ai_changelog=ai_changelog,
         config_path=config_path,
         work_dir=work_dir,
         push=raw.get("push", False),
@@ -712,7 +762,7 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     if (
         ps.by_labels or ps.exclude_labels or ps.include_prs
         or ps.exclude_prs or ps.include_authors or ps.exclude_authors
-        or ps.groups or ps.auto_pr is not True
+        or ps.groups or ps.auto_pr is not True or ps.retry_failed is not True
     ):
         ps_data: dict = {}
         if ps.by_labels:
@@ -757,6 +807,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
             ps_data["if_exists"] = ps.if_exists
         if ps.auto_pr is not True:
             ps_data["auto_pr"] = ps.auto_pr
+        if ps.retry_failed is not True:
+            ps_data["retry_failed"] = ps.retry_failed
         data["pr_sources"] = ps_data
 
     notif_data: dict = {}
@@ -808,6 +860,22 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         ai_data["api_retry_backoff_seconds"] = ai.api_retry_backoff_seconds
     if ai_data:
         data["ai_resolve"] = ai_data
+
+    aic = config.ai_changelog
+    aic_defaults = AIChangelogConfig()
+    aic_data: dict = {}
+    if aic.enabled != aic_defaults.enabled:
+        aic_data["enabled"] = aic.enabled
+    if aic.command != aic_defaults.command:
+        aic_data["command"] = aic.command
+    if aic.prompt_file != aic_defaults.prompt_file:
+        aic_data["prompt_file"] = aic.prompt_file
+    if aic.timeout_seconds != aic_defaults.timeout_seconds:
+        aic_data["timeout_seconds"] = aic.timeout_seconds
+    if aic.max_pr_body_chars != aic_defaults.max_pr_body_chars:
+        aic_data["max_pr_body_chars"] = aic.max_pr_body_chars
+    if aic_data:
+        data["ai_changelog"] = aic_data
 
     if config.push:
         data["push"] = True

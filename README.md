@@ -235,6 +235,11 @@ pr_sources:
 | `ai_resolve.needs_attention_label` | Label attached to draft PRs from partial-group failures | `ai-needs-attention` |
 | `ai_resolve.prompt_file` | Prompt template used when AI resolves a conflicted **cherry-pick** | `prompts/resolve_conflict.md` |
 | `ai_resolve.merge_prompt_file` | Prompt template used when AI resolves a conflicted **merge** during `releasy refresh` | `prompts/resolve_merge_conflict.md` |
+| `ai_changelog.enabled` | Use Claude to compose a single user-facing CHANGELOG entry for multi-PR groups (drops intermediate fix-ups, refactors, and other non-user-visible churn). Singletons always reuse the source PR's entry verbatim — no Claude call. | `false` |
+| `ai_changelog.command` | Claude executable used for synthesis. | `claude` |
+| `ai_changelog.prompt_file` | Prompt template for changelog synthesis. | `prompts/synthesize_changelog.md` |
+| `ai_changelog.timeout_seconds` | Per-call timeout for the synthesis subprocess. | `300` |
+| `ai_changelog.max_pr_body_chars` | Per-PR body trim before being inlined into the prompt. | `3000` |
 | `pr_sources.auto_pr` | Open a PR for every pushed port branch (singletons, by_labels, include_prs, groups). Requires `push: true`. | `true` |
 | `pr_sources.by_labels[].labels` | Labels a PR must have (AND logic) | — |
 | `pr_sources.by_labels[].merged_only` | Only include merged PRs | `false` |
@@ -249,6 +254,7 @@ pr_sources:
 | `pr_sources.groups[].description` | Title text for the combined PR | id |
 | `pr_sources.groups[].if_exists` | Override `pr_sources.if_exists` per group | inherits |
 | `pr_sources.if_exists` | When a port branch exists *locally only*: `skip` or `recreate`. Also: with `recreate`, an in-progress cherry-pick / merge / rebase at startup is auto-aborted; with `skip` the pipeline halts. Branches that already exist on the remote are always skipped. | `skip` |
+| `pr_sources.retry_failed` | When a PR unit has a `conflict` entry in state from a previous run: `true` discards the existing local / remote port branch and re-runs the cherry-pick from base; `false` leaves the entry exactly as-is. Overridable per-invocation with `--retry-failed` / `--no-retry-failed` on `releasy run`. | `true` |
 
 ### Environment variables
 
@@ -335,6 +341,7 @@ for the latter.
 ```bash
 releasy run [--onto <tag-or-sha>] [--work-dir <path>]
             [--resolve-conflicts | --no-resolve-conflicts]
+            [--retry-failed | --no-retry-failed]
 ```
 
 | Option | Description | Default |
@@ -342,6 +349,7 @@ releasy run [--onto <tag-or-sha>] [--work-dir <path>]
 | `--onto <ver>` | Version label used to derive `<project>-<version>` if `target_branch` is unset. Just a string — never resolved as a git ref. | from `target_branch` |
 | `--work-dir <path>` | Working directory for git operations (overrides config `work_dir`). | from config / cwd |
 | `--resolve-conflicts` / `--no-resolve-conflicts` | Toggle the AI resolver. The flag is a kill-switch: AI runs only if both this *and* `ai_resolve.enabled` are true. | on |
+| `--retry-failed` / `--no-retry-failed` | Re-attempt PR units whose previous run ended in `conflict` status: discard the existing local / remote port branch and re-run the cherry-pick from base. With `--no-retry-failed`, those entries are left exactly as-is. | from `pr_sources.retry_failed` (true) |
 
 Exit code: `1` if any port ended up in `conflict` status, `0` otherwise.
 
