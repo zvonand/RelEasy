@@ -105,6 +105,46 @@ def fetch_all(config: Config, repo_path: Path) -> None:
     fetch_remote(repo_path, config.origin.remote_name)
 
 
+def ensure_remote(repo_path: Path, name: str, url: str) -> bool:
+    """Register a remote alias if missing; update the URL if it drifted.
+
+    Idempotent: a no-op when ``name`` already points at ``url``. Returns
+    True iff the local config was changed (added or updated). Used by the
+    AI conflict resolver to make the configured ``upstream`` remote
+    available for ``git fetch <upstream> <branch>`` and ``git log -S``
+    queries during prereq detection.
+    """
+    existing = run_git(
+        ["remote", "get-url", name], repo_path, check=False,
+    )
+    if existing.returncode == 0:
+        if existing.stdout.strip() == url:
+            return False
+        run_git(["remote", "set-url", name, url], repo_path, check=False)
+        return True
+    run_git(["remote", "add", name, url], repo_path, check=False)
+    return True
+
+
+def is_ancestor(repo_path: Path, ancestor: str, descendant: str) -> bool | None:
+    """Return True iff ``ancestor`` is an ancestor of ``descendant``.
+
+    Wraps ``git merge-base --is-ancestor`` (exit 0 = yes, 1 = no, anything
+    else = error). Returns ``None`` on error so callers can skip the
+    check rather than treat "git doesn't know" as a definitive answer.
+    """
+    result = run_git(
+        ["merge-base", "--is-ancestor", ancestor, descendant],
+        repo_path,
+        check=False,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    return None
+
+
 def stash_and_clean(repo_path: Path) -> None:
     """Ensure the working tree is clean."""
     run_git(["checkout", "--force", "HEAD"], repo_path, check=False)

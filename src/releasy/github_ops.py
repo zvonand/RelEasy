@@ -8,12 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import requests
-from rich.console import Console
+from releasy.termlog import console
 
 from releasy.config import Config, get_github_token
 from releasy.state import FeatureState, PipelineState
-
-console = Console()
 
 log = logging.getLogger(__name__)
 
@@ -216,7 +214,7 @@ class PRInfo:
     number: int
     title: str
     body: str
-    state: str  # "open" or "merged"
+    state: str  # "open", "merged", or "closed" (unmerged; see include_closed fetches)
     merge_commit_sha: str | None
     head_sha: str
     url: str
@@ -334,6 +332,8 @@ def fetch_pr_by_number(
     number: int,
     merged_only: bool = False,
     slug: str | None = None,
+    *,
+    include_closed: bool = False,
 ) -> PRInfo | None:
     """Fetch a single PR by number.
 
@@ -365,6 +365,8 @@ def fetch_pr_by_number(
             if merged_only:
                 return None
             pr_state = "open"
+        elif include_closed and pr.state == "closed":
+            pr_state = "closed"
         else:
             return None
 
@@ -390,7 +392,11 @@ def fetch_pr_by_number(
 
 
 def fetch_pr_by_url(
-    config: Config, url: str, merged_only: bool = False,
+    config: Config,
+    url: str,
+    merged_only: bool = False,
+    *,
+    include_closed: bool = False,
 ) -> PRInfo | None:
     """Fetch a PR identified by its full GitHub URL (any public repo)."""
     parsed = parse_pr_url(url)
@@ -399,8 +405,25 @@ def fetch_pr_by_url(
         return None
     owner, repo, number = parsed
     return fetch_pr_by_number(
-        config, number, merged_only=merged_only, slug=f"{owner}/{repo}",
+        config,
+        number,
+        merged_only=merged_only,
+        slug=f"{owner}/{repo}",
+        include_closed=include_closed,
     )
+
+
+def rebase_pr_was_closed_without_merge(config: Config, pr_url: str) -> bool:
+    """True when the port / rebase PR exists on GitHub but is closed unmerged.
+
+    Used with ``pr_sources.recreate_closed_prs`` to open a fresh port branch
+    (``<canonical>-1``, ``-2``, …) after the previous rebase PR was closed.
+    Returns ``False`` when the PR is open, merged, the URL is invalid, or the
+    lookup fails (missing token, network error) — callers treat unknown as
+    "do not renumber".
+    """
+    info = fetch_pr_by_url(config, pr_url, include_closed=True)
+    return info is not None and info.state == "closed"
 
 
 def is_pr_merged(config: Config, pr_url: str) -> bool | None:
@@ -2267,6 +2290,22 @@ def sync_project(config: Config, state: PipelineState) -> ProjectSyncSummary:
     return summary
 
 
+def _format_pr_url_as_link(url: str) -> str:
+    """Render a GitHub PR URL as a markdown link ``[owner/repo#N](url)``.
+
+    Falls back to the bare URL when parsing fails — keeps the body
+    readable without ever throwing on a malformed string.
+    """
+    m = re.match(
+        r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/pull/(\d+)",
+        url,
+    )
+    if not m:
+        return url
+    owner, repo, num = m.group(1), m.group(2), m.group(3)
+    return f"[{owner}/{repo}#{num}]({url})"
+
+
 def _project_item_body(
     state: PipelineState,
     status: str,
@@ -2333,7 +2372,121 @@ def _project_item_body(
         if fs.rebase_pr_url:
             note_lines.append(f"Draft PR: {fs.rebase_pr_url}")
         body_parts.append("\n".join(note_lines))
+
+    # Prereq-detection blocks. These are independent of the conflict-files
+    # block above — a unit can both have unresolved conflict files AND a
+    # missing-prereq trail (e.g. detection-only mode left both populated).
+    if fs is not None:
+        prereq_block = _render_prereq_body_block(fs)
+        if prereq_block:
+            body_parts.append(prereq_block)
+
     if conflict_files:
         files_str = "\n".join(f"- `{f}`" for f in conflict_files)
         body_parts.append(f"**Conflict files:**\n{files_str}")
     return "\n\n".join(body_parts)
+
+
+def _render_prereq_body_block(fs: FeatureState) -> str | None:
+    """Render the prereq-detection / auto-recovery block(s) for ``fs``.
+
+    Selects the right variant based on which fields are populated:
+    * ``queued_prereq_units`` set → "already queued elsewhere"
+    * ``prereq_recovery_exhausted`` set → "depth limit / cycle"
+    * ``dynamic_prereq_urls`` set with no exhaust + status != conflict
+      → "auto-ported prerequisites" (success)
+    * ``missing_prereq_prs`` set otherwise → detection-only block
+
+    Returns ``None`` when no prereq-related state is present.
+    """
+    if fs.queued_prereq_units:
+        lines = ["**Prerequisite already queued.**"]
+        lines.append(
+            "Releasy detected that this PR depends on PR(s) which are "
+            "already known to releasy and being ported elsewhere. "
+            "Merge those first; this unit will succeed on the next "
+            "`releasy run`."
+        )
+        for entry in fs.queued_prereq_units:
+            url = entry.get("prereq_url", "")
+            queued_in = entry.get("queued_in", "?")
+            queued_pr = entry.get("queued_in_pr_url")
+            link = _format_pr_url_as_link(url) if url else "(unknown PR)"
+            extra = f" — already-open PR: {queued_pr}" if queued_pr else ""
+            lines.append(f"- {link} (queued in `{queued_in}`){extra}")
+        return "\n".join(lines)
+
+    if fs.prereq_recovery_exhausted and fs.prereq_trail:
+        max_depth = max(
+            (entry.get("at_depth", 0) for entry in fs.prereq_trail),
+            default=0,
+        )
+        # Last trail entry's `discovered` is the prereq we *would* have
+        # dived into when we hit the cap (or the cycle).
+        last = fs.prereq_trail[-1]
+        next_prereqs = last.get("discovered", []) or []
+        next_link_str = ", ".join(
+            _format_pr_url_as_link(u) for u in next_prereqs
+        ) or "(none recorded)"
+        lines = [
+            f"**Auto-prereq recovery hit a hard limit (depth {max_depth}).**",
+            "Dependency trail (each line = one dive, in discovery order):",
+        ]
+        for i, entry in enumerate(fs.prereq_trail, start=1):
+            trig = entry.get("triggering_pr") or "(unknown)"
+            disc = entry.get("discovered", []) or []
+            reason = entry.get("reason") or ""
+            disc_str = ", ".join(
+                _format_pr_url_as_link(u) for u in disc
+            ) or "(none)"
+            trig_link = _format_pr_url_as_link(trig)
+            line = f"{i}. {trig_link} → needed {disc_str}"
+            if reason:
+                line += f" — _{reason}_"
+            lines.append(line)
+        lines.append(
+            f"**Next prereq that exceeded the limit:** {next_link_str}"
+        )
+        lines.append(
+            "All dynamic prereqs were rolled back. Resolve manually or "
+            "bump `ai_resolve.auto_add_prerequisite_prs.max_prereq_depth`."
+        )
+        return "\n".join(lines)
+
+    if (
+        fs.dynamic_prereq_urls
+        and not fs.prereq_recovery_exhausted
+        and fs.status != "conflict"
+    ):
+        lines = ["**Auto-ported prerequisites.**"]
+        lines.append(
+            "Releasy detected one or more missing prerequisite PR(s) and "
+            "ported them automatically before the requested PR. The "
+            "combined PR includes:"
+        )
+        for url in fs.dynamic_prereq_urls:
+            lines.append(f"- {_format_pr_url_as_link(url)}")
+        if fs.prereq_trail:
+            trail_chain = " → ".join(
+                _format_pr_url_as_link(
+                    entry.get("triggering_pr") or "(unknown)"
+                )
+                for entry in fs.prereq_trail
+            )
+            if trail_chain:
+                lines.append(f"_Detection trail:_ {trail_chain}")
+        return "\n".join(lines)
+
+    if fs.missing_prereq_prs:
+        lines = ["**Missing prerequisites.**"]
+        lines.append(
+            "Claude judged this conflict to be caused by upstream PR(s) "
+            "that have not yet been ported to the target branch:"
+        )
+        for url in fs.missing_prereq_prs:
+            lines.append(f"- {_format_pr_url_as_link(url)}")
+        if fs.missing_prereq_note:
+            lines.append(f"**Analysis:** {fs.missing_prereq_note}")
+        return "\n".join(lines)
+
+    return None

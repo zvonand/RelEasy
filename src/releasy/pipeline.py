@@ -12,10 +12,10 @@ records the entry as ``Conflict`` in the GitHub Project.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from rich.console import Console
+from releasy.termlog import console
 
 from releasy.config import Config, FeatureConfig, PRGroupConfig, PRSourceConfig
 from releasy.git_ops import (
@@ -23,6 +23,8 @@ from releasy.git_ops import (
     abort_in_progress_op,
     append_commit_trailer,
     branch_exists,
+    ensure_remote,
+    is_ancestor,
     local_branch_exists,
     remote_branch_exists,
     cherry_pick_merge_commit,
@@ -44,7 +46,9 @@ from releasy.github_ops import (
     create_pull_request,
     ensure_label,
     fetch_pr_by_number,
+    fetch_pr_by_url,
     find_pr_for_branch,
+    rebase_pr_was_closed_without_merge,
     get_origin_repo_slug,
     is_pr_merged,
     mark_pr_ready_for_review,
@@ -59,8 +63,6 @@ from releasy.github_ops import (
     update_pull_request,
 )
 from releasy.state import FeatureState, PipelineState, load_state, save_state
-
-console = Console()
 
 
 # ---------------------------------------------------------------------------
@@ -610,14 +612,10 @@ def run_pipeline(
     # The needs-attention label is used for partial-group draft PRs whenever
     # an unresolved conflict surfaces, regardless of whether the AI resolver
     # was enabled — pre-create it so the PR-creation path doesn't fail on a
-    # missing label.
+    # missing label. Same goes for the missing-prereqs and auto-prereq
+    # labels: cheaper to ensure them once up-front than on every conflict.
     if config.push:
-        ensure_label(
-            config,
-            config.ai_resolve.needs_attention_label,
-            config.ai_resolve.needs_attention_label_color,
-            "Releasy stopped on a conflict it could not resolve — needs human review",
-        )
+        _ensure_conflict_labels(config)
 
     console.print(
         f"\n[bold]Phase:[/bold] Porting PRs onto [cyan]{base_branch}[/cyan]"
@@ -791,12 +789,7 @@ def run_sequential(
         console.print(f"[dim]AI conflict resolver: {why}[/dim]")
 
     if config.push:
-        ensure_label(
-            config,
-            config.ai_resolve.needs_attention_label,
-            config.ai_resolve.needs_attention_label_color,
-            "Releasy stopped on a conflict it could not resolve — needs human review",
-        )
+        _ensure_conflict_labels(config)
 
     console.print(
         f"\n[bold]Phase:[/bold] Sequential porting onto [cyan]{base_branch}[/cyan]"
@@ -977,6 +970,33 @@ _RELEASY_PREFIX_RE = re.compile(r"^\[releasy\b[^\]]*\]\s*", re.IGNORECASE)
 RELEASY_LABEL = "releasy"
 RELEASY_LABEL_COLOR = "1F6FEB"  # GitHub blue
 RELEASY_LABEL_DESCRIPTION = "Created/managed by RelEasy"
+
+
+def _ensure_conflict_labels(config: Config) -> None:
+    """Pre-create every label the conflict-handling paths might apply.
+
+    Cheaper than re-checking on each conflict and removes the chance that
+    a label-application call inside the hot path fails on a missing
+    label (which would degrade gracefully but spam warnings).
+    """
+    ensure_label(
+        config,
+        config.ai_resolve.needs_attention_label,
+        config.ai_resolve.needs_attention_label_color,
+        "Releasy stopped on a conflict it could not resolve — needs human review",
+    )
+    ensure_label(
+        config,
+        config.ai_resolve.missing_prereqs_label,
+        config.ai_resolve.missing_prereqs_label_color,
+        "Conflict caused by an unported prerequisite PR",
+    )
+    ensure_label(
+        config,
+        config.ai_resolve.auto_prereq_label,
+        config.ai_resolve.auto_prereq_label_color,
+        "Combined PR includes auto-added prerequisite PR(s)",
+    )
 
 
 def _display_project(project: str | None) -> str:
@@ -1487,6 +1507,8 @@ def _unit_body(
     failed_index: int | None = None,
     failed_pr: PRInfo | None = None,
     conflict_files: list[str] | None = None,
+    auto_prereq_urls: list[str] | None = None,
+    auto_prereq_trail: list[dict] | None = None,
 ) -> str:
     """Build the PR body listing constituent PRs.
 
@@ -1500,6 +1522,12 @@ def _unit_body(
     automatically. The banner lists the conflicted files from the failed
     step (if known) and notes that any later PRs in the group were not
     attempted.
+
+    When ``auto_prereq_urls`` is non-empty, prepends a notice that the
+    combined PR auto-included prerequisite PR(s) discovered by Claude
+    during conflict resolution (auto-recovery mode). The trail (if
+    provided) is rendered as a chain so reviewers can see the discovery
+    order.
     """
     lines: list[str] = []
     if needs_intervention:
@@ -1530,6 +1558,25 @@ def _unit_body(
             "> Resolve the conflict locally, push the fix, and mark this "
             "PR ready for review."
         )
+        lines.append("")  # blank separator before the rest
+
+    if auto_prereq_urls:
+        lines.append(
+            "> **Auto-ported prerequisites:** RelEasy detected that the "
+            "requested port depended on PR(s) not yet on the target "
+            f"branch and auto-ported them first ({len(auto_prereq_urls)} "
+            "PR(s) added). Reviewers: please confirm the prereq scope "
+            "is appropriate."
+        )
+        for url in auto_prereq_urls:
+            lines.append(f"> - {url}")
+        if auto_prereq_trail:
+            chain = " → ".join(
+                entry.get("triggering_pr") or "(unknown)"
+                for entry in auto_prereq_trail
+            )
+            if chain:
+                lines.append(f"> _Detection trail:_ {chain}")
         lines.append("")  # blank separator before the rest
 
     changelog = _build_changelog_block(unit)
@@ -1631,6 +1678,24 @@ def _cherry_pick_pr(
     )
 
 
+def _next_free_renumbered_port_branch(
+    repo_path: Path,
+    remote: str,
+    canonical_branch: str,
+) -> str:
+    """Pick ``<canonical_branch>-N`` for the smallest ``N >= 1`` with no
+    matching local or remote ref.
+    """
+    n = 1
+    while True:
+        candidate = f"{canonical_branch}-{n}"
+        if not remote_branch_exists(
+            repo_path, candidate, remote,
+        ) and not local_branch_exists(repo_path, candidate):
+            return candidate
+        n += 1
+
+
 def _process_feature_unit(
     config: Config,
     repo_path: Path,
@@ -1655,11 +1720,13 @@ def _process_feature_unit(
     port branch is force-recreated from base and the cherry-pick is
     re-attempted; when false, the unit is left exactly as-is (no
     cherry-pick, no PR side-effects).
+
+    ``pr_sources.recreate_closed_prs`` allocates ``feature/.../<id>-1``,
+    ``-2``, … when the stored ``rebase_pr_url`` PR was closed without merging,
+    then runs the normal cherry-pick + push + open-PR path for that name.
     """
     origin_slug = get_origin_repo_slug(config)
-    new_branch = config.feature_branch_name(unit.feature_id, onto)
-    on_remote = remote_branch_exists(repo_path, new_branch, remote)
-    on_local = local_branch_exists(repo_path, new_branch)
+    canonical_branch = config.feature_branch_name(unit.feature_id, onto)
     label = (
         f"group {unit.group_id} ({len(unit.prs)} PRs)"
         if unit.is_group
@@ -1678,18 +1745,45 @@ def _process_feature_unit(
         # as it is so manual fix-ups (or a later --retry-failed run) can
         # take over without us touching the PR / branch / project board.
         console.print(
-            f"\n    [dim]{new_branch} ({label}) — previously conflicted, "
+            f"\n    [dim]{canonical_branch} ({label}) — previously conflicted, "
             "skipping (pr_sources.retry_failed: false / "
             "--no-retry-failed)[/dim]"
         )
         return "continue"
 
-    if force_retry and (on_remote or on_local):
+    on_remote_canon = remote_branch_exists(
+        repo_path, canonical_branch, remote,
+    )
+    on_local_canon = local_branch_exists(repo_path, canonical_branch)
+
+    if force_retry and (on_remote_canon or on_local_canon):
         console.print(
-            f"\n    [yellow]↻[/yellow] [cyan]{new_branch}[/cyan] ({label}) — "
+            f"\n    [yellow]↻[/yellow] [cyan]{canonical_branch}[/cyan] ({label}) — "
             "previously conflicted, force-recreating from base "
             "(pr_sources.retry_failed: true)"
         )
+
+    new_branch = canonical_branch
+    if (
+        config.pr_sources.recreate_closed_prs
+        and not force_retry
+        and prev_state
+        and prev_state.rebase_pr_url
+        and rebase_pr_was_closed_without_merge(
+            config, prev_state.rebase_pr_url,
+        )
+    ):
+        new_branch = _next_free_renumbered_port_branch(
+            repo_path, remote, canonical_branch,
+        )
+        console.print(
+            f"\n    [yellow]↻[/yellow] Rebase PR closed without merge — "
+            f"opening a new port branch [cyan]{new_branch}[/cyan] "
+            "([cyan]pr_sources.recreate_closed_prs[/cyan])"
+        )
+
+    on_remote = remote_branch_exists(repo_path, new_branch, remote)
+    on_local = local_branch_exists(repo_path, new_branch)
 
     if on_remote and not force_retry:
         console.print(
@@ -1728,18 +1822,177 @@ def _process_feature_unit(
         source_branch="", enabled=True,
     ))
 
-    console.print(f"\n  [cyan]{new_branch}[/cyan] ({label})")
-    for pr in unit.prs:
-        ref = pr_ref_label(pr.repo_slug, pr.number, origin_slug)
-        console.print(f"    PR {ref}: {pr.url}  [{pr.state}]")
+    # Auto-recovery loop. Each iteration runs the full cherry-pick sequence
+    # for whatever ``unit.prs`` currently contains. On a clean finish or a
+    # plain conflict (no missing-prereq signal) the loop exits. On a
+    # missing-prereq report we either label-and-stop (detection-only mode)
+    # or prepend the discovered prereq(s) and restart with the expanded
+    # unit. ``max_prereq_depth`` and the cycle check bound the loop.
+    fs_dynamic_prereq_urls: list[str] = []
+    fs_prereq_trail: list[dict] = []
+    prereq_discovery_depth = 0
+    auto_cfg = config.ai_resolve.auto_add_prerequisite_prs
 
-    pr_meta = _unit_pr_meta(unit)
+    while True:
+        console.print(f"\n  [cyan]{new_branch}[/cyan] ({label})")
+        for pr in unit.prs:
+            ref = pr_ref_label(pr.repo_slug, pr.number, origin_slug)
+            tag = ""
+            if pr.url in fs_dynamic_prereq_urls:
+                tag = " [dim](auto-prereq)[/dim]"
+            console.print(f"    PR {ref}: {pr.url}  [{pr.state}]{tag}")
 
-    stash_and_clean(repo_path)
-    create_branch_from_ref(repo_path, new_branch, base_ref)
+        pr_meta = _unit_pr_meta(unit)
+        stash_and_clean(repo_path)
+        create_branch_from_ref(repo_path, new_branch, base_ref)
 
-    # Cherry-pick each PR in order. Conflicts are handled per-PR; a
-    # successful AI resolve continues to the next PR in the group.
+        outcome = _attempt_cherry_picks(
+            config, repo_path, unit, new_branch, base_branch, ai_active,
+            origin_slug,
+        )
+
+        if outcome.kind == "success":
+            # --- All PRs cherry-picked cleanly (possibly via AI) ---
+            # Synthesise the combined-port CHANGELOG entry now (groups only,
+            # ai_changelog enabled). Done after the cherry-pick succeeded so
+            # we don't burn tokens on units that ended up in conflict —
+            # those already produced a draft PR with the per-PR fallback
+            # wording, and a successful retry will hit this same path.
+            _maybe_synthesize_changelog(config, unit, base_branch)
+            _finish_clean_unit(
+                config, repo_path, state, unit, new_branch, base_branch,
+                onto, pr_meta,
+                was_failed_prev=is_failed_prev,
+                dynamic_prereq_urls=fs_dynamic_prereq_urls,
+                prereq_trail=fs_prereq_trail,
+                prereq_discovery_depth=prereq_discovery_depth,
+            )
+            return "continue"
+
+        if outcome.kind == "missing_prereqs":
+            # Either label-and-stop (detection-only) or dive deeper.
+            should_dive, exit_reason = _decide_prereq_dive(
+                config, state, unit, outcome, fs_dynamic_prereq_urls,
+                prereq_discovery_depth,
+            )
+            if not should_dive:
+                _handle_missing_prereqs_no_dive(
+                    config, repo_path, state, unit, new_branch, base_branch,
+                    base_ref, onto, outcome, pr_meta,
+                    fs_dynamic_prereq_urls=fs_dynamic_prereq_urls,
+                    fs_prereq_trail=fs_prereq_trail,
+                    prereq_discovery_depth=prereq_discovery_depth,
+                    exit_reason=exit_reason,
+                )
+                return "continue"
+
+            # --- Dive: prepend discovered prereq(s) and restart ---
+            prereq_infos, fetch_failed = _fetch_prereq_prs(
+                config, exit_reason["dive_urls"],
+            )
+            if fetch_failed:
+                console.print(
+                    f"    [yellow]![/yellow] Could not fetch "
+                    f"{len(fetch_failed)} prereq PR(s) — falling back to "
+                    "detection-only labelling:"
+                )
+                for url in fetch_failed:
+                    console.print(f"      • {url}")
+                _handle_missing_prereqs_no_dive(
+                    config, repo_path, state, unit, new_branch, base_branch,
+                    base_ref, onto, outcome, pr_meta,
+                    fs_dynamic_prereq_urls=fs_dynamic_prereq_urls,
+                    fs_prereq_trail=fs_prereq_trail,
+                    prereq_discovery_depth=prereq_discovery_depth,
+                    exit_reason={"reason": "fetch_failed",
+                                 "failed_urls": fetch_failed},
+                )
+                return "continue"
+
+            prereq_discovery_depth += 1
+            new_dynamic_urls = [pi.url for pi in prereq_infos]
+            fs_dynamic_prereq_urls = new_dynamic_urls + fs_dynamic_prereq_urls
+            fs_prereq_trail.append({
+                "at_depth": prereq_discovery_depth,
+                "triggering_pr": outcome.failed_pr.url,
+                "discovered": new_dynamic_urls,
+                "reason": outcome.missing_prereq_note or "",
+            })
+            unit.prs = prereq_infos + unit.prs
+
+            console.print(
+                f"\n    [magenta]↻ auto-prereq dive #{prereq_discovery_depth}"
+                f"/{auto_cfg.max_prereq_depth}[/magenta] — prepending "
+                f"{len(prereq_infos)} prereq PR(s) to unit and restarting:"
+            )
+            for pi in prereq_infos:
+                console.print(
+                    f"      → {pr_ref_label(pi.repo_slug, pi.number, origin_slug)}"
+                    f" {pi.url}"
+                )
+
+            # Persist the in-progress trail so a Ctrl-C / crash mid-dive
+            # leaves a paper trail in state for the next `releasy continue`.
+            _persist_dive_progress(
+                config, state, unit, new_branch, onto, pr_meta,
+                fs_dynamic_prereq_urls=fs_dynamic_prereq_urls,
+                fs_prereq_trail=fs_prereq_trail,
+                prereq_discovery_depth=prereq_discovery_depth,
+            )
+            continue  # restart the loop with the expanded unit
+
+        # outcome.kind == "unresolved"
+        # Plain unresolved conflict — flag for manual review and stop.
+        _handle_unresolved_conflict(
+            config, repo_path, state, unit, new_branch, base_branch,
+            base_ref, onto, outcome.failed_idx, outcome.failed_pr,
+            outcome.conflict_files, pr_meta,
+            ai_attempted=ai_active,
+            dynamic_prereq_urls=fs_dynamic_prereq_urls,
+            prereq_trail=fs_prereq_trail,
+            prereq_discovery_depth=prereq_discovery_depth,
+        )
+        return "continue"
+
+
+@dataclass
+class _CherryPickOutcome:
+    """Outcome of a single full ``_attempt_cherry_picks`` pass over a unit.
+
+    ``kind`` is one of:
+      * ``"success"`` — every PR in ``unit.prs`` was cherry-picked cleanly
+        (possibly via AI). No other fields are populated.
+      * ``"unresolved"`` — a conflict on PR ``failed_idx`` could not be
+        resolved by the AI (or AI is disabled). ``failed_pr`` and
+        ``conflict_files`` are populated.
+      * ``"missing_prereqs"`` — the AI identified the conflict as caused
+        by an unported prerequisite. ``missing_prereq_prs`` and
+        ``missing_prereq_note`` carry Claude's report; ``failed_pr``
+        is the source PR that triggered the conflict.
+    """
+    kind: str
+    failed_idx: int = 0
+    failed_pr: PRInfo | None = None
+    conflict_files: list[str] = field(default_factory=list)
+    missing_prereq_prs: list[str] = field(default_factory=list)
+    missing_prereq_note: str | None = None
+
+
+def _attempt_cherry_picks(
+    config: Config,
+    repo_path: Path,
+    unit: FeatureUnit,
+    new_branch: str,
+    base_branch: str,
+    ai_active: bool,
+    origin_slug: str | None,
+) -> _CherryPickOutcome:
+    """Cherry-pick every PR in ``unit.prs`` into the current branch.
+
+    Stops on the first conflict and returns the appropriate outcome
+    (``unresolved`` or ``missing_prereqs``). Returns ``success`` only
+    when every PR landed cleanly.
+    """
     for idx, pr in enumerate(unit.prs):
         ref = pr_ref_label(pr.repo_slug, pr.number, origin_slug)
         if len(unit.prs) > 1:
@@ -1761,37 +2014,97 @@ def _process_feature_unit(
         for cf in cp_result.conflict_files:
             console.print(f"      [red]•[/red] {cf}")
 
-        handled = False
+        ai_outcome: _AIStepOutcome | None = None
         if ai_active:
-            handled = _try_ai_resolve_step(
+            ai_outcome = _try_ai_resolve_step(
                 config, repo_path, unit, new_branch, base_branch, pr,
                 cp_result.conflict_files,
             )
 
-        if handled:
+        if ai_outcome is not None and ai_outcome.handled:
             _tag_commit_with_source_pr(repo_path, unit, pr, origin_slug)
             continue
 
-        # --- Unhandled conflict — clean up and flag for manual review ---
-        _handle_unresolved_conflict(
-            config, repo_path, state, unit, new_branch, base_branch,
-            base_ref, onto, idx, pr, cp_result.conflict_files, pr_meta,
-            ai_attempted=ai_active,
-        )
-        return "continue"
+        if ai_outcome is not None and ai_outcome.missing_prereq_prs:
+            return _CherryPickOutcome(
+                kind="missing_prereqs",
+                failed_idx=idx,
+                failed_pr=pr,
+                conflict_files=cp_result.conflict_files,
+                missing_prereq_prs=ai_outcome.missing_prereq_prs,
+                missing_prereq_note=ai_outcome.missing_prereq_note,
+            )
 
-    # --- All PRs cherry-picked cleanly (possibly via AI) ---
-    # Synthesise the combined-port CHANGELOG entry now (groups only,
-    # ai_changelog enabled). Done after the cherry-pick succeeded so
-    # we don't burn tokens on units that ended up in conflict — those
-    # already produced a draft PR with the per-PR fallback wording, and
-    # a successful retry will hit this same path.
-    _maybe_synthesize_changelog(config, unit, base_branch)
-    _finish_clean_unit(
-        config, repo_path, state, unit, new_branch, base_branch, onto, pr_meta,
-        was_failed_prev=is_failed_prev,
+        return _CherryPickOutcome(
+            kind="unresolved",
+            failed_idx=idx,
+            failed_pr=pr,
+            conflict_files=cp_result.conflict_files,
+        )
+
+    return _CherryPickOutcome(kind="success")
+
+
+def _decide_prereq_dive(
+    config: Config,
+    state: PipelineState,
+    unit: FeatureUnit,
+    outcome: _CherryPickOutcome,
+    fs_dynamic_prereq_urls: list[str],
+    prereq_discovery_depth: int,
+) -> tuple[bool, dict]:
+    """Decide whether to dive into auto-recovery on a missing-prereq report.
+
+    Returns ``(should_dive, exit_reason)``. ``exit_reason`` is a dict
+    that always carries a ``"reason"`` key. When ``should_dive`` is True,
+    it also has ``"dive_urls"``: the URLs to actually port (after
+    queued-elsewhere / depth / cycle / ancestor pre-flight have winnowed
+    the list). When False, the reason explains what stopped us:
+
+      * ``"detection_only"`` — auto-recovery is disabled in config
+      * ``"queued_elsewhere"`` — at least one prereq is already known to
+        releasy in another unit / config entry; ``"queued"`` lists them
+      * ``"cycle"`` — a discovered prereq is already in the unit's PR list
+      * ``"depth_exhausted"`` — bumping depth would exceed
+        ``max_prereq_depth``
+      * ``"all_already_in_base"`` — every discovered prereq is already
+        merged into ``base_branch`` per the local ancestor pre-flight
+    """
+    auto_cfg = config.ai_resolve.auto_add_prerequisite_prs
+
+    if not auto_cfg.enabled:
+        return False, {"reason": "detection_only"}
+
+    # 1) Queued-elsewhere check (cheapest, most informative).
+    queued = _find_already_queued_prereqs(
+        config, state, outcome.missing_prereq_prs,
+        exclude_feature_id=unit.feature_id,
     )
-    return "continue"
+    if queued:
+        return False, {"reason": "queued_elsewhere", "queued": queued}
+
+    # 2) Cycle: any prereq already in the unit's PR list (original
+    # members or already-prepended dynamic ones)?
+    unit_urls = {pr.url for pr in unit.prs}
+    unit_urls.update(fs_dynamic_prereq_urls)
+    cycle_hits = [u for u in outcome.missing_prereq_prs if u in unit_urls]
+    if cycle_hits:
+        return False, {"reason": "cycle", "cycle_urls": cycle_hits}
+
+    # 3) Depth cap.
+    if prereq_discovery_depth >= auto_cfg.max_prereq_depth:
+        return False, {
+            "reason": "depth_exhausted",
+            "depth": prereq_discovery_depth,
+            "max_depth": auto_cfg.max_prereq_depth,
+        }
+
+    # 4) Made it through the gates — return the candidates as
+    # ``dive_urls``. The actual ancestor pre-flight needs ``PRInfo``
+    # (we need ``merge_commit_sha``), so it happens in the caller after
+    # the fetch step. Returning the raw URLs here keeps this function
+    # cheap and pure (no GitHub fetches).
+    return True, {"reason": "ok", "dive_urls": list(outcome.missing_prereq_prs)}
 
 
 def _success_status(rebase_pr_url: str | None) -> str:
@@ -1905,6 +2218,9 @@ def _finish_clean_unit(
     pr_meta: dict,
     *,
     was_failed_prev: bool = False,
+    dynamic_prereq_urls: list[str] | None = None,
+    prereq_trail: list[dict] | None = None,
+    prereq_discovery_depth: int = 0,
 ) -> None:
     """Push and (optionally) open a single combined PR for the unit.
 
@@ -1918,8 +2234,15 @@ def _finish_clean_unit(
     ``ai-needs-attention`` label (if any) is removed, and a draft PR is
     flipped to ready-for-review — so reviewers don't see a "needs
     intervention" banner on a port that is now actually clean.
+
+    ``dynamic_prereq_urls`` / ``prereq_trail`` / ``prereq_discovery_depth``
+    carry the auto-recovery bookkeeping. When non-empty they:
+      * persist on the FeatureState so the project board card and
+        re-runs surface the trail,
+      * tag the merged PR with ``ai_resolve.auto_prereq_label``.
     """
     ai_used = unit.ai_resolved_count > 0
+    has_auto_prereqs = bool(dynamic_prereq_urls)
 
     if config.push:
         _push(config, repo_path, new_branch)
@@ -1937,6 +2260,10 @@ def _finish_clean_unit(
         fs.ai_iterations = unit.ai_iterations_total or None
     if unit.ai_cost_usd_total is not None:
         fs.ai_cost_usd = unit.ai_cost_usd_total
+    if has_auto_prereqs:
+        fs.dynamic_prereq_urls = list(dynamic_prereq_urls or [])
+        fs.prereq_trail = list(prereq_trail or [])
+        fs.prereq_discovery_depth = prereq_discovery_depth
     state.features[unit.feature_id] = fs
 
     if config.push and config.pr_sources.auto_pr:
@@ -1945,8 +2272,12 @@ def _finish_clean_unit(
         title = _unit_title(unit, config.project, base_branch)
         rebase_pr_url, outcome = _ensure_pr_for_branch(
             config, new_branch, base_branch, title,
-            _unit_body(unit, get_origin_repo_slug(config)),
-            force_update=was_failed_prev,
+            _unit_body(
+                unit, get_origin_repo_slug(config),
+                auto_prereq_urls=dynamic_prereq_urls,
+                auto_prereq_trail=prereq_trail,
+            ),
+            force_update=was_failed_prev or has_auto_prereqs,
         )
         _log_pr_action(outcome, rebase_pr_url)
         if rebase_pr_url:
@@ -1955,6 +2286,8 @@ def _finish_clean_unit(
             _apply_releasy_label_to_pr(config, rebase_pr_url)
             if ai_used:
                 _apply_ai_label_to_pr(config, rebase_pr_url)
+            if has_auto_prereqs:
+                _apply_auto_prereq_label_to_pr(config, rebase_pr_url)
             if was_failed_prev:
                 relabelled = _reconcile_recovered_pr(config, rebase_pr_url)
                 # The previous failed run flagged this PR for human
@@ -1963,7 +2296,7 @@ def _finish_clean_unit(
                 # in state, and the `ai-resolved` label on the PR.
                 if relabelled and not state.features[unit.feature_id].ai_resolved:
                     state.features[unit.feature_id].ai_resolved = True
-    elif config.push and ai_used:
+    elif config.push and (ai_used or has_auto_prereqs):
         # Branch pushed but pr_sources.auto_pr disabled — try to label any
         # pre-existing PR for this branch.
         existing = find_pr_for_branch(config, new_branch, base_branch)
@@ -1971,7 +2304,14 @@ def _finish_clean_unit(
             _apply_releasy_label_to_pr(
                 config, existing.url, pr_number=existing.number,
             )
-            _apply_ai_label_to_pr(config, existing.url, pr_number=existing.number)
+            if ai_used:
+                _apply_ai_label_to_pr(
+                    config, existing.url, pr_number=existing.number,
+                )
+            if has_auto_prereqs:
+                _apply_auto_prereq_label_to_pr(
+                    config, existing.url, pr_number=existing.number,
+                )
             state.features[unit.feature_id].rebase_pr_url = existing.url
             state.features[unit.feature_id].status = "needs_review"
             if was_failed_prev:
@@ -2153,6 +2493,403 @@ def _apply_releasy_label_to_pr(
     add_label_to_pr(config, pr_number, RELEASY_LABEL)
 
 
+def _apply_missing_prereqs_label_to_pr(
+    config: Config, pr_url: str, pr_number: int | None = None,
+) -> None:
+    """Best-effort: tag a draft / placeholder PR with the
+    ``missing_prereqs_label``.
+
+    Called whenever a unit's conflict was identified as caused by a
+    missing prerequisite (detection-only mode), an exhausted
+    auto-recovery dive, or a prereq that's already queued elsewhere.
+    """
+    if pr_number is None:
+        pr_number = _pr_number_from_url(pr_url)
+    if pr_number is None:
+        return
+    add_label_to_pr(config, pr_number, config.ai_resolve.missing_prereqs_label)
+
+
+def _apply_auto_prereq_label_to_pr(
+    config: Config, pr_url: str, pr_number: int | None = None,
+) -> None:
+    """Best-effort: tag a successfully merged-up combined PR with the
+    ``auto_prereq_label`` so reviewers know the PR's scope was expanded
+    by auto-recovery (one or more prereq PRs were prepended).
+    """
+    if pr_number is None:
+        pr_number = _pr_number_from_url(pr_url)
+    if pr_number is None:
+        return
+    add_label_to_pr(config, pr_number, config.ai_resolve.auto_prereq_label)
+
+
+def _ensure_upstream_remote(config: Config, repo_path: Path) -> None:
+    """Register the configured upstream remote on the local clone.
+
+    Idempotent: a no-op when ``config.upstream`` is ``None`` or when the
+    alias already points at the configured URL. Called lazily, just before
+    invoking the AI resolver, so users who never enable AI never pay the
+    cost (and never have a stray remote sitting in their clone).
+    """
+    if config.upstream is None:
+        return
+    changed = ensure_remote(
+        repo_path, config.upstream.remote_name, config.upstream.remote,
+    )
+    if changed:
+        console.print(
+            f"    [dim]Registered upstream remote "
+            f"[cyan]{config.upstream.remote_name}[/cyan] "
+            f"→ {config.upstream.remote}[/dim]"
+        )
+
+
+def _find_already_queued_prereqs(
+    config: Config,
+    state: PipelineState,
+    candidate_urls: list[str],
+    *,
+    exclude_feature_id: str | None = None,
+) -> list[dict]:
+    """For each URL in ``candidate_urls``, find where releasy already
+    tracks it (config or state), if anywhere.
+
+    Returns a list of dicts, one per matching candidate, in input order
+    and with no duplicates. Each dict has::
+
+        {
+            "prereq_url": "<the candidate URL>",
+            "queued_in": "<feature_id | 'config:include_prs' | 'config:groups[<id>]'>",
+            "queued_in_pr_url": "<rebase PR URL or None>",
+        }
+
+    Empty list when no candidate is already queued — the caller falls
+    through to the auto-recovery dive (or detection-only labelling).
+
+    ``exclude_feature_id`` skips state entries with that id, used so we
+    don't flag a unit's own prior dynamic prereqs (which we already
+    know about) as "queued elsewhere".
+
+    URL normalisation: candidates are matched against config / state by
+    their parsed ``(owner, repo, number)`` tuple, so query strings,
+    trailing slashes, and ``http`` vs ``https`` differences don't cause
+    false negatives.
+    """
+    def _normalize(url: str) -> tuple[str, str, int] | None:
+        return parse_pr_url(url)
+
+    # Build the lookup table from config and state.
+    # value = (queued_in_label, queued_in_pr_url_or_None)
+    index: dict[tuple[str, str, int], tuple[str, str | None]] = {}
+
+    for url in config.pr_sources.include_prs:
+        ref = _normalize(url)
+        if ref and ref not in index:
+            index[ref] = ("config:include_prs", None)
+
+    for group in config.pr_sources.groups:
+        for url in group.prs:
+            ref = _normalize(url)
+            if ref and ref not in index:
+                index[ref] = (f"config:groups[{group.id}]", None)
+
+    for fid, fs in state.features.items():
+        if fid == exclude_feature_id:
+            continue
+        # All PRs being processed by this feature, original + dynamic.
+        for url in (fs.pr_urls or ([fs.pr_url] if fs.pr_url else [])):
+            if not url:
+                continue
+            ref = _normalize(url)
+            if ref and ref not in index:
+                index[ref] = (fid, fs.rebase_pr_url)
+        for url in fs.dynamic_prereq_urls:
+            ref = _normalize(url)
+            if ref and ref not in index:
+                index[ref] = (fid, fs.rebase_pr_url)
+
+    out: list[dict] = []
+    seen: set[tuple[str, str, int]] = set()
+    for url in candidate_urls:
+        ref = _normalize(url)
+        if ref is None or ref in seen:
+            continue
+        if ref in index:
+            queued_in, queued_pr_url = index[ref]
+            out.append({
+                "prereq_url": url,
+                "queued_in": queued_in,
+                "queued_in_pr_url": queued_pr_url,
+            })
+            seen.add(ref)
+    return out
+
+
+def _is_prereq_already_in_base(
+    repo_path: Path, base_branch: str, pr: PRInfo,
+) -> bool:
+    """Pre-flight: is ``pr`` already merged into the local ``base_branch``?
+
+    Returns True when ``pr.merge_commit_sha`` is set AND is reachable from
+    ``base_branch`` per ``git merge-base --is-ancestor``. Returns False
+    in every other case (no merge SHA, ancestor check failed / errored,
+    not reachable) — falsing-out is the safe default because dive logic
+    will then proceed and any double-application will surface as an
+    empty cherry-pick downstream.
+    """
+    if not pr.merge_commit_sha:
+        return False
+    answer = is_ancestor(repo_path, pr.merge_commit_sha, base_branch)
+    return answer is True
+
+
+def _fetch_prereq_prs(
+    config: Config, urls: list[str],
+) -> tuple[list[PRInfo], list[str]]:
+    """Fetch ``PRInfo`` for each prereq URL.
+
+    Returns ``(fetched, failed)``: ``fetched`` is the list of successful
+    fetches in input order, ``failed`` is the list of URLs that couldn't
+    be resolved (parse error, GitHub fetch failed, etc.). Callers treat
+    a non-empty ``failed`` list as a soft failure of the dive — log it
+    and fall through to the detection-only path so the user can sort
+    out the unfetchable URLs manually.
+    """
+    fetched: list[PRInfo] = []
+    failed: list[str] = []
+    for url in urls:
+        info = fetch_pr_by_url(config, url)
+        if info is None:
+            failed.append(url)
+            continue
+        fetched.append(info)
+    return fetched, failed
+
+
+def _persist_dive_progress(
+    config: Config,
+    state: PipelineState,
+    unit: FeatureUnit,
+    new_branch: str,
+    onto: str,
+    pr_meta: dict,
+    *,
+    fs_dynamic_prereq_urls: list[str],
+    fs_prereq_trail: list[dict],
+    prereq_discovery_depth: int,
+) -> None:
+    """Persist the unit's in-progress dive state.
+
+    Called between dives so a Ctrl-C / crash mid-recovery leaves a
+    paper trail that ``releasy continue`` can read. Status stays at
+    ``branch_created`` (a non-terminal "we're working on it" marker)
+    until the loop exits with success or a final failure outcome.
+    """
+    fs = state.features.get(unit.feature_id) or FeatureState()
+    fs.status = "branch_created"
+    fs.branch_name = new_branch
+    fs.base_commit = onto
+    for k, v in pr_meta.items():
+        setattr(fs, k, v)
+    fs.dynamic_prereq_urls = list(fs_dynamic_prereq_urls)
+    fs.prereq_trail = list(fs_prereq_trail)
+    fs.prereq_discovery_depth = prereq_discovery_depth
+    if unit.ai_cost_usd_total is not None:
+        fs.ai_cost_usd = unit.ai_cost_usd_total
+    state.features[unit.feature_id] = fs
+    _persist_state(config, state)
+
+
+def _print_prereq_dive_failure(
+    fs_prereq_trail: list[dict],
+    prereq_discovery_depth: int,
+    exit_reason: dict,
+    auto_cfg,
+    triggering_pr: PRInfo | None,
+    final_discovered: list[str],
+) -> None:
+    """Pretty-print the auto-recovery dependency trail to the console.
+
+    Shared by every "dive aborted" path (depth exhausted, cycle, prereq
+    already queued elsewhere, fetch failed). Layout matches the project
+    board card body so the user sees the same trail in both places.
+    """
+    reason = exit_reason.get("reason")
+    headline_map = {
+        "depth_exhausted": (
+            f"Auto-prereq dive hit the depth limit "
+            f"(max_prereq_depth={auto_cfg.max_prereq_depth})."
+        ),
+        "cycle": "Auto-prereq dive aborted: cycle detected.",
+        "queued_elsewhere": (
+            "Auto-prereq dive aborted: discovered prereq is already queued "
+            "elsewhere."
+        ),
+        "fetch_failed": "Auto-prereq dive aborted: prereq fetch failed.",
+        "detection_only": (
+            "Detection-only mode "
+            "(set ai_resolve.auto_add_prerequisite_prs.enabled: true to "
+            "auto-port)."
+        ),
+        "all_already_in_base": (
+            "Auto-prereq dive aborted: all discovered prereqs are already "
+            "merged into base_branch."
+        ),
+    }
+    headline = headline_map.get(reason, "Auto-prereq dive aborted.")
+    console.print(f"    [red]✗[/red] {headline}")
+
+    if fs_prereq_trail:
+        console.print("    [bold]Dependency trail:[/bold]")
+        for i, entry in enumerate(fs_prereq_trail, start=1):
+            trig = entry.get("triggering_pr") or "(unknown)"
+            disc = entry.get("discovered", []) or []
+            reason_txt = entry.get("reason") or ""
+            disc_str = ", ".join(disc) or "(none)"
+            line = (
+                f"      {i}. {trig} → needed {disc_str}"
+            )
+            if reason_txt:
+                line += f"  [dim]({reason_txt})[/dim]"
+            console.print(line)
+
+    if reason == "depth_exhausted":
+        next_str = ", ".join(final_discovered) or "(none)"
+        console.print(
+            f"    [bold]Next prereq exceeding the limit:[/bold] {next_str}"
+        )
+        console.print(
+            "    [dim]Consider porting the next prereq manually first, "
+            "or bump ai_resolve.auto_add_prerequisite_prs.max_prereq_depth.[/dim]"
+        )
+    elif reason == "cycle":
+        cyc = exit_reason.get("cycle_urls") or []
+        cyc_str = ", ".join(cyc) or "(none)"
+        console.print(
+            f"    [bold]Cycle on:[/bold] {cyc_str}"
+        )
+    elif reason == "queued_elsewhere":
+        queued = exit_reason.get("queued") or []
+        for q in queued:
+            url = q.get("prereq_url", "?")
+            where = q.get("queued_in", "?")
+            qpr = q.get("queued_in_pr_url")
+            extra = f" → {qpr}" if qpr else ""
+            console.print(
+                f"      • {url} (queued in {where}{extra})"
+            )
+        console.print(
+            "    [dim]Action: wait for the queued unit's PR to merge, "
+            "then re-run releasy.[/dim]"
+        )
+    elif reason == "fetch_failed":
+        for url in exit_reason.get("failed_urls", []):
+            console.print(f"      • could not fetch {url}")
+
+
+def _handle_missing_prereqs_no_dive(
+    config: Config,
+    repo_path: Path,
+    state: PipelineState,
+    unit: FeatureUnit,
+    new_branch: str,
+    base_branch: str,
+    base_ref: str,
+    onto: str,
+    outcome: _CherryPickOutcome,
+    pr_meta: dict,
+    *,
+    fs_dynamic_prereq_urls: list[str],
+    fs_prereq_trail: list[dict],
+    prereq_discovery_depth: int,
+    exit_reason: dict,
+) -> None:
+    """Roll back the unit, persist the prereq trail, label, and report.
+
+    Shared exit path for every "we know what's missing but we are not
+    going to dive" outcome:
+      * detection-only mode (auto-recovery disabled)
+      * prereq queued elsewhere
+      * depth exhausted
+      * cycle detected
+      * dive's prereq fetch failed
+      * every dive candidate is already in base_branch (rare; surfaces
+        when Claude misidentified a prereq we *just* merged)
+
+    Always:
+      * aborts any in-progress git op
+      * resets the port branch state (drops local branch when no
+        successful picks were committed; keeps partial-group commits
+        otherwise — same rule as ``_handle_unresolved_conflict``)
+      * persists the prereq trail + ``missing_prereq_prs`` /
+        ``missing_prereq_note`` on FeatureState
+      * applies the ``missing-prerequisites`` label to any opened PR
+      * emits the dependency trail to stdout
+    """
+    auto_cfg = config.ai_resolve.auto_add_prerequisite_prs
+
+    # First: clean up any in-progress git op so the working tree is
+    # safe to operate on.
+    if is_operation_in_progress(repo_path):
+        run_git(["cherry-pick", "--abort"], repo_path, check=False)
+        run_git(["merge", "--abort"], repo_path, check=False)
+        run_git(["rebase", "--abort"], repo_path, check=False)
+
+    final_discovered = list(outcome.missing_prereq_prs)
+    exhausted = exit_reason.get("reason") in (
+        "depth_exhausted", "cycle", "fetch_failed", "all_already_in_base",
+    )
+
+    _print_prereq_dive_failure(
+        fs_prereq_trail, prereq_discovery_depth, exit_reason,
+        auto_cfg, outcome.failed_pr, final_discovered,
+    )
+    if exit_reason.get("reason") == "queued_elsewhere":
+        # Print the prereq cross-references in the standard "queued"
+        # variant of the trail printer. (Already done above in
+        # ``_print_prereq_dive_failure``; leave a marker so the next
+        # step doesn't rewrite the line.)
+        pass
+
+    # Discard any local branch we built up. Failed at idx 0 means no
+    # commit landed; idx > 0 means partial-group commits exist. Drop
+    # everything either way — when auto-recovery is in play we don't
+    # publish a half-built branch with confusing prereqs.
+    if local_branch_exists(repo_path, new_branch):
+        run_git(["checkout", "--detach", base_ref], repo_path, check=False)
+        run_git(["branch", "-D", new_branch], repo_path, check=False)
+    console.print(
+        f"    [yellow]Dropped local branch[/yellow] [cyan]{new_branch}[/cyan]"
+        " (auto-prereq dive aborted; nothing kept)."
+    )
+
+    fs = FeatureState(
+        status="conflict",
+        branch_name=None,
+        base_commit=onto,
+        conflict_files=outcome.conflict_files,
+        failed_step_index=outcome.failed_idx,
+        partial_pr_count=0,
+        ai_cost_usd=unit.ai_cost_usd_total,
+        missing_prereq_prs=final_discovered,
+        missing_prereq_note=outcome.missing_prereq_note,
+        dynamic_prereq_urls=list(fs_dynamic_prereq_urls),
+        prereq_discovery_depth=prereq_discovery_depth,
+        prereq_trail=list(fs_prereq_trail),
+        prereq_recovery_exhausted=exhausted,
+        queued_prereq_units=list(exit_reason.get("queued") or []),
+        **pr_meta,
+    )
+    state.features[unit.feature_id] = fs
+    _persist_state(config, state)
+    # Sync above already labelled the project card body. There is no
+    # rebase PR to label here (we dropped the branch and didn't push) —
+    # the missing-prereqs label only attaches to PRs in the partial-
+    # group draft path inside ``_handle_unresolved_conflict``, which is
+    # not the auto-recovery roll-back path.
+
+
 def _handle_unresolved_conflict(
     config: Config,
     repo_path: Path,
@@ -2168,6 +2905,9 @@ def _handle_unresolved_conflict(
     pr_meta: dict,
     *,
     ai_attempted: bool,
+    dynamic_prereq_urls: list[str] | None = None,
+    prereq_trail: list[dict] | None = None,
+    prereq_discovery_depth: int = 0,
 ) -> None:
     """Centralised cleanup for an unresolved cherry-pick conflict.
 
@@ -2227,6 +2967,9 @@ def _handle_unresolved_conflict(
             failed_step_index=idx,
             partial_pr_count=0,
             ai_cost_usd=unit.ai_cost_usd_total,
+            dynamic_prereq_urls=list(dynamic_prereq_urls or []),
+            prereq_trail=list(prereq_trail or []),
+            prereq_discovery_depth=prereq_discovery_depth,
             **pr_meta,
         )
         _persist_state(config, state)
@@ -2311,6 +3054,9 @@ def _handle_unresolved_conflict(
         failed_step_index=applied,
         partial_pr_count=applied,
         ai_cost_usd=unit.ai_cost_usd_total,
+        dynamic_prereq_urls=list(dynamic_prereq_urls or []),
+        prereq_trail=list(prereq_trail or []),
+        prereq_discovery_depth=prereq_discovery_depth,
         **pr_meta,
     )
     if rebase_pr_url:
@@ -2327,7 +3073,7 @@ def _try_ai_resolve_step(
     base_branch: str,
     pr: PRInfo,
     conflict_files: list[str],
-) -> bool:
+) -> "_AIStepOutcome":
     """Invoke Claude to resolve ONE conflicted cherry-pick step in place.
 
     Step-mode contract: on success Claude has resolved, built, and committed
@@ -2336,12 +3082,21 @@ def _try_ai_resolve_step(
     opening the (possibly combined) PR. This contract is the same for
     singletons and for any step inside a sequential group.
 
-    Returns True on success. On failure the working tree is reset to a
-    clean state at ``start_sha`` (handled inside ``attempt_ai_resolve``)
-    and the caller is responsible for deciding what to do next — typically
-    routing through :func:`_handle_unresolved_conflict`.
+    Returns an :class:`_AIStepOutcome`. ``handled`` is True iff the step
+    succeeded and the caller should continue with the next pick. When
+    Claude reported ``MISSING_PREREQS`` the outcome carries the discovered
+    URLs / reason, even though ``handled`` is False — callers branch on
+    this to enter the auto-recovery dive (or detection-only labelling)
+    instead of routing to :func:`_handle_unresolved_conflict`.
+
+    On non-success the working tree is reset to a clean state at
+    ``start_sha`` (handled inside ``attempt_ai_resolve``).
     """
     from releasy.ai_resolve import AIResolveContext, attempt_ai_resolve
+
+    # Lazy: register the upstream remote so Claude's prereq-detection
+    # `git fetch` / `git log` queries can resolve it.
+    _ensure_upstream_remote(config, repo_path)
 
     ctx = AIResolveContext(
         port_branch=new_branch,
@@ -2371,7 +3126,11 @@ def _try_ai_resolve_step(
         console.print(
             f"    [yellow]AI resolve failed:[/yellow] {reason}{cost_note}"
         )
-        return False
+        return _AIStepOutcome(
+            handled=False,
+            missing_prereq_prs=list(result.missing_prereq_prs or []),
+            missing_prereq_note=result.missing_prereq_note,
+        )
 
     unit.ai_resolved_count += 1
     if result.iterations:
@@ -2386,7 +3145,21 @@ def _try_ai_resolve_step(
     console.print(
         f"    [green]✓[/green] AI resolved #{pr.number}{iters}{cost}"
     )
-    return True
+    return _AIStepOutcome(handled=True)
+
+
+@dataclass
+class _AIStepOutcome:
+    """Result of one ``_try_ai_resolve_step`` call.
+
+    ``handled`` is True iff the AI committed the cherry-pick locally.
+    When False, ``missing_prereq_prs`` may be non-empty (Claude reported
+    a missing-prereq situation) — callers route on that distinction
+    instead of falling straight through to ``_handle_unresolved_conflict``.
+    """
+    handled: bool
+    missing_prereq_prs: list[str] = field(default_factory=list)
+    missing_prereq_note: str | None = None
 
 
 # ---------------------------------------------------------------------------

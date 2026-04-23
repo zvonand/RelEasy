@@ -36,7 +36,7 @@ What the command does NOT try to recover:
 
 from __future__ import annotations
 
-from rich.console import Console
+from releasy.termlog import console
 
 from releasy.config import Config, get_github_token
 from releasy.github_ops import (
@@ -48,8 +48,6 @@ from releasy.github_ops import (
     pr_ref_label,
 )
 from releasy.state import FeatureState, PipelineState, load_state, save_state
-
-console = Console()
 
 
 # Status on the GitHub Project board that forces a local ``skipped``

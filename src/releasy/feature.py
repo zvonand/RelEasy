@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from rich.console import Console
+from releasy.termlog import console
 from rich.table import Table
 
 from releasy.config import Config, FeatureConfig, save_config
-
-console = Console()
 
 
 def add_feature(

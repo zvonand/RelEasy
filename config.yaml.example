@@ -64,6 +64,13 @@ name: antalya-26.3
 # Can also be overridden with --work-dir on the CLI.
 # work_dir: /path/to/ClickHouse
 
+# ── Session log (optional) ───────────────────────────────────────
+# Append a full transcript of the process (stdout and stderr: Rich
+# output, ``click`` messages, ``logging`` warnings, tracebacks) to a file
+# for post-run analysis. Relative paths resolve against the directory
+# that contains this config file.
+# log_file: .releasy/releasy.log
+
 # ── Origin (required) ──────────────────────────────────────────────
 # The repo you work against. This is the only repo RelEasy tracks
 # as a configured remote.
@@ -162,7 +169,15 @@ features:
 #
 # Note: if the branch already exists on the remote it is ALWAYS skipped,
 # regardless of this setting. Resolve those manually so you don't
-# clobber someone else's work.
+# clobber someone else's work. Exception: when recreate_closed_prs is
+# true and the stored rebase PR was closed without merging, RelEasy picks
+# a new name ``feature/<base>/<id>-1``, ``-2``, … (first unused) and runs
+# the port again.
+#
+# recreate_closed_prs — when false (default), a remote port branch still
+#   causes the unit to be skipped. When true, if state has rebase_pr_url
+#   and that GitHub PR is closed (not merged), allocate ``<canonical>-N``
+#   and cherry-pick + open a fresh PR to the target branch.
 #
 # retry_failed — when a PR unit has a `conflict` entry in state from a
 #   previous run:
@@ -181,6 +196,7 @@ features:
 # pr_sources:
 #   if_exists: skip
 #   # retry_failed: true   # default; set false to leave conflicted entries alone
+#   # recreate_closed_prs: false   # default; true → new -1/-2 branch after closed rebase PR
 #   # auto_pr: true        # default; set false to push branches without opening PRs
 #   by_labels:
 #     - labels: ["forward-port", "v26.1"]

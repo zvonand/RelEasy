@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from rich.console import Console
+from releasy.termlog import console
 
 from releasy.config import Config, make_stateless_config
 from releasy.git_ops import (
@@ -45,8 +45,6 @@ from releasy.github_ops import (
     parse_source_url,
     slug_to_https_url,
 )
-
-console = Console()
 
 
 SourceKind = Literal["pr", "commit", "tag"]

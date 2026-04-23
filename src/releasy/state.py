@@ -112,6 +112,45 @@ class FeatureState:
     # failed conflict resolution, and how many earlier picks were committed.
     failed_step_index: int | None = None
     partial_pr_count: int | None = None
+    # ----- Missing-prerequisite detection / auto-recovery state -----
+    # Populated by the AI resolver when Claude judges the conflict to be
+    # caused by an unported upstream PR. Even in detection-only mode (no
+    # auto-recovery), these fields persist on the feature so the project
+    # board card and re-runs can surface the trail.
+    #
+    # ``missing_prereq_prs`` — most recent set of PR URLs Claude reported
+    # as the missing foundation (cleared once the unit lands cleanly).
+    # ``missing_prereq_note`` — Claude's one-line REASON.
+    missing_prereq_prs: list[str] = field(default_factory=list)
+    missing_prereq_note: str | None = None
+    # Auto-recovery bookkeeping (irrelevant when
+    # ``ai_resolve.auto_add_prerequisite_prs.enabled`` is false):
+    # ``dynamic_prereq_urls`` — PRs that were prepended to the unit by
+    # the auto-recovery loop, in cherry-pick order. Empty when no dives
+    # happened. Survives ``releasy continue`` so a re-run resumes with
+    # the expanded unit shape rather than the original config-listed
+    # PRs only.
+    dynamic_prereq_urls: list[str] = field(default_factory=list)
+    # ``prereq_discovery_depth`` — number of times the detection fired
+    # recursively on this unit. PR_A → PR_B → PR_C is depth 2.
+    prereq_discovery_depth: int = 0
+    # ``prereq_trail`` — audit log of every dive, used to render the
+    # dependency trail in stdout / project board / PR body. Each entry is
+    # ``{at_depth: int, triggering_pr: url, discovered: [urls],
+    # reason: str}``; the most recent dive is last.
+    prereq_trail: list[dict] = field(default_factory=list)
+    # ``prereq_recovery_exhausted`` — True iff a dive was aborted because
+    # ``max_prereq_depth`` was exceeded or a cycle was detected. Selects
+    # the "exhausted" body / label / message variant in reporting code.
+    prereq_recovery_exhausted: bool = False
+    # ``queued_prereq_units`` — cross-references to other units (or
+    # config entries) where the discovered prereq is already going to be
+    # ported. Each entry is ``{prereq_url: str, queued_in: str,
+    # queued_in_pr_url: str | None}`` where ``queued_in`` is a human-
+    # readable identifier (feature_id, "config:include_prs",
+    # "config:groups[<id>]"). Drives the "merge unit X first" message;
+    # cleared once the unit lands cleanly.
+    queued_prereq_units: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -157,6 +196,15 @@ def _parse_features(raw_features: dict) -> dict[str, FeatureState]:
             ai_cost_usd=fraw.get("ai_cost_usd"),
             failed_step_index=fraw.get("failed_step_index"),
             partial_pr_count=fraw.get("partial_pr_count"),
+            missing_prereq_prs=fraw.get("missing_prereq_prs", []) or [],
+            missing_prereq_note=fraw.get("missing_prereq_note"),
+            dynamic_prereq_urls=fraw.get("dynamic_prereq_urls", []) or [],
+            prereq_discovery_depth=int(fraw.get("prereq_discovery_depth", 0) or 0),
+            prereq_trail=list(fraw.get("prereq_trail", []) or []),
+            prereq_recovery_exhausted=bool(
+                fraw.get("prereq_recovery_exhausted", False)
+            ),
+            queued_prereq_units=list(fraw.get("queued_prereq_units", []) or []),
         )
     return features
 
@@ -253,6 +301,20 @@ def save_state(state: PipelineState, config: Config) -> None:
             entry["failed_step_index"] = fs.failed_step_index
         if fs.partial_pr_count is not None:
             entry["partial_pr_count"] = fs.partial_pr_count
+        if fs.missing_prereq_prs:
+            entry["missing_prereq_prs"] = fs.missing_prereq_prs
+        if fs.missing_prereq_note:
+            entry["missing_prereq_note"] = fs.missing_prereq_note
+        if fs.dynamic_prereq_urls:
+            entry["dynamic_prereq_urls"] = fs.dynamic_prereq_urls
+        if fs.prereq_discovery_depth:
+            entry["prereq_discovery_depth"] = fs.prereq_discovery_depth
+        if fs.prereq_trail:
+            entry["prereq_trail"] = fs.prereq_trail
+        if fs.prereq_recovery_exhausted:
+            entry["prereq_recovery_exhausted"] = True
+        if fs.queued_prereq_units:
+            entry["queued_prereq_units"] = fs.queued_prereq_units
         features_data[fid] = entry
 
     data: dict = {

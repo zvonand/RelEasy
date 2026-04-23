@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from rich.console import Console
+from releasy.termlog import console
 
 from releasy.ai_resolve import AIResolveContext, attempt_ai_resolve
 from releasy.config import Config
@@ -52,8 +52,6 @@ from releasy.github_ops import (
     sync_project,
 )
 from releasy.state import FeatureState, PipelineState, load_state, save_state
-
-console = Console()
 
 
 # ---------------------------------------------------------------------------

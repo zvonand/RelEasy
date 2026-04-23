@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from rich.console import Console
+from releasy.termlog import console
 
 from releasy.config import Config, FeatureConfig
 from releasy.git_ops import (
@@ -27,8 +27,6 @@ from releasy.git_ops import (
 )
 from releasy.github_ops import create_pull_request
 from releasy.state import load_state
-
-console = Console()
 
 
 def _feature_pr_branch(release_name: str, feature_id: str) -> str:

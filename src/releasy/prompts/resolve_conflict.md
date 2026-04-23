@@ -64,6 +64,113 @@ Anything that can't meet either bar does not belong in your resolution.
 
 ---
 
+## Recognising a missing-prerequisite conflict
+
+Sometimes what looks like a conflict is actually the source PR depending
+on earlier work that has not yet been ported to `{base_branch}`. The
+pattern feels different from a normal divergence: rather than two
+branches independently editing the same lines, you find that "theirs"
+is *built on top of* something that simply does not exist on our side
+at all — a foundation that was never laid.
+
+Signals that may warrant investigation (not a checklist — use judgment):
+- "theirs" calls a function, uses a type, or includes a header that you
+  cannot locate anywhere in `{base_branch}` or the current working tree.
+- The merge-base version of the file had none of the surrounding context
+  that "theirs" is extending.
+- Trying to apply bucket-1 doesn't make sense because the required
+  scaffolding is missing, not just different.
+- The conflict marker shows "ours" with a completely different structure
+  in the same region, not a line-level divergence.
+
+When you suspect this, investigate before touching the conflict. Search
+for the missing identifier in the source-repo history:
+
+```bash
+git log -S '<identifier>' --oneline {origin_remote_name}/{origin_branch} -- <file>
+```
+
+{upstream_fetch_section}
+
+GitHub merge commits embed the PR number in their message
+(`Merge pull request #NNN` or `(#NNN)`). Extract the number and form
+the PR URL from the repo slug.
+
+**Before declaring it missing — confirm the foundation is actually
+absent, not just renamed.** A symbol that does not appear under its
+old name on `{base_branch}` may still exist there under a different
+name, with a different signature, or split across different files.
+This happens when the same upstream change reached `{base_branch}`
+and the source PR's branch through different paths (for example, a
+parallel backport with rewording, or an upstream refactor that landed
+on `{base_branch}` but not on the branch where the source PR was
+authored).
+
+Cross-check the candidate prereq PR before reporting it:
+
+```bash
+gh pr diff <candidate_prereq_url>
+```
+
+Read what that PR introduces (function names, types, headers, file
+locations). For each notable addition, search `{base_branch}` for the
+*concept*, not just the literal name:
+
+```bash
+git grep -n '<concept_keyword>' -- <expected_file_or_dir>
+git log --oneline {base_branch} -- <expected_file>
+```
+
+If you find that `{base_branch}` already has equivalent functionality
+under a different shape (renamed function, restructured type, moved
+location), the prereq is **not missing** — the source PR just needs a
+bucket-2 mechanical adaptation to use the names/shapes `{base_branch}`
+exposes. Proceed to standard resolution; do not report MISSING_PREREQS.
+
+Only when the foundation is *genuinely absent* on `{base_branch}` — no
+equivalent code, no renamed version, no parallel landing — report:
+
+```
+MISSING_PREREQS: <url1> <url2>
+REASON: <one line explaining the dependency, AND why the equivalent is not already on {base_branch}>
+```
+
+Then output `UNRESOLVED` and exit without staging anything.
+
+If investigation turns up nothing clear, or if the conflict turns out
+to be a normal divergence after all, just proceed with the standard
+resolution steps. The investigation is never mandatory — it is a tool
+to reach for when the conflict shape suggests a deeper dependency
+problem.
+
+### Worked example of a false-positive prereq
+
+The source PR (authored on a 25.8-style branch) calls
+`foo_v2(ctx, out)`. Cherry-picking onto `{base_branch}` (a 26.3-style
+branch) produces a conflict because `foo_v2` is not defined.
+
+```bash
+git log -S 'foo_v2' --oneline {origin_remote_name}/{origin_branch} -- <file>
+```
+
+finds a backport PR #1234 that introduced `foo_v2` in 25.8.
+
+Before reporting #1234 as missing, run `gh pr diff #1234` and check
+`{base_branch}`:
+
+```bash
+git grep -n 'foo' -- src/Foo/
+git log --oneline {base_branch} -- src/Foo/Foo.cpp
+```
+
+If `{base_branch}` has `foo(ctx, out)` (the upstream original of which
+`foo_v2` was a 25.8-flavoured rewording), the right action is **not**
+to port #1234 — it would conflict with `foo` that's already there.
+The right action is a bucket-2 adaptation: rename `foo_v2(...)` to
+`foo(...)` in the conflict resolution and proceed normally.
+
+---
+
 ## Task — execute these steps in order, without asking for confirmation
 
 ### Step 1 — Establish ground truth (the source PR's actual diff)
@@ -188,6 +295,14 @@ For every `<<<<<<< ... ======= ... >>>>>>>` block:
   `git log <other-branch>`, or read other branches/tags to figure out
   "what should be there". The only refs that matter are
   `{source_pr_merge_sha}`, `{port_branch}`, and `{base_branch}`.
+  *Exception — prerequisite detection only*: `git log -S <identifier>`
+  on `{origin_remote_name}/{origin_branch}` (and on the upstream remote
+  if configured) is allowed **solely to identify which PR introduced a
+  missing foundation**, when you judge the conflict may be a
+  missing-prerequisite situation (see "Recognising a
+  missing-prerequisite conflict" above). This never licenses reading or
+  copying code from those refs — only extracting a commit reference to
+  report back via `MISSING_PREREQS:`.
 - **No `git add -A`.** Stage only the conflicted files (and any file you
   had to touch to make them compile after resolving the conflict).
 - **No fixing unrelated lints / refactors / typos** noticed along the

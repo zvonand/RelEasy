@@ -688,8 +688,9 @@ def list_cmd() -> None:
 
     Outputs one row per project: ``name | phase | features | last_run | config``.
     """
-    from rich.console import Console
     from rich.table import Table
+
+    from releasy.termlog import console
 
     from releasy.state import _read_raw_state  # internal helper, see state.py
 
@@ -739,7 +740,7 @@ def list_cmd() -> None:
             run_blob.get("started_at") or "—",
             raw.get("config_path") or "—",
         )
-    Console().print(table)
+    console.print(table)
 
 
 # Register `releasy ls` as an alias for `releasy list`. We add it as a

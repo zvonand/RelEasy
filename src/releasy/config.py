@@ -81,6 +81,26 @@ class OriginConfig:
 
 
 @dataclass
+class UpstreamConfig:
+    """Optional upstream remote used **solely** for git fetch during AI conflict
+    resolution.
+
+    When configured, the AI resolver may fetch this remote and ``git log -S
+    <symbol>`` against it to identify which upstream PR introduced a missing
+    foundation (see ``ai_resolve.prompt_file``'s "Recognising a
+    missing-prerequisite conflict" section). RelEasy never pushes to this
+    remote and never reads code from it for conflict resolution — only commit
+    references for prereq detection.
+
+    The upstream remote is auto-added to the local clone on demand (idempotent)
+    so users only have to declare it once in config.
+    """
+    remote: str
+    remote_name: str = "upstream"
+    branch: str = "master"
+
+
+@dataclass
 class FeatureConfig:
     id: str
     description: str
@@ -167,6 +187,12 @@ class PRSourcesConfig:
     # false, conflicted entries are left exactly as they are (no new
     # cherry-pick, no PR side-effects), and `releasy run` walks past them.
     retry_failed: bool = True
+    # When the auto-opened rebase PR (see state ``rebase_pr_url``) was later
+    # closed without merging: allocate a new port branch name by appending
+    # ``-1``, ``-2``, … to the canonical ``feature/<base>/<id>`` name and
+    # run the cherry-pick + open-PR flow again. Off by default — without it,
+    # an existing remote port branch still causes the unit to be skipped.
+    recreate_closed_prs: bool = False
 
 
 def _default_assignee_dev_options() -> list[str]:
@@ -295,6 +321,29 @@ class AIChangelogConfig:
 
 
 @dataclass
+class AutoAddPrerequisitePRsConfig:
+    """Auto-recovery for missing-prerequisite cherry-pick conflicts.
+
+    When ``enabled`` is true and Claude reports ``MISSING_PREREQS:`` in the
+    cherry-pick prompt, RelEasy prepends the discovered prereq PR(s) to the
+    current unit's cherry-pick sequence and restarts it. The unit effectively
+    becomes a group with the prereq first and the original PR last; one
+    combined PR is opened on success.
+
+    ``max_prereq_depth`` caps recursion (counted in dives, not total PRs):
+    PR_A → PR_B → PR_C is depth 2. Hitting the cap aborts the unit, rolls
+    back all dynamic prereqs, and surfaces a verbose dependency trail in
+    stdout, the GitHub Project board card, and (when one exists) the
+    placeholder PR body.
+
+    Off by default: detection-only mode still applies (the prereq is just
+    labelled and reported, no recursive porting).
+    """
+    enabled: bool = False
+    max_prereq_depth: int = 7
+
+
+@dataclass
 class AIResolveConfig:
     """Claude-driven conflict resolver configuration."""
     enabled: bool = False
@@ -318,12 +367,30 @@ class AIResolveConfig:
     # resolver gave up (a partial-group draft PR; singletons get no PR).
     needs_attention_label: str = "ai-needs-attention"
     needs_attention_label_color: str = "D93F0B"
+    # Label applied to the PR / draft PR for a unit whose conflict was
+    # caused by a missing prerequisite PR (detection-only mode), or whose
+    # auto-recovery exhausted ``max_prereq_depth``, or whose discovered
+    # prereq is already queued elsewhere. Distinct from
+    # ``needs_attention_label`` so dashboards can tell "AI gave up, no
+    # idea why" apart from "AI knew exactly what's missing".
+    missing_prereqs_label: str = "missing-prerequisites"
+    missing_prereqs_label_color: str = "E4E669"
+    # Label applied to a successfully-merged combined PR that picked up
+    # one or more dynamically-added prerequisite PRs via auto-recovery.
+    # Lets reviewers know the PR's scope was recursively expanded.
+    auto_prereq_label: str = "auto-prereq-added"
+    auto_prereq_label_color: str = "0E8A16"
     extra_args: list[str] = field(default_factory=list)
     # How many times to re-invoke claude when the Anthropic streaming
     # API drops the turn with a transient error ("Stream idle timeout",
     # "Overloaded", "Connection reset", …). Each retry is a fresh turn.
     api_retries: int = 3
     api_retry_backoff_seconds: int = 15
+    # Auto-recovery on detected missing prerequisites (off by default).
+    # See ``AutoAddPrerequisitePRsConfig``.
+    auto_add_prerequisite_prs: AutoAddPrerequisitePRsConfig = field(
+        default_factory=AutoAddPrerequisitePRsConfig,
+    )
 
 
 @dataclass
@@ -331,6 +398,11 @@ class Config:
     name: str  # unique slug identifying this project (state file key)
     origin: OriginConfig
     project: str  # short project identifier, e.g. "antalya"
+    # Optional second remote, used SOLELY for fetch during AI conflict
+    # resolution (prereq detection via ``git log -S``). When ``None`` the
+    # AI resolver only inspects the origin remote's history. RelEasy never
+    # pushes to upstream and never reads code from it.
+    upstream: UpstreamConfig | None = None
     target_branch: str | None = None  # explicit base/target branch override
     # When a PR for the port branch already exists on GitHub:
     #   false (default) — leave it exactly as-is; don't try to create a new
@@ -349,6 +421,10 @@ class Config:
     ai_changelog: AIChangelogConfig = field(default_factory=AIChangelogConfig)
     config_path: Path = field(default_factory=lambda: Path.cwd() / "config.yaml")
     work_dir: Path | None = None
+    # When set, a copy of all stdout+stderr (Rich, Click, logging, tracebacks)
+    # is appended to this file. Relative paths resolve against the directory
+    # that contains config.yaml. See :func:`releasy.termlog.configure`.
+    log_file: Path | None = None
     push: bool = False
     # Sequential mode: process the merged-time-sorted PR queue one PR per
     # invocation. Each `releasy run` / `releasy continue` either confirms
@@ -464,6 +540,33 @@ def load_config(config_path: Path | None = None) -> Config:
         remote_name=raw["origin"].get("remote_name", "origin"),
     )
 
+    upstream: UpstreamConfig | None = None
+    upstream_raw = raw.get("upstream")
+    if upstream_raw is not None:
+        if not isinstance(upstream_raw, dict):
+            raise ValueError(
+                "'upstream' must be a mapping with a 'remote' key "
+                f"(got {type(upstream_raw).__name__})"
+            )
+        upstream_remote = upstream_raw.get("remote")
+        if not upstream_remote or not isinstance(upstream_remote, str):
+            raise ValueError(
+                "upstream.remote is required and must be a string git URL"
+            )
+        upstream_remote_name = upstream_raw.get("remote_name", "upstream")
+        upstream_branch = upstream_raw.get("branch", "master")
+        if upstream_remote_name == origin.remote_name:
+            raise ValueError(
+                f"upstream.remote_name {upstream_remote_name!r} collides with "
+                f"origin.remote_name — pick a distinct alias for the upstream "
+                "remote so they don't shadow each other in the local clone"
+            )
+        upstream = UpstreamConfig(
+            remote=upstream_remote,
+            remote_name=upstream_remote_name,
+            branch=upstream_branch,
+        )
+
     project = raw.get("project")
     if not project:
         raise ValueError(
@@ -492,6 +595,7 @@ def load_config(config_path: Path | None = None) -> Config:
         )
     global_auto_pr = bool(ps_raw.get("auto_pr", True))
     global_retry_failed = bool(ps_raw.get("retry_failed", True))
+    global_recreate_closed_prs = bool(ps_raw.get("recreate_closed_prs", False))
     by_labels = []
     for entry in ps_raw.get("by_labels", []):
         raw_labels = entry.get("labels", [])
@@ -584,6 +688,7 @@ def load_config(config_path: Path | None = None) -> Config:
         if_exists=global_if_exists,
         auto_pr=global_auto_pr,
         retry_failed=global_retry_failed,
+        recreate_closed_prs=global_recreate_closed_prs,
     )
 
     notif_raw = raw.get("notifications", {}) or {}
@@ -668,6 +773,35 @@ def load_config(config_path: Path | None = None) -> Config:
     )
 
     ai_raw = raw.get("ai_resolve", {}) or {}
+
+    # `auto_add_prerequisite_prs` accepts either:
+    #   - a bool (sugar: `false` → {enabled: false}, `true` → {enabled: true})
+    #   - a mapping {enabled: bool, max_prereq_depth: int}
+    # The bool form is the convenience syntax for users who don't need to
+    # touch max_prereq_depth; the mapping is the canonical write-back shape.
+    auto_prereq_raw = ai_raw.get("auto_add_prerequisite_prs")
+    if auto_prereq_raw is None:
+        auto_add_prerequisite_prs = AutoAddPrerequisitePRsConfig()
+    elif isinstance(auto_prereq_raw, bool):
+        auto_add_prerequisite_prs = AutoAddPrerequisitePRsConfig(
+            enabled=auto_prereq_raw,
+        )
+    elif isinstance(auto_prereq_raw, dict):
+        auto_add_prerequisite_prs = AutoAddPrerequisitePRsConfig(
+            enabled=bool(auto_prereq_raw.get("enabled", False)),
+            max_prereq_depth=int(auto_prereq_raw.get("max_prereq_depth", 7)),
+        )
+    else:
+        raise ValueError(
+            "ai_resolve.auto_add_prerequisite_prs must be a bool or mapping, "
+            f"got {type(auto_prereq_raw).__name__}"
+        )
+    if auto_add_prerequisite_prs.max_prereq_depth < 0:
+        raise ValueError(
+            "ai_resolve.auto_add_prerequisite_prs.max_prereq_depth must be "
+            f">= 0, got {auto_add_prerequisite_prs.max_prereq_depth}"
+        )
+
     ai_resolve = AIResolveConfig(
         enabled=ai_raw.get("enabled", False),
         command=ai_raw.get("command", "claude"),
@@ -687,13 +821,41 @@ def load_config(config_path: Path | None = None) -> Config:
         needs_attention_label_color=ai_raw.get(
             "needs_attention_label_color", "D93F0B",
         ),
+        missing_prereqs_label=ai_raw.get(
+            "missing_prereqs_label", "missing-prerequisites",
+        ),
+        missing_prereqs_label_color=ai_raw.get(
+            "missing_prereqs_label_color", "E4E669",
+        ),
+        auto_prereq_label=ai_raw.get(
+            "auto_prereq_label", "auto-prereq-added",
+        ),
+        auto_prereq_label_color=ai_raw.get(
+            "auto_prereq_label_color", "0E8A16",
+        ),
         extra_args=ai_raw.get("extra_args", []) or [],
         api_retries=int(ai_raw.get("api_retries", 3)),
         api_retry_backoff_seconds=int(ai_raw.get("api_retry_backoff_seconds", 15)),
+        auto_add_prerequisite_prs=auto_add_prerequisite_prs,
     )
 
     raw_work_dir = raw.get("work_dir")
     work_dir = Path(raw_work_dir).resolve() if raw_work_dir else None
+
+    raw_log = raw.get("log_file")
+    log_file: Path | None = None
+    if raw_log is not None:
+        if not isinstance(raw_log, str) or not raw_log.strip():
+            raise ValueError(
+                "log_file: must be a non-empty string path when set "
+                f"(got {type(raw_log).__name__!r})"
+            )
+        lp = Path(raw_log).expanduser()
+        if not lp.is_absolute():
+            lp = (config_path.parent / lp).resolve()
+        else:
+            lp = lp.resolve()
+        log_file = lp
 
     sequential = bool(raw.get("sequential", False))
     if sequential and groups:
@@ -702,9 +864,12 @@ def load_config(config_path: Path | None = None) -> Config:
             "remove the groups or set sequential: false"
         )
 
-    return Config(
+    from releasy.termlog import configure as _configure_term_log
+
+    cfg = Config(
         name=name,
         origin=origin,
+        upstream=upstream,
         project=project,
         target_branch=raw.get("target_branch") or None,
         update_existing_prs=bool(raw.get("update_existing_prs", False)),
@@ -715,9 +880,12 @@ def load_config(config_path: Path | None = None) -> Config:
         ai_changelog=ai_changelog,
         config_path=config_path,
         work_dir=work_dir,
+        log_file=log_file,
         push=raw.get("push", False),
         sequential=sequential,
     )
+    _configure_term_log(log_file)
+    return cfg
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:
@@ -733,6 +901,13 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         },
         "project": config.project,
     }
+
+    if config.upstream is not None:
+        data["upstream"] = {
+            "remote": config.upstream.remote,
+            "remote_name": config.upstream.remote_name,
+            "branch": config.upstream.branch,
+        }
 
     if config.target_branch:
         data["target_branch"] = config.target_branch
@@ -758,11 +933,21 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     if config.work_dir:
         data["work_dir"] = str(config.work_dir)
 
+    if config.log_file is not None:
+        try:
+            rel = config.log_file.relative_to(config.config_path.parent)
+            data["log_file"] = str(rel)
+        except ValueError:
+            data["log_file"] = str(config.log_file)
+
     ps = config.pr_sources
     if (
         ps.by_labels or ps.exclude_labels or ps.include_prs
         or ps.exclude_prs or ps.include_authors or ps.exclude_authors
-        or ps.groups or ps.auto_pr is not True or ps.retry_failed is not True
+        or ps.groups
+        or ps.auto_pr is not True
+        or ps.retry_failed is not True
+        or ps.recreate_closed_prs
     ):
         ps_data: dict = {}
         if ps.by_labels:
@@ -809,6 +994,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
             ps_data["auto_pr"] = ps.auto_pr
         if ps.retry_failed is not True:
             ps_data["retry_failed"] = ps.retry_failed
+        if ps.recreate_closed_prs:
+            ps_data["recreate_closed_prs"] = True
         data["pr_sources"] = ps_data
 
     notif_data: dict = {}
@@ -852,12 +1039,33 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         ai_data["needs_attention_label"] = ai.needs_attention_label
     if ai.needs_attention_label_color != ai_defaults.needs_attention_label_color:
         ai_data["needs_attention_label_color"] = ai.needs_attention_label_color
+    if ai.missing_prereqs_label != ai_defaults.missing_prereqs_label:
+        ai_data["missing_prereqs_label"] = ai.missing_prereqs_label
+    if ai.missing_prereqs_label_color != ai_defaults.missing_prereqs_label_color:
+        ai_data["missing_prereqs_label_color"] = ai.missing_prereqs_label_color
+    if ai.auto_prereq_label != ai_defaults.auto_prereq_label:
+        ai_data["auto_prereq_label"] = ai.auto_prereq_label
+    if ai.auto_prereq_label_color != ai_defaults.auto_prereq_label_color:
+        ai_data["auto_prereq_label_color"] = ai.auto_prereq_label_color
     if ai.extra_args:
         ai_data["extra_args"] = ai.extra_args
     if ai.api_retries != ai_defaults.api_retries:
         ai_data["api_retries"] = ai.api_retries
     if ai.api_retry_backoff_seconds != ai_defaults.api_retry_backoff_seconds:
         ai_data["api_retry_backoff_seconds"] = ai.api_retry_backoff_seconds
+    auto_prereq_defaults = AutoAddPrerequisitePRsConfig()
+    if (
+        ai.auto_add_prerequisite_prs.enabled != auto_prereq_defaults.enabled
+        or ai.auto_add_prerequisite_prs.max_prereq_depth
+        != auto_prereq_defaults.max_prereq_depth
+    ):
+        # Always emit the canonical mapping form on write-back so the on-disk
+        # config doesn't quietly switch shapes between runs even when the
+        # user wrote it as a bare bool.
+        ai_data["auto_add_prerequisite_prs"] = {
+            "enabled": ai.auto_add_prerequisite_prs.enabled,
+            "max_prereq_depth": ai.auto_add_prerequisite_prs.max_prereq_depth,
+        }
     if ai_data:
         data["ai_resolve"] = ai_data
 

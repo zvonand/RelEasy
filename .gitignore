@@ -3,6 +3,7 @@
 # ${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml,
 # outside the repo entirely.
 config.yaml
+.releasy/
 
 # Python
 __pycache__/

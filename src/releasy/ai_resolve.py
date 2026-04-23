@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from rich.console import Console
+from releasy.termlog import console
 
 from releasy.config import Config
 from releasy.git_ops import (
@@ -28,8 +28,6 @@ from releasy.git_ops import (
     run_git,
 )
 from releasy.github_ops import PRInfo
-
-console = Console()
 
 
 # What kind of conflicted git operation Claude is being asked to drive to
@@ -77,6 +75,15 @@ class AIResolveResult:
     # transient-API-error retries). ``None`` when Claude reported no cost
     # at all (e.g. failed before producing a result event).
     cost_usd: float | None = None
+    # When Claude reported ``MISSING_PREREQS: <url1> <url2>`` in its
+    # output (followed by ``UNRESOLVED``), these are the discovered PR
+    # URLs and the one-line REASON. Empty list / None when the run was
+    # not classified as a missing-prereq situation. Always paired with
+    # ``success=False`` and a non-None ``error`` ("claude reported
+    # MISSING_PREREQS"); the pipeline reads ``missing_prereq_prs`` to
+    # branch into detection-only labelling or auto-recovery.
+    missing_prereq_prs: list[str] = field(default_factory=list)
+    missing_prereq_note: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +194,37 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
         ctx.source_pr.merge_commit_sha or ctx.source_pr.head_sha or ""
     )
 
+    # Origin remote / default branch — referenced by the prereq-detection
+    # section of the cherry-pick prompt so commands stay literal-copy
+    # ready (not "git log -S … origin/master" hard-coded when the user
+    # configured a different remote_name).
+    origin_remote_name = config.origin.remote_name
+    # The "default" branch on origin to search prereq history against.
+    # We don't have a config knob for this today (target_branch is the
+    # *port target*, which is exactly the branch where the prereq is
+    # missing — not the right thing to search). Default to ``master``,
+    # the convention for the upstream-mirror repos RelEasy targets.
+    origin_branch_default = "master"
+
+    if config.upstream is not None:
+        upstream_remote_name = config.upstream.remote_name
+        upstream_branch = config.upstream.branch
+        upstream_fetch_section = (
+            "Also search the upstream remote (fetch it first):\n\n"
+            "```bash\n"
+            f"git fetch {upstream_remote_name} {upstream_branch} --depth=500\n"
+            f"git log -S '<identifier>' --oneline {upstream_remote_name}/"
+            f"{upstream_branch} -- <file>\n"
+            "```\n"
+        )
+    else:
+        upstream_remote_name = ""
+        upstream_branch = ""
+        upstream_fetch_section = (
+            "_(no upstream remote is configured; only the origin history "
+            "above is searched)_\n"
+        )
+
     placeholders = {
         "repo_slug": repo_slug,
         "cwd": str(repo_path),
@@ -207,6 +245,13 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
         # prompts that don't reference it (no-op there). For merge prompts
         # this lets Claude link the rebase PR in narration if helpful.
         "rebase_pr_url": ctx.rebase_pr_url or "",
+        # Prereq-detection placeholders (cherry-pick prompt only — the
+        # merge prompt doesn't reference them, so empty values are safe).
+        "origin_remote_name": origin_remote_name,
+        "origin_branch": origin_branch_default,
+        "upstream_remote_name": upstream_remote_name,
+        "upstream_branch": upstream_branch,
+        "upstream_fetch_section": upstream_fetch_section,
     }
 
     def _replace(match: re.Match[str]) -> str:
@@ -564,6 +609,52 @@ def _extract_cost_usd(output: str) -> float | None:
     return total
 
 
+_MISSING_PREREQS_RE = re.compile(
+    r"^MISSING_PREREQS:\s*(.+?)\s*$",
+    re.MULTILINE,
+)
+_REASON_RE = re.compile(r"^REASON:\s*(.+?)\s*$", re.MULTILINE)
+# A token that *looks like* a GitHub PR URL — broad on purpose so we
+# accept variants like ``https://github.com/owner/repo/pull/123#whatever``
+# without dropping them. Validation happens downstream via
+# ``parse_pr_url``; the parser's job is just to peel them off the
+# MISSING_PREREQS line.
+_PR_URL_TOKEN_RE = re.compile(
+    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+[\w/#?=&.\-]*",
+    re.IGNORECASE,
+)
+
+
+def _parse_missing_prereqs(output: str) -> tuple[list[str], str | None]:
+    """Extract MISSING_PREREQS PR URLs (and the one-line REASON) from the
+    transcript.
+
+    The prompt's contract: Claude prints ``MISSING_PREREQS: url1 url2 ...``
+    on one line and ``REASON: <one-liner>`` on the next, followed by
+    ``UNRESOLVED`` on its own line. We accept any whitespace separator
+    between URLs (space, tab, comma) and trim trailing punctuation.
+
+    Returns ``([], None)`` when no MISSING_PREREQS line was emitted.
+    """
+    text = _extract_assistant_text(output)
+    urls: list[str] = []
+    seen: set[str] = set()
+    # Walk every MISSING_PREREQS occurrence — there should normally only
+    # be one, but if Claude restated it (e.g. once mid-narration and once
+    # at the tail) we union them rather than picking arbitrarily.
+    for m in _MISSING_PREREQS_RE.finditer(text):
+        for tok in _PR_URL_TOKEN_RE.finditer(m.group(1)):
+            url = tok.group(0).rstrip(".,;:)]\"'")
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+    if not urls:
+        return [], None
+    reason_match = _REASON_RE.search(text)
+    reason = reason_match.group(1).strip() if reason_match else None
+    return urls, reason
+
+
 def _count_iterations(output: str) -> int | None:
     """Best-effort: count how many build attempts Claude ran.
 
@@ -730,6 +821,21 @@ def resolve_with_claude(
 
     tail_lines = assistant_text.strip().splitlines()[-40:] if assistant_text.strip() else []
     tail_str = "\n".join(tail_lines)
+
+    # Check MISSING_PREREQS *before* the generic UNRESOLVED check: the prompt
+    # contract is "MISSING_PREREQS: ... ; REASON: ... ; UNRESOLVED" together,
+    # so an UNRESOLVED tail line by itself doesn't disambiguate the two.
+    # Scan the full transcript (not just the tail) because Claude sometimes
+    # emits the structured marker mid-narration before its closing summary.
+    missing_prereq_prs, missing_prereq_note = _parse_missing_prereqs(output)
+    if missing_prereq_prs:
+        return AIResolveResult(
+            success=False, iterations=iterations,
+            error="claude reported MISSING_PREREQS",
+            cost_usd=cost_usd_total,
+            missing_prereq_prs=missing_prereq_prs,
+            missing_prereq_note=missing_prereq_note,
+        )
     if any(line.strip() == "UNRESOLVED" for line in tail_lines):
         return AIResolveResult(
             success=False, iterations=iterations,
