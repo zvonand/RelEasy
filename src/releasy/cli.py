@@ -35,8 +35,45 @@ def _load_config_or_exit(config_path: str | None = None) -> Config:
         raise click.ClickException(f"Failed to load config: {e}")
 
 
-def _load_and_verify(ctx: click.Context) -> Config:
-    """Load config and verify the state file (if any) belongs to it.
+def _attach_session(
+    config: Config,
+    session_file_override: str | None,
+    *,
+    required: bool,
+) -> None:
+    """Populate ``config.session`` by loading the session file.
+
+    ``required=True`` is for commands that can't do anything useful
+    without features / pr_sources (``run``, ``feature *``). Missing
+    session file → ``click.ClickException``.
+
+    ``required=False`` leaves ``config.session`` as ``None`` if the file
+    is missing — except when the user explicitly pointed at a specific
+    path via ``--session-file``, which is always an error if absent
+    (never silently fall back; the user asked for *that file*).
+    """
+    from releasy.config import load_session
+
+    override = Path(session_file_override) if session_file_override else None
+    if override is not None and not override.exists():
+        raise click.ClickException(f"Session file not found: {override}")
+    try:
+        config.session = load_session(config, override)
+    except FileNotFoundError as e:
+        if required:
+            raise click.ClickException(str(e))
+        config.session = None
+    except Exception as e:
+        raise click.ClickException(f"Failed to load session: {e}")
+
+
+def _load_and_verify(
+    ctx: click.Context, *, session: str = "optional",
+) -> Config:
+    """Load config, verify state ownership, optionally attach session.
+
+    ``session``: ``"required"`` (error if missing), ``"optional"``
+    (leave ``config.session=None`` on missing), ``"skip"`` (don't look).
 
     Use this for commands that need a config but don't take the project
     lock (read-only operations, or commands that explicitly rebind state).
@@ -48,20 +85,29 @@ def _load_and_verify(ctx: click.Context) -> Config:
         verify_ownership(config)
     except OwnershipCollisionError as e:
         raise click.ClickException(str(e))
+    if session != "skip":
+        _attach_session(
+            config, ctx.obj.get("session_file"),
+            required=(session == "required"),
+        )
     return config
 
 
 @contextmanager
-def _locked_config(ctx: click.Context) -> Iterator[Config]:
+def _locked_config(
+    ctx: click.Context, *, session: str = "optional",
+) -> Iterator[Config]:
     """Load + verify + lock a project's config; yield the Config.
 
     Wrap every mutating subcommand in this so concurrent invocations on
     the SAME project (same ``name:``) serialize, while invocations on
     different projects run in parallel.
+
+    ``session`` controls session-file handling; see :func:`_load_and_verify`.
     """
     from releasy.locks import project_lock
 
-    config = _load_and_verify(ctx)
+    config = _load_and_verify(ctx, session=session)
     with project_lock(config):
         yield config
 
@@ -102,11 +148,22 @@ _CLI_CONTEXT_SETTINGS = {"max_content_width": 120}
     default=None,
     help="Path to config.yaml (defaults to ./config.yaml in the current directory)",
 )
+@click.option(
+    "--session-file",
+    "session_file",
+    default=None,
+    help="Path to the session file (features + pr_sources). Overrides "
+         "the session_file: key in config.yaml. Defaults to "
+         "<config-dir>/<name>.session.yaml.",
+)
 @click.pass_context
-def cli(ctx: click.Context, config_path: str | None) -> None:
+def cli(
+    ctx: click.Context, config_path: str | None, session_file: str | None,
+) -> None:
     """RelEasy — manage port branches and release construction."""
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config_path
+    ctx.obj["session_file"] = session_file
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +193,7 @@ def cli(ctx: click.Context, config_path: str | None) -> None:
     help="Re-attempt PR units whose previous run ended in `conflict` "
          "status: discard the existing branch and re-run the cherry-pick "
          "from base. With --no-retry-failed those entries are left "
-         "exactly as-is. Defaults to the `pr_sources.retry_failed` value "
+         "exactly as-is. Defaults to the `pr_policy.retry_failed` value "
          "in config (true unless overridden).",
 )
 @click.pass_context
@@ -150,7 +207,7 @@ def run(
     """Discover and port new PRs onto the base branch (cherry-pick + open PR)."""
     from releasy.pipeline import run_pipeline, run_sequential
 
-    with _locked_config(ctx) as config:
+    with _locked_config(ctx, session="required") as config:
         if not onto:
             if not config.target_branch:
                 raise click.ClickException(
@@ -160,7 +217,7 @@ def run(
 
         wd = Path(work_dir) if work_dir else None
         effective_retry_failed = (
-            config.pr_sources.retry_failed
+            config.pr_policy.retry_failed
             if retry_failed is None else retry_failed
         )
 
@@ -361,7 +418,7 @@ def continue_cmd(ctx: click.Context, branch: str | None, work_dir: str | None) -
     """Reconcile state after a manual fix (push + open any missing PRs)."""
     from releasy.pipeline import continue_all, continue_branch, run_sequential
 
-    with _locked_config(ctx) as config:
+    with _locked_config(ctx, session="optional") as config:
         wd = Path(work_dir) if work_dir else None
         if branch:
             if not continue_branch(config, branch):
@@ -389,7 +446,7 @@ def skip(ctx: click.Context, branch: str) -> None:
     """Mark a port branch as skipped (state-only, branch + PR untouched)."""
     from releasy.pipeline import skip_branch
 
-    with _locked_config(ctx) as config:
+    with _locked_config(ctx, session="skip") as config:
         if not skip_branch(config, branch):
             raise SystemExit(1)
 
@@ -400,7 +457,7 @@ def abort(ctx: click.Context) -> None:
     """Persist current state and exit (no rollback; branches/PRs untouched)."""
     from releasy.pipeline import abort_run
 
-    with _locked_config(ctx) as config:
+    with _locked_config(ctx, session="skip") as config:
         abort_run(config)
 
 
@@ -410,7 +467,7 @@ def status(ctx: click.Context) -> None:
     """Print current pipeline state (read-only, no git/network)."""
     from releasy.pipeline import print_status
 
-    config = _load_and_verify(ctx)
+    config = _load_and_verify(ctx, session="skip")
     print_status(config)
 
 
@@ -441,7 +498,7 @@ def import_cmd(ctx: click.Context) -> None:
     """
     from releasy.import_state import import_from_github
 
-    with _locked_config(ctx) as config:
+    with _locked_config(ctx, session="optional") as config:
         if not import_from_github(config):
             raise SystemExit(1)
 
@@ -486,7 +543,7 @@ def refresh(
     """
     from releasy.refresh import refresh_tracked_prs
 
-    with _locked_config(ctx) as config:
+    with _locked_config(ctx, session="skip") as config:
         wd = Path(work_dir) if work_dir else None
         if not refresh_tracked_prs(config, wd, resolve_conflicts=resolve_conflicts):
             raise SystemExit(1)
@@ -559,14 +616,16 @@ def refresh(
     "--stateless",
     is_flag=True,
     default=False,
-    help="Bypass config.yaml entirely. No config file is read, no state "
-         "file is touched, no project lock is taken. All inputs come "
-         "from CLI flags (see the --origin / --build-command / "
-         "--claude-command / --prompt-file / --timeout / --max-iterations "
-         "/ --post-summary-comment options below). Origin defaults to "
-         "the PR's host repo (as https://github.com/<owner>/<repo>.git) "
-         "if you don't pass --origin. All those options are IGNORED "
-         "unless --stateless is set.",
+    help="Skip the session and state files: no per-project lock, no "
+         "ownership check, no state mutations. config.yaml IS still "
+         "loaded (with the usual --config override) so AI settings, "
+         "origin, trusted_reviewers, etc. are inherited from it. The "
+         "--origin / --build-command / --claude-command / --prompt-file "
+         "/ --timeout / --max-iterations / --post-summary-comment "
+         "overrides below apply only with --stateless. When no "
+         "config.yaml is present in cwd (and --config is not passed), "
+         "a synthetic config is built from the flags; --origin defaults "
+         "to the PR's host repo as an https URL in that case.",
 )
 @click.option(
     "--origin",
@@ -574,47 +633,48 @@ def refresh(
     default=None,
     help="(stateless only) Origin remote URL to push to. Use this if "
          "you need an ssh-form URL (e.g. git@github.com:owner/repo.git) "
-         "instead of https. Defaults to the PR's host repo as an "
-         "https URL.",
+         "instead of https. When config.yaml is present its origin is "
+         "used unless this flag overrides.",
 )
 @click.option(
     "--build-command",
     "build_command_cli",
-    default="",
+    default=None,
     help="(stateless only) Shell command the AI may run inside the "
          "repo to verify its changes compile. Written into "
          ".releasy/build.sh. Empty means 'no build — AI skips "
-         "verification'.",
+         "verification'. Overrides ai_resolve.build_command in config.",
 )
 @click.option(
     "--claude-command",
     "claude_command",
-    default="claude",
-    show_default=True,
-    help="(stateless only) Executable used to invoke Claude.",
+    default=None,
+    help="(stateless only) Executable used to invoke Claude. "
+         "Overrides review_response.command in config.",
 )
 @click.option(
     "--prompt-file",
     "prompt_file_cli",
     default=None,
     help="(stateless only) Path to the address-review prompt template. "
-         "Defaults to the prompt bundled with the releasy package.",
+         "Overrides review_response.prompt_file in config. Defaults to "
+         "the prompt bundled with the releasy package.",
 )
 @click.option(
     "--timeout",
     "timeout_seconds",
     type=int,
-    default=7200,
-    show_default=True,
-    help="(stateless only) Per-invocation Claude timeout in seconds.",
+    default=None,
+    help="(stateless only) Per-invocation Claude timeout in seconds. "
+         "Overrides review_response.timeout_seconds in config.",
 )
 @click.option(
     "--max-iterations",
     "max_iterations_cli",
     type=int,
-    default=15,
-    show_default=True,
-    help="(stateless only) Hard cap on build attempts per run.",
+    default=None,
+    help="(stateless only) Hard cap on build attempts per run. "
+         "Overrides review_response.max_iterations in config.",
 )
 @click.option(
     "--post-summary-comment",
@@ -635,11 +695,11 @@ def address_review_cmd(
     dry_run: bool,
     stateless: bool,
     origin_url: str | None,
-    build_command_cli: str,
-    claude_command: str,
+    build_command_cli: str | None,
+    claude_command: str | None,
     prompt_file_cli: str | None,
-    timeout_seconds: int,
-    max_iterations_cli: int,
+    timeout_seconds: int | None,
+    max_iterations_cli: int | None,
     post_summary_comment_cli: bool,
 ) -> None:
     """Let the AI address review feedback on a PR.
@@ -680,15 +740,15 @@ def address_review_cmd(
     stateless_only_set: list[str] = []
     if origin_url is not None:
         stateless_only_set.append("--origin")
-    if build_command_cli:
+    if build_command_cli is not None:
         stateless_only_set.append("--build-command")
-    if claude_command != "claude":
+    if claude_command is not None:
         stateless_only_set.append("--claude-command")
     if prompt_file_cli is not None:
         stateless_only_set.append("--prompt-file")
-    if timeout_seconds != 7200:
+    if timeout_seconds is not None:
         stateless_only_set.append("--timeout")
-    if max_iterations_cli != 15:
+    if max_iterations_cli is not None:
         stateless_only_set.append("--max-iterations")
     if post_summary_comment_cli:
         stateless_only_set.append("--post-summary-comment")
@@ -696,42 +756,88 @@ def address_review_cmd(
     if not stateless and stateless_only_set:
         raise click.UsageError(
             f"{', '.join(stateless_only_set)} only apply with "
-            "--stateless. Drop the flags, or add --stateless to run "
-            "without config.yaml."
+            "--stateless. Drop the flags, or add --stateless to skip "
+            "the session/state/lock layer."
         )
 
     if stateless:
-        from releasy.config import make_stateless_address_review_config
+        from releasy.config import (
+            build_stateless_address_review_config,
+            load_config,
+            overlay_address_review_overrides,
+        )
         from releasy.github_ops import parse_pr_url, slug_to_https_url
 
-        effective_origin = origin_url
-        if not effective_origin:
-            parsed = parse_pr_url(pr_url)
-            if parsed is None:
-                raise click.ClickException(
-                    f"Could not parse --pr URL: {pr_url!r}"
-                )
-            owner, repo, _ = parsed
-            effective_origin = slug_to_https_url(f"{owner}/{repo}")
+        # Try to load config.yaml via the usual --config resolution; fall
+        # back to a fully synthetic config only when no file is found.
+        config_path = ctx.obj.get("config_path")
+        config: Config | None = None
+        try:
+            config = load_config(
+                Path(config_path) if config_path else None,
+            )
+        except FileNotFoundError:
+            config = None
+        except Exception as e:
+            raise click.ClickException(f"Failed to load config: {e}")
 
-        config = make_stateless_address_review_config(
-            origin_url=effective_origin,
-            work_dir=wd,
-            claude_command=claude_command,
-            build_command=build_command_cli,
-            prompt_file=prompt_file_cli,
-            timeout_seconds=timeout_seconds,
-            max_iterations=max_iterations_cli,
-            trusted_reviewers=list(cli_reviewers),
-            reply_to_non_addressable=(
-                True if reply_to_non_addressable is None
-                else reply_to_non_addressable
-            ),
-            post_summary_comment=post_summary_comment_cli,
-        )
-        # In stateless mode, reply preference is already baked into
-        # the config we just built, so there's no CLI-vs-config
-        # precedence left to apply.
+        if config is None:
+            effective_origin = origin_url
+            if not effective_origin:
+                parsed = parse_pr_url(pr_url)
+                if parsed is None:
+                    raise click.ClickException(
+                        f"Could not parse --pr URL: {pr_url!r}"
+                    )
+                owner, repo, _ = parsed
+                effective_origin = slug_to_https_url(f"{owner}/{repo}")
+            config = build_stateless_address_review_config(
+                origin_url=effective_origin,
+                work_dir=wd,
+                claude_command=claude_command or "claude",
+                build_command=build_command_cli or "",
+                prompt_file=prompt_file_cli,
+                timeout_seconds=(
+                    timeout_seconds if timeout_seconds is not None else 7200
+                ),
+                max_iterations=(
+                    max_iterations_cli
+                    if max_iterations_cli is not None else 15
+                ),
+                trusted_reviewers=list(cli_reviewers),
+                reply_to_non_addressable=(
+                    True if reply_to_non_addressable is None
+                    else reply_to_non_addressable
+                ),
+                post_summary_comment=post_summary_comment_cli,
+            )
+        else:
+            # Real config loaded — overlay only the flags the user passed.
+            # Origin override is applied directly on the OriginConfig; the
+            # rest go through the helper.
+            if origin_url:
+                config.origin.remote = origin_url
+            overlay_address_review_overrides(
+                config,
+                claude_command=claude_command,
+                build_command=build_command_cli,
+                prompt_file=prompt_file_cli,
+                timeout_seconds=timeout_seconds,
+                max_iterations=max_iterations_cli,
+                # --reviewer flags ADD to config's trusted_reviewers.
+                trusted_reviewers=(
+                    list(config.review_response.trusted_reviewers)
+                    + list(cli_reviewers)
+                ) if cli_reviewers else None,
+                reply_to_non_addressable=reply_to_non_addressable,
+                post_summary_comment=(
+                    True if post_summary_comment_cli else None
+                ),
+            )
+
+        # Stateless: never load state, never lock, never attach session.
+        config.session = None
+        config.stateless = True
         result = address_review(
             config,
             pr_url,
@@ -739,7 +845,10 @@ def address_review_cmd(
             since_iso=since_iso,
             work_dir=wd,
             dry_run=dry_run,
-            reply_override=None,
+            reply_override=(
+                None if reply_to_non_addressable is None
+                else reply_to_non_addressable
+            ),
         )
         if not result.success:
             if result.error:
@@ -747,7 +856,7 @@ def address_review_cmd(
             raise SystemExit(1)
         return
 
-    with _locked_config(ctx) as config:
+    with _locked_config(ctx, session="skip") as config:
         result = address_review(
             config,
             pr_url,
@@ -790,7 +899,7 @@ def release(
     """Build a release branch from a tag, merging finished ports onto it."""
     from releasy.release import build_release
 
-    with _locked_config(ctx) as config:
+    with _locked_config(ctx, session="optional") as config:
         wd = Path(work_dir) if work_dir else None
         if not build_release(config, base_tag, name, strict, include_skipped, wd):
             raise SystemExit(1)
@@ -823,7 +932,7 @@ def setup_project_cmd(ctx: click.Context) -> None:
     from releasy.github_ops import setup_project
     from releasy.pipeline import sync_to_project
 
-    with _locked_config(ctx) as config:
+    with _locked_config(ctx, session="skip") as config:
         url = setup_project(config)
         if not url:
             raise SystemExit(1)
@@ -853,7 +962,7 @@ def sync_project_cmd(ctx: click.Context) -> None:
     """
     from releasy.pipeline import sync_to_project
 
-    with _locked_config(ctx) as config:
+    with _locked_config(ctx, session="optional") as config:
         if not sync_to_project(config):
             raise SystemExit(1)
 
@@ -926,29 +1035,46 @@ def new_cmd(
             f"or remove the existing file first."
         )
 
-    template_path = Path(__file__).parent / "templates" / "config.yaml.tmpl"
-    if not template_path.exists():
+    templates_dir = Path(__file__).parent / "templates"
+    config_tmpl = templates_dir / "config.yaml.tmpl"
+    session_tmpl = templates_dir / "session.yaml.tmpl"
+    if not config_tmpl.exists() or not session_tmpl.exists():
         raise click.ClickException(
-            f"Bundled template missing: {template_path}. This is a packaging "
-            "bug — please report it."
+            f"Bundled templates missing under {templates_dir}. This is a "
+            "packaging bug — please report it."
         )
-    text = template_path.read_text()
-    rendered = _render_template(
-        text,
+
+    # Session file goes next to config.yaml as ``<name>.session.yaml`` —
+    # keep it co-located so users editing config see the session file
+    # right there.
+    session_path = out_path.parent / f"{name_opt}.session.yaml"
+    if session_path.exists():
+        raise click.ClickException(
+            f"{session_path} already exists. Remove it or pass --out to "
+            "write somewhere else."
+        )
+
+    rendered_config = _render_template(
+        config_tmpl.read_text(),
         name=name_opt,
         target_branch=target_branch or "",
         project=project_opt or "",
     )
+    rendered_session = session_tmpl.read_text()
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(rendered)
+    out_path.write_text(rendered_config)
+    session_path.write_text(rendered_session)
 
-    # stdout is the absolute path and nothing else; user-facing chatter
-    # goes to stderr so shell composition (cd $(releasy new …)) works.
+    # stdout is the absolute path of config.yaml and nothing else; user-
+    # facing chatter goes to stderr so shell composition
+    # (cd $(releasy new …)) works.
     click.echo(str(out_path))
     click.echo(
-        f"Created config for project {name_opt!r}. "
-        f"State will live at {state_file_path(name_opt)}.",
+        f"Created config for project {name_opt!r}.\n"
+        f"  Config : {out_path}\n"
+        f"  Session: {session_path}\n"
+        f"  State  : {state_file_path(name_opt)}",
         err=True,
     )
 
@@ -1066,7 +1192,7 @@ def adopt(ctx: click.Context) -> None:
 
 @cli.group()
 def feature() -> None:
-    """Manage the static `features:` list in config.yaml."""
+    """Manage the static `features:` list in the session file."""
 
 
 @feature.command(name="add")
@@ -1080,7 +1206,7 @@ def feature_add(
     """Add a new feature branch."""
     from releasy.feature import add_feature
 
-    with _locked_config(ctx) as config:
+    with _locked_config(ctx, session="required") as config:
         if not add_feature(config, feature_id, source_branch, description):
             raise SystemExit(1)
 
@@ -1092,7 +1218,7 @@ def feature_enable(ctx: click.Context, feature_id: str) -> None:
     """Enable a feature branch."""
     from releasy.feature import enable_feature
 
-    with _locked_config(ctx) as config:
+    with _locked_config(ctx, session="required") as config:
         if not enable_feature(config, feature_id):
             raise SystemExit(1)
 
@@ -1104,7 +1230,7 @@ def feature_disable(ctx: click.Context, feature_id: str) -> None:
     """Disable a feature branch."""
     from releasy.feature import disable_feature
 
-    with _locked_config(ctx) as config:
+    with _locked_config(ctx, session="required") as config:
         if not disable_feature(config, feature_id):
             raise SystemExit(1)
 
@@ -1116,7 +1242,7 @@ def feature_remove(ctx: click.Context, feature_id: str) -> None:
     """Remove a feature branch."""
     from releasy.feature import remove_feature
 
-    with _locked_config(ctx) as config:
+    with _locked_config(ctx, session="required") as config:
         if not remove_feature(config, feature_id):
             raise SystemExit(1)
 
@@ -1127,7 +1253,7 @@ def feature_list(ctx: click.Context) -> None:
     """List all configured features."""
     from releasy.feature import list_features
 
-    config = _load_and_verify(ctx)
+    config = _load_and_verify(ctx, session="required")
     list_features(config)
 
 

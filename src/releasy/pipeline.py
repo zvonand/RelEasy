@@ -466,7 +466,7 @@ def discover_feature_units(config: Config) -> list["FeatureUnit"]:
         default_source = (
             config.pr_sources.by_labels[0]
             if config.pr_sources.by_labels
-            else PRSourceConfig(labels=[], if_exists=config.pr_sources.if_exists)
+            else PRSourceConfig(labels=[], if_exists=config.pr_policy.if_exists)
         )
         for ref in sorted(include_pr_refs):
             if ref in collected:
@@ -543,11 +543,11 @@ def run_pipeline(
     repo_path = _setup_repo(config, work_dir, config.base_branch_name(onto))
 
     if is_operation_in_progress(repo_path):
-        if config.pr_sources.if_exists == "recreate":
+        if config.pr_policy.if_exists == "recreate":
             kind = abort_in_progress_op(repo_path)
             console.print(
                 f"\n[yellow]↻ Aborted in-progress {kind} in [cyan]{repo_path}[/cyan][/yellow] "
-                f"(pr_sources.if_exists: recreate)"
+                f"(pr_policy.if_exists: recreate)"
             )
         else:
             console.print(
@@ -556,7 +556,7 @@ def run_pipeline(
             )
             console.print(
                 "  Resolve it first (or run `git cherry-pick --abort`), then re-run.\n"
-                "  Or set [cyan]pr_sources.if_exists: recreate[/cyan] in config to "
+                "  Or set [cyan]pr_policy.if_exists: recreate[/cyan] in config to "
                 "auto-abort it."
             )
             raise SystemExit(2)
@@ -716,11 +716,11 @@ def run_sequential(
     repo_path = _setup_repo(config, work_dir, config.base_branch_name(onto))
 
     if is_operation_in_progress(repo_path):
-        if config.pr_sources.if_exists == "recreate":
+        if config.pr_policy.if_exists == "recreate":
             kind = abort_in_progress_op(repo_path)
             console.print(
                 f"\n[yellow]↻ Aborted in-progress {kind} in [cyan]{repo_path}[/cyan][/yellow] "
-                f"(pr_sources.if_exists: recreate)"
+                f"(pr_policy.if_exists: recreate)"
             )
         else:
             console.print(
@@ -729,7 +729,7 @@ def run_sequential(
             )
             console.print(
                 "  Resolve it first (or run `git cherry-pick --abort`), then re-run.\n"
-                "  Or set [cyan]pr_sources.if_exists: recreate[/cyan] in config to "
+                "  Or set [cyan]pr_policy.if_exists: recreate[/cyan] in config to "
                 "auto-abort it."
             )
             raise SystemExit(2)
@@ -829,7 +829,7 @@ def run_sequential(
                     "  Resolve it manually and re-run "
                     "[cyan]releasy continue[/cyan], or pass "
                     "[cyan]--retry-failed[/cyan] (or set "
-                    "[cyan]pr_sources.retry_failed: true[/cyan] in config) "
+                    "[cyan]pr_policy.retry_failed: true[/cyan] in config) "
                     "to force a fresh cherry-pick attempt."
                 )
                 raise SystemExit(1)
@@ -1737,7 +1737,7 @@ def _process_feature_unit(
     re-attempted; when false, the unit is left exactly as-is (no
     cherry-pick, no PR side-effects).
 
-    ``pr_sources.recreate_closed_prs`` allocates ``feature/.../<id>-1``,
+    ``pr_policy.recreate_closed_prs`` allocates ``feature/.../<id>-1``,
     ``-2``, … when the stored ``rebase_pr_url`` PR was closed without merging,
     then runs the normal cherry-pick + push + open-PR path for that name.
     """
@@ -1762,7 +1762,7 @@ def _process_feature_unit(
         # take over without us touching the PR / branch / project board.
         console.print(
             f"\n    [dim]{canonical_branch} ({label}) — previously conflicted, "
-            "skipping (pr_sources.retry_failed: false / "
+            "skipping (pr_policy.retry_failed: false / "
             "--no-retry-failed)[/dim]"
         )
         return "continue"
@@ -1776,12 +1776,12 @@ def _process_feature_unit(
         console.print(
             f"\n    [yellow]↻[/yellow] [cyan]{canonical_branch}[/cyan] ({label}) — "
             "previously conflicted, force-recreating from base "
-            "(pr_sources.retry_failed: true)"
+            "(pr_policy.retry_failed: true)"
         )
 
     new_branch = canonical_branch
     if (
-        config.pr_sources.recreate_closed_prs
+        config.pr_policy.recreate_closed_prs
         and not force_retry
         and prev_state
         and prev_state.rebase_pr_url
@@ -1795,7 +1795,7 @@ def _process_feature_unit(
         console.print(
             f"\n    [yellow]↻[/yellow] Rebase PR closed without merge — "
             f"opening a new port branch [cyan]{new_branch}[/cyan] "
-            "([cyan]pr_sources.recreate_closed_prs[/cyan])"
+            "([cyan]pr_policy.recreate_closed_prs[/cyan])"
         )
 
     on_remote = remote_branch_exists(repo_path, new_branch, remote)
@@ -1815,7 +1815,7 @@ def _process_feature_unit(
     if on_local and unit.if_exists == "skip" and not force_retry:
         console.print(
             f"\n    [cyan]{new_branch}[/cyan] ({label}) — local branch "
-            "exists, skipping (set pr_sources.if_exists: recreate to rebuild)"
+            "exists, skipping (set pr_policy.if_exists: recreate to rebuild)"
         )
         return "continue"
 
@@ -2128,7 +2128,7 @@ def _success_status(rebase_pr_url: str | None) -> str:
 
     ``needs_review`` once a PR exists for the rebase branch — that's the
     "ready for human review" state. ``branch_created`` when the branch is
-    around but no PR has been opened yet (e.g. ``pr_sources.auto_pr:
+    around but no PR has been opened yet (e.g. ``pr_policy.auto_pr:
     false``, or PR creation hit a transient failure). The latter shows up
     on the project board with a branch link and a GitHub *compare* URL so
     the user can open the PR manually with one click.
@@ -2148,11 +2148,11 @@ def _ensure_pr_for_existing_remote_branch(
 
     Triggered on re-runs when the cherry-pick is skipped because the branch
     is already pushed (typical case: a prior run that ran with
-    ``pr_sources.auto_pr: false`` and only pushed the branch). Idempotent:
+    ``pr_policy.auto_pr: false`` and only pushed the branch). Idempotent:
     if a PR is already on file, this just makes sure the labels and project
     board reflect it.
 
-    No-op unless ``config.push`` is enabled. When ``pr_sources.auto_pr``
+    No-op unless ``config.push`` is enabled. When ``pr_policy.auto_pr``
     is off, the helper still ensures a state entry exists for the branch
     (status ``branch_created``) so the project board can show it with a
     compare-URL link.
@@ -2189,7 +2189,7 @@ def _ensure_pr_for_existing_remote_branch(
                 "label \u2014 treating this re-run as a deferred recovery"
             )
 
-    if config.pr_sources.auto_pr:
+    if config.pr_policy.auto_pr:
         title = _unit_title(unit, config.project, base_branch)
         body = _unit_body(unit, get_origin_repo_slug(config))
         pr_url, outcome = _ensure_pr_for_branch(
@@ -2282,7 +2282,7 @@ def _finish_clean_unit(
         fs.prereq_discovery_depth = prereq_discovery_depth
     state.features[unit.feature_id] = fs
 
-    if config.push and config.pr_sources.auto_pr:
+    if config.push and config.pr_policy.auto_pr:
         # Title format is identical regardless of AI involvement; the
         # `ai-resolved` label (applied below) is what marks it.
         title = _unit_title(unit, config.project, base_branch)
@@ -2313,7 +2313,7 @@ def _finish_clean_unit(
                 if relabelled and not state.features[unit.feature_id].ai_resolved:
                     state.features[unit.feature_id].ai_resolved = True
     elif config.push and (ai_used or has_auto_prereqs):
-        # Branch pushed but pr_sources.auto_pr disabled — try to label any
+        # Branch pushed but pr_policy.auto_pr disabled — try to label any
         # pre-existing PR for this branch.
         existing = find_pr_for_branch(config, new_branch, base_branch)
         if existing:
@@ -3006,7 +3006,7 @@ def _handle_unresolved_conflict(
         console.print(f"    [green]✓[/green] Pushed [cyan]{new_branch}[/cyan]")
         pushed = True
 
-    if pushed and config.pr_sources.auto_pr:
+    if pushed and config.pr_policy.auto_pr:
         title = _unit_title(unit, config.project, base_branch)
         body = _unit_body(
             unit,
@@ -3421,7 +3421,7 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
       - ``conflict``, still unresolved → highlight, leave alone.
       - ``branch_created`` (branch on origin, no PR yet) → try to open
         the PR. Covers the case where the previous run had
-        ``pr_sources.auto_pr: false`` and only pushed the branch, or
+        ``pr_policy.auto_pr: false`` and only pushed the branch, or
         where an earlier failure prevented PR creation. Stays as
         ``branch_created`` if PR creation is still disabled / failing.
       - ``needs_review`` already linked to a PR → leave alone.
@@ -3502,7 +3502,7 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
             )
             continue
         if fs.status == "branch_created":
-            if not (config.push and config.pr_sources.auto_pr):
+            if not (config.push and config.pr_policy.auto_pr):
                 console.print(
                     f"{header} — [dim]branch-created (auto_pr off, "
                     "open PR manually)[/dim]"

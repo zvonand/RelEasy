@@ -4,6 +4,8 @@
 # Unique slug identifying this project on this machine. Keys the
 # per-project state file under
 #   ${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml
+# and (by default) the session file at
+#   <config-dir>/<name>.session.yaml
 # Allowed: A-Z a-z 0-9 . _ - (1-64 chars). Don't rename without
 # `releasy adopt` (or just edit the state file path).
 name: {{ name }}
@@ -19,8 +21,14 @@ name: {{ name }}
 # `releasy run` / `releasy continue` invocation. Each invocation either
 # confirms the previous rebase PR was merged into target_branch and ports
 # the next PR, or stops with an error. Default: false (batch mode).
-# Incompatible with pr_sources.groups.
+# Incompatible with pr_sources.groups in the session file.
 # sequential: false
+
+# Optional explicit path to the session file (features + pr_sources).
+# Relative paths resolve against this config's directory. Can also be
+# overridden per-invocation with --session-file.
+# Default: <config-dir>/<name>.session.yaml
+# session_file: {{ name }}.session.yaml
 
 origin:
   remote: <set me — https or ssh URL of the origin repo>
@@ -35,10 +43,16 @@ project: {{ project }}
 # exist on origin.
 target_branch: {{ target_branch }}
 
-# pr_sources: PR discovery and filtering. See config.yaml.example.
-# pr_sources:
-#   include_prs:
-#     - https://github.com/owner/repo/pull/123
+# ── PR processing policy ───────────────────────────────────────────
+# Knobs that apply to every discovered PR / group. Lives here (not in
+# the session file) because it's infrastructure — what to do with
+# branches, when to retry, whether to open PRs — not *what* to port.
+# All values shown below are defaults; omit the block to accept them.
+# pr_policy:
+#   if_exists: skip           # skip | recreate
+#   auto_pr: true             # open a PR for every pushed port branch
+#   retry_failed: true        # re-attempt conflicted entries on next run
+#   recreate_closed_prs: false
 
 # ai_resolve: Claude-driven conflict resolution. See config.yaml.example.
 # ai_resolve:

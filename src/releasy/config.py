@@ -1,4 +1,23 @@
-"""Configuration loading and validation from config.yaml."""
+"""Configuration loading and validation.
+
+Three layers, one responsibility each:
+
+* ``config.yaml`` — stable infrastructure (origin, workdir, AI settings,
+  notifications, push/sequential/update policies, the global ``pr_policy:``
+  block). Loaded by :func:`load_config`.
+
+* ``<name>.session.yaml`` — per-effort source data (``features:``,
+  ``pr_sources:``). Loaded by :func:`load_session`. Lives next to
+  ``config.yaml`` by default; overridable via CLI (``--session-file``) or
+  a ``session_file:`` key in ``config.yaml``.
+
+* ``<name>.state.yaml`` — runtime progress (status per feature, conflict
+  files, AI cost, rebase-PR URLs). See :mod:`releasy.state`.
+
+The old all-in-one ``config.yaml`` layout (inline ``features:`` /
+``pr_sources:``) is deliberately no longer accepted; :func:`load_config`
+raises a helpful error pointing at the new layout.
+"""
 
 from __future__ import annotations
 
@@ -11,8 +30,9 @@ import yaml
 
 
 # Slug constraints for the per-project ``name:`` field. The name doubles
-# as a filename (``<name>.state.yaml``) so it must be filesystem-safe and
-# short enough to be readable in ``releasy list`` output.
+# as a filename (``<name>.state.yaml``, ``<name>.session.yaml``) so it
+# must be filesystem-safe and short enough to be readable in ``releasy
+# list`` output.
 _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _STATE_SUBDIR = "releasy"
 
@@ -118,8 +138,8 @@ class PRSourceConfig:
     description: str = ""
     merged_only: bool = False
     # When the port branch already exists: "skip" (leave it alone) or
-    # "recreate" (delete and rebuild from base). Inherits PRSourcesConfig.if_exists
-    # when not set per-source.
+    # "recreate" (delete and rebuild from base). Inherits ``pr_policy.if_exists``
+    # from config.yaml when not set per-source.
     if_exists: str = "skip"
 
 
@@ -129,19 +149,38 @@ class PRGroupConfig:
 
     All ``prs`` are cherry-picked, in listed order, onto the same port branch
     ``feature/<base>/<id>`` and result in a single combined PR (when push +
-    pr_sources.auto_pr).
+    ``pr_policy.auto_pr``).
     """
     id: str
     prs: list[str]
     description: str = ""
     # When the port branch already exists locally: "skip" or "recreate".
-    # Inherits from PRSourcesConfig.if_exists when not set per-group.
+    # Inherits from ``pr_policy.if_exists`` in config.yaml when not set
+    # per-group.
     if_exists: str = "skip"
 
 
 @dataclass
+class PRPolicyConfig:
+    """Policy knobs for PR processing. Lives in ``config.yaml`` (not the
+    session file) because these settings are stable across efforts: they
+    describe *how* to process discovered units, not *which* units to
+    discover.
+
+    ``if_exists`` is the default for individual ``pr_sources`` entries in
+    the session file that don't set their own ``if_exists``.
+    """
+    if_exists: str = "skip"
+    auto_pr: bool = True
+    retry_failed: bool = True
+    recreate_closed_prs: bool = False
+
+
+@dataclass
 class PRSourcesConfig:
-    """PR discovery and filtering.
+    """PR discovery selectors. Lives in the session file — this is the
+    mutable, per-effort data that changes between runs (which PRs to port
+    this week, which labels define the current rebase wave, etc.).
 
     Set arithmetic:
         union(by_labels)
@@ -161,10 +200,9 @@ class PRSourcesConfig:
     PRs by the listed authors. Author comparisons are case-insensitive.
     Both filters are bypassed for PRs explicitly listed in ``include_prs``.
 
-    ``auto_pr`` is a single global switch: when true (the default), every
-    pushed port branch (singleton, by-labels, include_prs, or group) gets a
-    PR opened against the base branch. Set to false to push branches only
-    and open PRs manually. Requires ``push: true`` to have any effect.
+    Policy knobs that used to live here (``if_exists``, ``auto_pr``,
+    ``retry_failed``, ``recreate_closed_prs``) now live in
+    :class:`PRPolicyConfig` under ``pr_policy:`` in ``config.yaml``.
     """
     by_labels: list[PRSourceConfig] = field(default_factory=list)
     exclude_labels: list[str] = field(default_factory=list)
@@ -173,26 +211,6 @@ class PRSourcesConfig:
     include_authors: list[str] = field(default_factory=list)
     exclude_authors: list[str] = field(default_factory=list)
     groups: list[PRGroupConfig] = field(default_factory=list)
-    # Default behavior when a port branch already exists. Applied to PRs from
-    # ``include_prs`` and to any ``by_labels`` / ``groups`` entry that omits
-    # ``if_exists``.
-    if_exists: str = "skip"
-    # Global switch: open a PR for every pushed port branch.
-    auto_pr: bool = True
-    # Re-attempt PR units whose previous run ended in `conflict` status.
-    # When true (the default), `releasy run` discards any existing local /
-    # remote port branch for a conflicted entry and re-runs the cherry-pick
-    # from base — useful after fixing a bug, topping up Anthropic credits,
-    # or otherwise resolving whatever caused the original failure. When
-    # false, conflicted entries are left exactly as they are (no new
-    # cherry-pick, no PR side-effects), and `releasy run` walks past them.
-    retry_failed: bool = True
-    # When the auto-opened rebase PR (see state ``rebase_pr_url``) was later
-    # closed without merging: allocate a new port branch name by appending
-    # ``-1``, ``-2``, … to the canonical ``feature/<base>/<id>`` name and
-    # run the cherry-pick + open-PR flow again. Off by default — without it,
-    # an existing remote port branch still causes the unit to be skipped.
-    recreate_closed_prs: bool = False
 
 
 def _default_assignee_dev_options() -> list[str]:
@@ -440,6 +458,23 @@ class AIResolveConfig:
 
 
 @dataclass
+class SessionConfig:
+    """Per-effort source data.
+
+    Kept deliberately small: just the ``features`` list and the ``pr_sources``
+    selectors. Policy knobs that used to live in ``pr_sources`` are on
+    :class:`PRPolicyConfig` (in ``config.yaml``) because they don't change
+    between efforts.
+
+    ``session_path`` is the on-disk file this was loaded from (or where it
+    should be written by :func:`save_session`). ``None`` means in-memory only.
+    """
+    features: list[FeatureConfig] = field(default_factory=list)
+    pr_sources: PRSourcesConfig = field(default_factory=PRSourcesConfig)
+    session_path: Path | None = None
+
+
+@dataclass
 class Config:
     name: str  # unique slug identifying this project (state file key)
     origin: OriginConfig
@@ -460,8 +495,7 @@ class Config:
     #                     tweaked the body format and want the rebase PR to
     #                     reflect it.
     update_existing_prs: bool = False
-    features: list[FeatureConfig] = field(default_factory=list)
-    pr_sources: PRSourcesConfig = field(default_factory=PRSourcesConfig)
+    pr_policy: PRPolicyConfig = field(default_factory=PRPolicyConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     ai_resolve: AIResolveConfig = field(default_factory=AIResolveConfig)
     ai_changelog: AIChangelogConfig = field(default_factory=AIChangelogConfig)
@@ -477,8 +511,23 @@ class Config:
     # invocation. Each `releasy run` / `releasy continue` either confirms
     # the previous rebase PR was merged into target_branch and ports the
     # next one, or stops with an error. Incompatible with
-    # ``pr_sources.groups`` (rejected at load time).
+    # session ``pr_sources.groups`` (rejected at session-load time).
     sequential: bool = False
+    # Optional override for the session file path, read from
+    # ``session_file:`` in config.yaml. Relative paths resolve against the
+    # config.yaml directory. When None, the default path
+    # ``<config-dir>/<name>.session.yaml`` is used.
+    session_file: Path | None = None
+    # Populated by :func:`load_session` when the caller needs the session
+    # data (``run``, ``continue``, ``feature *``, …). Stays ``None`` for
+    # session-agnostic commands (``status``, ``where``, ``adopt``) and
+    # for stateless flows.
+    session: SessionConfig | None = None
+    # Set by ``--stateless`` flows (``address-review --stateless``, the
+    # cherry-pick entry point). Consumers that would otherwise read /
+    # write per-project state skip those calls when this is True. Checked
+    # via :func:`is_stateless` so the flag lives in one place.
+    stateless: bool = False
 
     @property
     def repo_dir(self) -> Path:
@@ -510,6 +559,20 @@ class Config:
         if self.work_dir is not None:
             return self.work_dir.resolve()
         return Path.cwd()
+
+    @property
+    def features(self) -> list[FeatureConfig]:
+        """Features declared in the loaded session (empty when no session)."""
+        if self.session is None:
+            return []
+        return self.session.features
+
+    @property
+    def pr_sources(self) -> PRSourcesConfig:
+        """PR selectors from the loaded session (empty struct when no session)."""
+        if self.session is None:
+            return PRSourcesConfig()
+        return self.session.pr_sources
 
     @property
     def enabled_features(self) -> list[FeatureConfig]:
@@ -556,8 +619,37 @@ class Config:
         return f"feature/{self.base_branch_name(onto)}/{feature_id}"
 
 
+# ---------------------------------------------------------------------------
+# config.yaml I/O
+# ---------------------------------------------------------------------------
+
+
+# Keys that used to live at the top level of config.yaml but now belong
+# elsewhere. Presence triggers a helpful error pointing at the new layout.
+_LEGACY_TOP_LEVEL_KEYS = {
+    "features": (
+        "features: now lives in the session file — move this list to the "
+        "session YAML (default path: <config-dir>/<name>.session.yaml; "
+        "scaffolded automatically by `releasy new`)."
+    ),
+    "pr_sources": (
+        "pr_sources: has been split. Move the selector fields "
+        "(by_labels, exclude_labels, include_prs, exclude_prs, "
+        "include_authors, exclude_authors, groups) into the session "
+        "file's pr_sources: block. Move the policy fields "
+        "(if_exists, auto_pr, retry_failed, recreate_closed_prs) into "
+        "a new pr_policy: block at the top level of config.yaml."
+    ),
+}
+
+
 def load_config(config_path: Path | None = None) -> Config:
-    """Load and validate config from config.yaml."""
+    """Load and validate ``config.yaml``. Does not touch the session file.
+
+    Callers that need feature/PR-source data must also call
+    :func:`load_session` — the two files are deliberately independent so
+    ``--stateless`` flows can load config without pulling session data.
+    """
     if config_path is None:
         config_path = Path.cwd() / "config.yaml"
 
@@ -571,6 +663,14 @@ def load_config(config_path: Path | None = None) -> Config:
 
     if not raw:
         raise ValueError("Config file is empty")
+
+    # Reject legacy inline features:/pr_sources: with a concrete migration hint.
+    for legacy_key, hint in _LEGACY_TOP_LEVEL_KEYS.items():
+        if legacy_key in raw:
+            raise ValueError(
+                f"Invalid config.yaml key {legacy_key!r}: {hint}\n"
+                f"See README for the new layout."
+            )
 
     name = raw.get("name")
     if not name:
@@ -621,121 +721,22 @@ def load_config(config_path: Path | None = None) -> Config:
             "This is used to name the base and port branches."
         )
 
-    features = []
-    for feat_raw in raw.get("features", []):
-        features.append(
-            FeatureConfig(
-                id=feat_raw["id"],
-                description=feat_raw["description"],
-                source_branch=feat_raw["source_branch"],
-                enabled=feat_raw.get("enabled", True),
-                depends_on=feat_raw.get("depends_on", []),
-            )
-        )
-
-    ps_raw = raw.get("pr_sources", {})
-    global_if_exists = ps_raw.get("if_exists", "skip")
-    if global_if_exists not in _VALID_IF_EXISTS:
+    pp_raw = raw.get("pr_policy", {}) or {}
+    if not isinstance(pp_raw, dict):
         raise ValueError(
-            f"pr_sources.if_exists must be one of {_VALID_IF_EXISTS}, "
-            f"got {global_if_exists!r}"
+            f"pr_policy must be a mapping, got {type(pp_raw).__name__}"
         )
-    global_auto_pr = bool(ps_raw.get("auto_pr", True))
-    global_retry_failed = bool(ps_raw.get("retry_failed", True))
-    global_recreate_closed_prs = bool(ps_raw.get("recreate_closed_prs", False))
-    by_labels = []
-    for entry in ps_raw.get("by_labels", []):
-        raw_labels = entry.get("labels", [])
-        if isinstance(raw_labels, str):
-            raw_labels = [raw_labels]
-        entry_if_exists = entry.get("if_exists", global_if_exists)
-        if entry_if_exists not in _VALID_IF_EXISTS:
-            raise ValueError(
-                f"pr_sources.by_labels[].if_exists must be one of "
-                f"{_VALID_IF_EXISTS}, got {entry_if_exists!r}"
-            )
-        if "auto_pr" in entry:
-            raise ValueError(
-                f"pr_sources.by_labels[labels={raw_labels!r}].auto_pr is no "
-                "longer supported. Use the global 'pr_sources.auto_pr' "
-                "switch (default true) instead."
-            )
-        by_labels.append(
-            PRSourceConfig(
-                labels=raw_labels,
-                description=entry.get("description", ""),
-                merged_only=entry.get("merged_only", False),
-                if_exists=entry_if_exists,
-            )
+    pp_if_exists = pp_raw.get("if_exists", "skip")
+    if pp_if_exists not in _VALID_IF_EXISTS:
+        raise ValueError(
+            f"pr_policy.if_exists must be one of {_VALID_IF_EXISTS}, "
+            f"got {pp_if_exists!r}"
         )
-    groups: list[PRGroupConfig] = []
-    seen_group_ids: set[str] = set()
-    seen_group_prs: dict[str, str] = {}  # url -> group id
-    for entry in ps_raw.get("groups", []):
-        gid = entry.get("id")
-        if not gid:
-            raise ValueError("pr_sources.groups[] entries must specify 'id'")
-        if gid in seen_group_ids:
-            raise ValueError(f"pr_sources.groups: duplicate id {gid!r}")
-        seen_group_ids.add(gid)
-        prs_list = entry.get("prs", [])
-        if not isinstance(prs_list, list) or len(prs_list) < 1:
-            raise ValueError(
-                f"pr_sources.groups[{gid!r}].prs must be a non-empty list of PR URLs"
-            )
-        for url in prs_list:
-            if url in seen_group_prs:
-                raise ValueError(
-                    f"PR {url} appears in both groups {seen_group_prs[url]!r} "
-                    f"and {gid!r}"
-                )
-            seen_group_prs[url] = gid
-        group_if_exists = entry.get("if_exists", global_if_exists)
-        if group_if_exists not in _VALID_IF_EXISTS:
-            raise ValueError(
-                f"pr_sources.groups[{gid!r}].if_exists must be one of "
-                f"{_VALID_IF_EXISTS}, got {group_if_exists!r}"
-            )
-        if "auto_pr" in entry:
-            raise ValueError(
-                f"pr_sources.groups[id={gid!r}].auto_pr is no longer "
-                "supported. Use the global 'pr_sources.auto_pr' switch "
-                "(default true) instead."
-            )
-        groups.append(
-            PRGroupConfig(
-                id=gid,
-                prs=prs_list,
-                description=entry.get("description", ""),
-                if_exists=group_if_exists,
-            )
-        )
-
-    def _str_list(key: str) -> list[str]:
-        """Read a list-of-strings config value, tolerating a bare string."""
-        v = ps_raw.get(key, [])
-        if v is None:
-            return []
-        if isinstance(v, str):
-            return [v]
-        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
-            raise ValueError(
-                f"pr_sources.{key} must be a list of strings, got {v!r}"
-            )
-        return v
-
-    pr_sources = PRSourcesConfig(
-        by_labels=by_labels,
-        exclude_labels=ps_raw.get("exclude_labels", []),
-        include_prs=ps_raw.get("include_prs", []),
-        exclude_prs=ps_raw.get("exclude_prs", []),
-        include_authors=_str_list("include_authors"),
-        exclude_authors=_str_list("exclude_authors"),
-        groups=groups,
-        if_exists=global_if_exists,
-        auto_pr=global_auto_pr,
-        retry_failed=global_retry_failed,
-        recreate_closed_prs=global_recreate_closed_prs,
+    pr_policy = PRPolicyConfig(
+        if_exists=pp_if_exists,
+        auto_pr=bool(pp_raw.get("auto_pr", True)),
+        retry_failed=bool(pp_raw.get("retry_failed", True)),
+        recreate_closed_prs=bool(pp_raw.get("recreate_closed_prs", False)),
     )
 
     notif_raw = raw.get("notifications", {}) or {}
@@ -935,12 +936,19 @@ def load_config(config_path: Path | None = None) -> Config:
             lp = lp.resolve()
         log_file = lp
 
+    raw_session_file = raw.get("session_file")
+    session_file: Path | None = None
+    if raw_session_file is not None:
+        if not isinstance(raw_session_file, str) or not raw_session_file.strip():
+            raise ValueError(
+                "session_file: must be a non-empty string path when set "
+                f"(got {type(raw_session_file).__name__!r})"
+            )
+        # Store as-given; session_file_path() handles relative resolution
+        # against the config dir so the stored value remains portable.
+        session_file = Path(raw_session_file).expanduser()
+
     sequential = bool(raw.get("sequential", False))
-    if sequential and groups:
-        raise ValueError(
-            "sequential: true is incompatible with pr_sources.groups — "
-            "remove the groups or set sequential: false"
-        )
 
     from releasy.termlog import configure as _configure_term_log
 
@@ -951,8 +959,7 @@ def load_config(config_path: Path | None = None) -> Config:
         project=project,
         target_branch=raw.get("target_branch") or None,
         update_existing_prs=bool(raw.get("update_existing_prs", False)),
-        features=features,
-        pr_sources=pr_sources,
+        pr_policy=pr_policy,
         notifications=notifications,
         ai_resolve=ai_resolve,
         ai_changelog=ai_changelog,
@@ -962,13 +969,18 @@ def load_config(config_path: Path | None = None) -> Config:
         log_file=log_file,
         push=raw.get("push", False),
         sequential=sequential,
+        session_file=session_file,
     )
     _configure_term_log(log_file)
     return cfg
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:
-    """Persist config back to config.yaml."""
+    """Persist ``config.yaml`` (infrastructure + policy only).
+
+    Session data (``features``, ``pr_sources``) is written by
+    :func:`save_session` — the two files round-trip independently.
+    """
     if config_path is None:
         config_path = config.config_path
 
@@ -994,21 +1006,6 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     if config.update_existing_prs:
         data["update_existing_prs"] = True
 
-    data["features"] = [
-        {
-            k: v
-            for k, v in {
-                "id": f.id,
-                "description": f.description,
-                "source_branch": f.source_branch,
-                "enabled": f.enabled,
-                "depends_on": f.depends_on or None,
-            }.items()
-            if v is not None
-        }
-        for f in config.features
-    ]
-
     if config.work_dir:
         data["work_dir"] = str(config.work_dir)
 
@@ -1019,63 +1016,22 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         except ValueError:
             data["log_file"] = str(config.log_file)
 
-    ps = config.pr_sources
-    if (
-        ps.by_labels or ps.exclude_labels or ps.include_prs
-        or ps.exclude_prs or ps.include_authors or ps.exclude_authors
-        or ps.groups
-        or ps.auto_pr is not True
-        or ps.retry_failed is not True
-        or ps.recreate_closed_prs
-    ):
-        ps_data: dict = {}
-        if ps.by_labels:
-            ps_data["by_labels"] = [
-                {
-                    k: v
-                    for k, v in {
-                        "labels": entry.labels,
-                        "description": entry.description or None,
-                        "merged_only": entry.merged_only or None,
-                        "if_exists": entry.if_exists if entry.if_exists != ps.if_exists else None,
-                    }.items()
-                    if v is not None
-                }
-                for entry in ps.by_labels
-            ]
-        if ps.exclude_labels:
-            ps_data["exclude_labels"] = ps.exclude_labels
-        if ps.include_prs:
-            ps_data["include_prs"] = ps.include_prs
-        if ps.exclude_prs:
-            ps_data["exclude_prs"] = ps.exclude_prs
-        if ps.include_authors:
-            ps_data["include_authors"] = ps.include_authors
-        if ps.exclude_authors:
-            ps_data["exclude_authors"] = ps.exclude_authors
-        if ps.groups:
-            ps_data["groups"] = [
-                {
-                    k: v
-                    for k, v in {
-                        "id": g.id,
-                        "description": g.description or None,
-                        "if_exists": g.if_exists if g.if_exists != ps.if_exists else None,
-                        "prs": g.prs,
-                    }.items()
-                    if v is not None
-                }
-                for g in ps.groups
-            ]
-        if ps.if_exists != "skip":
-            ps_data["if_exists"] = ps.if_exists
-        if ps.auto_pr is not True:
-            ps_data["auto_pr"] = ps.auto_pr
-        if ps.retry_failed is not True:
-            ps_data["retry_failed"] = ps.retry_failed
-        if ps.recreate_closed_prs:
-            ps_data["recreate_closed_prs"] = True
-        data["pr_sources"] = ps_data
+    if config.session_file is not None:
+        data["session_file"] = str(config.session_file)
+
+    pp = config.pr_policy
+    pp_defaults = PRPolicyConfig()
+    pp_data: dict = {}
+    if pp.if_exists != pp_defaults.if_exists:
+        pp_data["if_exists"] = pp.if_exists
+    if pp.auto_pr != pp_defaults.auto_pr:
+        pp_data["auto_pr"] = pp.auto_pr
+    if pp.retry_failed != pp_defaults.retry_failed:
+        pp_data["retry_failed"] = pp.retry_failed
+    if pp.recreate_closed_prs != pp_defaults.recreate_closed_prs:
+        pp_data["recreate_closed_prs"] = pp.recreate_closed_prs
+    if pp_data:
+        data["pr_policy"] = pp_data
 
     notif_data: dict = {}
     if config.notifications.github_project:
@@ -1198,6 +1154,280 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
 
+# ---------------------------------------------------------------------------
+# session.yaml I/O
+# ---------------------------------------------------------------------------
+
+
+def session_file_path(
+    config: Config, cli_override: Path | None = None,
+) -> Path:
+    """Resolve the on-disk path of this project's session file.
+
+    Priority:
+
+    1. ``cli_override`` — ``--session-file`` passed on the command line.
+    2. ``config.session_file`` — the ``session_file:`` key in ``config.yaml``
+       (relative paths resolve against the config dir).
+    3. Default: ``<config-dir>/<name>.session.yaml``.
+    """
+    if cli_override is not None:
+        return Path(cli_override).expanduser().resolve()
+    if config.session_file is not None:
+        p = Path(config.session_file).expanduser()
+        if not p.is_absolute():
+            p = (config.config_path.parent / p).resolve()
+        else:
+            p = p.resolve()
+        return p
+    return (config.config_path.parent / f"{config.name}.session.yaml").resolve()
+
+
+def load_session(
+    config: Config, cli_override: Path | None = None,
+) -> SessionConfig:
+    """Load and validate the session file for ``config``.
+
+    Raises :class:`FileNotFoundError` when the file does not exist —
+    callers decide whether to scaffold one or surface the error. Per-source
+    ``if_exists`` overrides default to ``config.pr_policy.if_exists`` when
+    omitted, and ``sequential: true`` combined with ``pr_sources.groups``
+    is rejected here (instead of in :func:`load_config`) because ``groups``
+    now live in the session file.
+    """
+    path = session_file_path(config, cli_override)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Session file not found: {path}\n"
+            f"Create one with `releasy new` (scaffolds config.yaml + "
+            f"<name>.session.yaml), edit it manually, or point to one "
+            f"explicitly with --session-file."
+        )
+
+    with open(path) as f:
+        raw = yaml.safe_load(f) or {}
+
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Session file must be a YAML mapping, got {type(raw).__name__}: {path}"
+        )
+
+    features: list[FeatureConfig] = []
+    for feat_raw in raw.get("features", []) or []:
+        features.append(
+            FeatureConfig(
+                id=feat_raw["id"],
+                description=feat_raw["description"],
+                source_branch=feat_raw["source_branch"],
+                enabled=feat_raw.get("enabled", True),
+                depends_on=feat_raw.get("depends_on", []),
+            )
+        )
+
+    ps_raw = raw.get("pr_sources", {}) or {}
+    if not isinstance(ps_raw, dict):
+        raise ValueError(
+            f"pr_sources must be a mapping, got {type(ps_raw).__name__}"
+        )
+
+    # Legacy-migration hint: the policy keys used to live here.
+    for legacy in ("if_exists", "auto_pr", "retry_failed", "recreate_closed_prs"):
+        if legacy in ps_raw:
+            raise ValueError(
+                f"pr_sources.{legacy} is no longer accepted in the session "
+                f"file — it moved to pr_policy.{legacy} in config.yaml. "
+                f"Set it there instead."
+            )
+
+    policy_if_exists = config.pr_policy.if_exists
+
+    by_labels: list[PRSourceConfig] = []
+    for entry in ps_raw.get("by_labels", []) or []:
+        raw_labels = entry.get("labels", [])
+        if isinstance(raw_labels, str):
+            raw_labels = [raw_labels]
+        entry_if_exists = entry.get("if_exists", policy_if_exists)
+        if entry_if_exists not in _VALID_IF_EXISTS:
+            raise ValueError(
+                f"pr_sources.by_labels[].if_exists must be one of "
+                f"{_VALID_IF_EXISTS}, got {entry_if_exists!r}"
+            )
+        if "auto_pr" in entry:
+            raise ValueError(
+                f"pr_sources.by_labels[labels={raw_labels!r}].auto_pr is no "
+                "longer supported. Use pr_policy.auto_pr in config.yaml."
+            )
+        by_labels.append(
+            PRSourceConfig(
+                labels=raw_labels,
+                description=entry.get("description", ""),
+                merged_only=entry.get("merged_only", False),
+                if_exists=entry_if_exists,
+            )
+        )
+
+    groups: list[PRGroupConfig] = []
+    seen_group_ids: set[str] = set()
+    seen_group_prs: dict[str, str] = {}  # url -> group id
+    for entry in ps_raw.get("groups", []) or []:
+        gid = entry.get("id")
+        if not gid:
+            raise ValueError("pr_sources.groups[] entries must specify 'id'")
+        if gid in seen_group_ids:
+            raise ValueError(f"pr_sources.groups: duplicate id {gid!r}")
+        seen_group_ids.add(gid)
+        prs_list = entry.get("prs", [])
+        if not isinstance(prs_list, list) or len(prs_list) < 1:
+            raise ValueError(
+                f"pr_sources.groups[{gid!r}].prs must be a non-empty list of PR URLs"
+            )
+        for url in prs_list:
+            if url in seen_group_prs:
+                raise ValueError(
+                    f"PR {url} appears in both groups {seen_group_prs[url]!r} "
+                    f"and {gid!r}"
+                )
+            seen_group_prs[url] = gid
+        group_if_exists = entry.get("if_exists", policy_if_exists)
+        if group_if_exists not in _VALID_IF_EXISTS:
+            raise ValueError(
+                f"pr_sources.groups[{gid!r}].if_exists must be one of "
+                f"{_VALID_IF_EXISTS}, got {group_if_exists!r}"
+            )
+        if "auto_pr" in entry:
+            raise ValueError(
+                f"pr_sources.groups[id={gid!r}].auto_pr is no longer "
+                "supported. Use pr_policy.auto_pr in config.yaml."
+            )
+        groups.append(
+            PRGroupConfig(
+                id=gid,
+                prs=prs_list,
+                description=entry.get("description", ""),
+                if_exists=group_if_exists,
+            )
+        )
+
+    def _str_list(key: str) -> list[str]:
+        """Read a list-of-strings field, tolerating a bare string."""
+        v = ps_raw.get(key, [])
+        if v is None:
+            return []
+        if isinstance(v, str):
+            return [v]
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            raise ValueError(
+                f"pr_sources.{key} must be a list of strings, got {v!r}"
+            )
+        return v
+
+    pr_sources = PRSourcesConfig(
+        by_labels=by_labels,
+        exclude_labels=ps_raw.get("exclude_labels", []) or [],
+        include_prs=ps_raw.get("include_prs", []) or [],
+        exclude_prs=ps_raw.get("exclude_prs", []) or [],
+        include_authors=_str_list("include_authors"),
+        exclude_authors=_str_list("exclude_authors"),
+        groups=groups,
+    )
+
+    if config.sequential and groups:
+        raise ValueError(
+            "sequential: true (in config.yaml) is incompatible with "
+            "pr_sources.groups (in the session file) — remove the groups "
+            "or set sequential: false."
+        )
+
+    return SessionConfig(
+        features=features,
+        pr_sources=pr_sources,
+        session_path=path,
+    )
+
+
+def save_session(session: SessionConfig, path: Path | None = None) -> None:
+    """Persist the session file.
+
+    Uses ``session.session_path`` when ``path`` is omitted; raises
+    :class:`ValueError` if neither is set (nowhere to write).
+    """
+    target = path or session.session_path
+    if target is None:
+        raise ValueError(
+            "save_session: no path to write to — pass `path` or set "
+            "`session.session_path` before calling."
+        )
+
+    data: dict = {}
+
+    data["features"] = [
+        {
+            k: v
+            for k, v in {
+                "id": f.id,
+                "description": f.description,
+                "source_branch": f.source_branch,
+                "enabled": f.enabled,
+                "depends_on": f.depends_on or None,
+            }.items()
+            if v is not None
+        }
+        for f in session.features
+    ]
+
+    ps = session.pr_sources
+    ps_data: dict = {}
+    if ps.by_labels:
+        ps_data["by_labels"] = [
+            {
+                k: v
+                for k, v in {
+                    "labels": entry.labels,
+                    "description": entry.description or None,
+                    "merged_only": entry.merged_only or None,
+                    "if_exists": entry.if_exists,
+                }.items()
+                if v is not None
+            }
+            for entry in ps.by_labels
+        ]
+    if ps.exclude_labels:
+        ps_data["exclude_labels"] = ps.exclude_labels
+    if ps.include_prs:
+        ps_data["include_prs"] = ps.include_prs
+    if ps.exclude_prs:
+        ps_data["exclude_prs"] = ps.exclude_prs
+    if ps.include_authors:
+        ps_data["include_authors"] = ps.include_authors
+    if ps.exclude_authors:
+        ps_data["exclude_authors"] = ps.exclude_authors
+    if ps.groups:
+        ps_data["groups"] = [
+            {
+                k: v
+                for k, v in {
+                    "id": g.id,
+                    "description": g.description or None,
+                    "if_exists": g.if_exists,
+                    "prs": g.prs,
+                }.items()
+                if v is not None
+            }
+            for g in ps.groups
+        ]
+    if ps_data:
+        data["pr_sources"] = ps_data
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "w") as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+
+# ---------------------------------------------------------------------------
+# Stateless helpers
+# ---------------------------------------------------------------------------
+
+
 def make_stateless_config(
     origin_url: str,
     *,
@@ -1214,19 +1444,14 @@ def make_stateless_config(
     """Build an in-memory ``Config`` for the stateless cherry-pick command.
 
     No YAML is read or written. The resulting ``Config`` has a sentinel
-    ``name`` (``"_stateless"``) — callers MUST NOT pass it to
-    ``load_state`` / ``save_state`` / ``project_lock``; the stateless
-    flow deliberately bypasses all per-project persistence.
+    ``name`` (``"_stateless"``) and ``session=None`` — callers MUST NOT
+    pass it to ``load_state`` / ``save_state`` / ``project_lock``; the
+    stateless flow deliberately bypasses all per-project persistence.
 
     ``ai_prompt_file`` defaults to the bundled
     ``src/releasy/prompts/resolve_conflict.md`` so users running
     ``releasy cherry-pick --resolve-conflicts`` don't need to ship a
     template alongside the install.
-
-    ``config_path`` is set to ``<cwd>/<stateless>`` so any relative-path
-    resolution that goes through ``config.repo_dir`` (e.g.
-    ``ai_resolve.prompt_file`` rendering) lands in a sane place even
-    though no real file is read.
     """
     if ai_prompt_file is None:
         bundled = (
@@ -1234,15 +1459,13 @@ def make_stateless_config(
         ).resolve()
         ai_prompt_file = str(bundled)
 
-    project_slug = "stateless"
     return Config(
         name="_stateless",
         origin=OriginConfig(remote=origin_url),
-        project=project_slug,
+        project="stateless",
         target_branch=None,
         update_existing_prs=False,
-        features=[],
-        pr_sources=PRSourcesConfig(auto_pr=auto_pr),
+        pr_policy=PRPolicyConfig(auto_pr=auto_pr),
         notifications=NotificationsConfig(),
         ai_resolve=AIResolveConfig(
             enabled=ai_enabled,
@@ -1256,10 +1479,58 @@ def make_stateless_config(
         work_dir=work_dir.resolve() if work_dir is not None else None,
         push=push,
         sequential=False,
+        session=None,
+        stateless=True,
     )
 
 
-def make_stateless_address_review_config(
+def overlay_address_review_overrides(
+    config: Config,
+    *,
+    claude_command: str | None = None,
+    build_command: str | None = None,
+    prompt_file: str | None = None,
+    timeout_seconds: int | None = None,
+    max_iterations: int | None = None,
+    trusted_reviewers: list[str] | None = None,
+    reply_to_non_addressable: bool | None = None,
+    post_summary_comment: bool | None = None,
+    allowed_tools: list[str] | None = None,
+    extra_args: list[str] | None = None,
+) -> None:
+    """Apply CLI overrides on top of a loaded ``Config`` for
+    ``address-review --stateless``.
+
+    Mutates ``config`` in place. ``None`` arguments leave the existing
+    value untouched — CLI flags that the user didn't pass don't clobber
+    whatever was in ``config.yaml``. When a ``--build-command`` is
+    provided, it also flows into ``ai_resolve.build_command`` so the AI
+    wrapper script the review flow materialises matches the override.
+    """
+    rr = config.review_response
+    if claude_command is not None:
+        rr.command = claude_command
+    if prompt_file is not None:
+        rr.prompt_file = prompt_file
+    if timeout_seconds is not None:
+        rr.timeout_seconds = timeout_seconds
+    if max_iterations is not None:
+        rr.max_iterations = max_iterations
+    if trusted_reviewers is not None:
+        rr.trusted_reviewers = list(trusted_reviewers)
+    if reply_to_non_addressable is not None:
+        rr.reply_to_non_addressable = reply_to_non_addressable
+    if post_summary_comment is not None:
+        rr.post_summary_comment = post_summary_comment
+    if allowed_tools is not None:
+        rr.allowed_tools = list(allowed_tools)
+    if extra_args is not None:
+        rr.extra_args = list(extra_args)
+    if build_command is not None:
+        config.ai_resolve.build_command = build_command
+
+
+def build_stateless_address_review_config(
     *,
     origin_url: str,
     work_dir: Path | None = None,
@@ -1274,24 +1545,13 @@ def make_stateless_address_review_config(
     allowed_tools: list[str] | None = None,
     extra_args: list[str] | None = None,
 ) -> Config:
-    """Build an in-memory ``Config`` for ``releasy address-review --stateless``.
+    """Build an in-memory ``Config`` for ``releasy address-review --stateless``
+    when no ``config.yaml`` is available.
 
-    Mirrors :func:`make_stateless_config` but for the review-response
-    flow: no YAML read, no state file touched, no project lock taken.
-    All review-relevant knobs come from CLI flags (or defaults).
-
-    ``prompt_file`` defaults to the bundled
-    ``src/releasy/prompts/address_review.md`` so ``--stateless`` runs
-    work without any repo-local prompt copy. The AI's build-wrapper
-    script is still materialised from ``build_command`` through
-    ``ai_resolve.build_command`` — passing an empty build command is
-    fine and simply tells the AI "there is no build; do not run the
-    wrapper."
-
-    The returned ``Config`` carries the sentinel ``name="_stateless"``;
-    callers in the address-review flow detect that name and skip
-    :func:`load_state` / :func:`save_state` (see
-    ``review_response._load_tracking_state``).
+    All knobs come from CLI flags. Prefer :func:`load_config` +
+    :func:`overlay_address_review_overrides` when a config file exists —
+    that path inherits AI settings, trusted_reviewers, notifications, etc.
+    from the project's config.
     """
     if prompt_file is None:
         bundled = (
@@ -1323,6 +1583,19 @@ def make_stateless_address_review_config(
         extra_args=list(extra_args or []),
     )
     return base
+
+
+def is_stateless(config: Config) -> bool:
+    """True when ``config`` was built for a stateless flow.
+
+    Set by :func:`make_stateless_config`,
+    :func:`build_stateless_address_review_config`, and the
+    ``address-review --stateless`` CLI path (which loads the real
+    ``config.yaml`` and flips this flag so downstream code skips state
+    I/O). Use this in place of raw name/field checks so the policy lives
+    in one place.
+    """
+    return config.stateless
 
 
 def get_github_token() -> str | None:

@@ -1,0 +1,42 @@
+# RelEasy session — per-effort source data.
+#
+# This file drives *what* to port on a given run: the list of static
+# feature branches and the PR discovery/filtering rules. Policy knobs
+# (auto_pr, if_exists, retry_failed, recreate_closed_prs) live in
+# config.yaml under `pr_policy:` because they don't change between
+# efforts.
+#
+# Edit this file freely between runs. `releasy feature add/enable/
+# disable/remove` also mutates it in place.
+
+# Static feature branches — each rebased onto the base branch as its
+# own port branch.
+features: []
+# features:
+#   - id: s3-disk
+#     description: "Custom S3 disk improvements"
+#     source_branch: feature/my-s3-disk
+#     enabled: true
+
+# PR discovery selectors. Set arithmetic:
+#   union(by_labels) − exclude_labels + include_prs − exclude_prs
+# Author filters (include_authors / exclude_authors) are applied on top;
+# include_authors (when non-empty) restricts to the listed logins and
+# exclude_authors drops them. groups are evaluated independently — every
+# PR listed in any group is ported as that group.
+# pr_sources:
+#   by_labels:
+#     - labels: ["forward-port"]
+#       description: "Forward-ported changes"
+#       merged_only: true
+#   exclude_labels: ["do-not-port", "wontfix"]
+#   include_prs:
+#     - https://github.com/<owner>/<repo>/pull/123
+#   exclude_prs:
+#     - https://github.com/<owner>/<repo>/pull/456
+#   groups:
+#     - id: my-feature
+#       description: "Multi-PR feature"
+#       prs:
+#         - https://github.com/<owner>/<repo>/pull/500
+#         - https://github.com/<owner>/<repo>/pull/501

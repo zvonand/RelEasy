@@ -1,12 +1,38 @@
+# RelEasy config.yaml — stable infrastructure for ONE project.
+#
+# Three files make up a project's on-disk footprint:
+#
+#   1. config.yaml            — this file. Origin, target branch, AI
+#                               settings, notifications, pr_policy. Rarely
+#                               edited once a project is set up.
+#   2. <name>.session.yaml    — per-effort source data: the `features:`
+#                               list and `pr_sources:` selectors. Edit this
+#                               between runs as your target work changes.
+#                               Lives next to config.yaml by default; point
+#                               elsewhere with `session_file:` below or
+#                               `--session-file` on the CLI.
+#   3. <name>.state.yaml      — runtime progress. Managed by RelEasy; lives
+#                               in ${XDG_STATE_HOME:-~/.local/state}/releasy/.
+#
+# `releasy --stateless` (e.g. `address-review --stateless`) loads THIS file
+# (overridable with `--config`) but skips the session and state files.
+
 # ── Project identity (required) ─────────────────────────────────────
 # Unique slug for this project on this machine. Doubles as the filename
-# of the per-project state file under
-#   ${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml
+# of the per-project state file and (by default) the session file:
+#   state:   ${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml
+#   session: <dir-of-this-config>/<name>.session.yaml
 # Allowed characters: A-Z a-z 0-9 . _ - (1-64 chars). Pick something
 # stable like the target branch you are porting onto. Renaming this
 # orphans the old state file — use `releasy adopt` to rebind state to a
 # moved/renamed config.
 name: antalya-26.3
+
+# ── Session file (optional override) ────────────────────────────────
+# By default the session file lives at `<config-dir>/<name>.session.yaml`.
+# Set this to point somewhere else (absolute or relative to this file's
+# directory). The CLI `--session-file <path>` always takes precedence.
+# session_file: sessions/antalya-26.3.session.yaml
 
 # ── Push & PR control ───────────────────────────────────────────────
 # Push branches to origin and open PRs.
@@ -26,7 +52,8 @@ name: antalya-26.3
 #      non-zero status and changes nothing.
 #
 # Default: false (batch mode — every discovered PR is ported in one go).
-# Incompatible with pr_sources.groups (config load will fail).
+# Incompatible with `pr_sources.groups` in the session file (session
+# load will fail).
 # sequential: false
 
 # ── Conflict handling ───────────────────────────────────────────────
@@ -96,150 +123,58 @@ project: antalya
 # The base branch must already exist on origin before running.
 target_branch: antalya-26.3
 
-# ── Static feature branches ────────────────────────────────────────
-# Each feature is rebased onto the base branch as a separate branch.
-# PRs can be auto-created into the base branch (if push + pr_sources.auto_pr).
-features:
-  - id: s3-disk
-    description: "Custom S3 disk improvements"
-    source_branch: feature/antalya-s3-disk
-    enabled: true
-
-  - id: keeper-cfg
-    description: "Keeper config extensions"
-    source_branch: feature/antalya-keeper-cfg
-    enabled: true
-
-  - id: observability
-    description: "Observability hooks"
-    source_branch: feature/antalya-observability
-    enabled: false
-
-  # Feature that depends on another:
-  # - id: disk-cache
-  #   description: "Shared disk cache layer"
-  #   source_branch: feature/antalya-disk-cache
-  #   depends_on: [s3-disk]
-  #   enabled: true
-
-# ── PR sources ────────────────────────────────────────────────────
-# Discover, include, and exclude PRs from the origin repo.
-# Each matching PR becomes its own feature branch.
-# Requires RELEASY_GITHUB_TOKEN.
+# ── PR policy ──────────────────────────────────────────────────────
+# Policy knobs that apply to EVERY discovered unit (by_labels entries,
+# explicit include_prs, groups, …). These live here — not in the
+# session file — because they're stable infrastructure: what to do
+# with branches, when to retry, whether to open PRs. Edit the session
+# file to change *what* to port; edit pr_policy to change *how*.
 #
-# Set arithmetic (evaluated in order):
+# All values shown below are defaults; omit pr_policy entirely to
+# accept them all.
 #
-#   union(by_labels) − exclude_labels + include_prs − exclude_prs
-#
-# by_labels — label-based discovery. Each entry uses AND logic (PR
-#   must carry ALL listed labels). Multiple entries are unioned.
-#   Per-entry options:
-#     merged_only: true — skip open PRs, only cherry-pick merged ones.
-#     if_exists: skip|recreate — overrides pr_sources.if_exists for this group.
-#     description: prefix prepended to the PR title for the feature name.
-#
-# auto_pr is global (top-level under pr_sources, default true): when true
-#   every pushed port branch — singleton, by_labels, include_prs, or
-#   group — gets a PR opened against the base. Set to false to push
-#   branches only and open PRs manually. Requires push: true.
-#
-# exclude_labels — drop any PR carrying at least one of these labels,
-#   even if it matched a by_labels entry.
-#
-# include_prs — always include these PRs by URL, even if they don't
-#   match any labels or carry an excluded label. URLs may point to ANY
-#   public GitHub repo (not just origin); cross-repo PRs are fetched
-#   directly from the URL — no extra git remote is added. Their port
-#   branches get a slug-prefixed name (feature/<base>/<owner>-<repo>-pr-<N>)
-#   so a same-numbered origin PR can never clash.
-#
-# exclude_prs — always exclude these PRs by URL. Final override —
-#   a PR listed here is never processed. Matched by full owner/repo/number,
-#   so excluding e.g. ClickHouse/ClickHouse#42 won't drop Altinity/ClickHouse#42.
-#
-# if_exists — what to do with stale local state from a previous run:
-#     "skip" (default) — leave the local branch alone, don't re-process.
-#                        Also: refuse to start if a cherry-pick / merge /
-#                        rebase is still in progress in the work dir.
-#     "recreate"       — delete the local branch and rebuild it from the
-#                        base branch. Also: if a cherry-pick / merge /
-#                        rebase is in progress at startup, abort it
-#                        (`git cherry-pick --abort` + reset --hard +
-#                        clean -fd) and start fresh.
-#
-# Note: if the branch already exists on the remote it is ALWAYS skipped,
-# regardless of this setting. Resolve those manually so you don't
-# clobber someone else's work. Exception: when recreate_closed_prs is
-# true and the stored rebase PR was closed without merging, RelEasy picks
-# a new name ``feature/<base>/<id>-1``, ``-2``, … (first unused) and runs
-# the port again.
-#
-# recreate_closed_prs — when false (default), a remote port branch still
-#   causes the unit to be skipped. When true, if state has rebase_pr_url
-#   and that GitHub PR is closed (not merged), allocate ``<canonical>-N``
-#   and cherry-pick + open a fresh PR to the target branch.
-#
-# retry_failed — when a PR unit has a `conflict` entry in state from a
-#   previous run:
-#     true  (default) — discard the existing local / remote port branch
-#                       and re-run the cherry-pick from base. Handy
-#                       after fixing a bug, topping up Anthropic credits,
-#                       or otherwise resolving whatever caused the
-#                       original failure.
-#     false           — leave the conflicted entry exactly as-is; no
-#                       cherry-pick, no PR side-effects.
-#   The CLI flag `--retry-failed / --no-retry-failed` overrides this
-#   per-invocation.
-#
-# PRs are processed in merge order (earliest merged first).
-#
-# pr_sources:
+# pr_policy:
 #   if_exists: skip
-#   # retry_failed: true   # default; set false to leave conflicted entries alone
-#   # recreate_closed_prs: false   # default; true → new -1/-2 branch after closed rebase PR
-#   # auto_pr: true        # default; set false to push branches without opening PRs
-#   by_labels:
-#     - labels: ["forward-port", "v26.1"]
-#       description: "Forward-ported changes"
-#       merged_only: true
-#       # if_exists: recreate    # override per-group
+#     # When the port branch already exists locally:
+#     # "skip"     (default) — leave the local branch alone; don't re-process.
+#     #                        Also: refuse to start if a cherry-pick / merge
+#     #                        / rebase is still in progress in the work dir.
+#     # "recreate"           — delete the local branch and rebuild from base.
+#     #                        Also: if a cherry-pick / merge / rebase is in
+#     #                        progress at startup, abort it and start fresh.
+#     # Note: if the branch already exists on the REMOTE it is ALWAYS skipped,
+#     # regardless of this setting (resolve those manually so you don't
+#     # clobber someone else's work). Individual session entries
+#     # (pr_sources.by_labels[] / pr_sources.groups[]) can override this
+#     # default per-entry with their own if_exists.
+#   auto_pr: true
+#     # When true (the default), every pushed port branch gets a PR opened
+#     # against the base. Set to false to push branches only and open PRs
+#     # manually. Requires push: true to have any effect.
+#   retry_failed: true
+#     # When a PR unit has a `conflict` entry in state from a previous run:
+#     #   true (default) — discard the existing local/remote port branch and
+#     #                    re-run the cherry-pick from base. Handy after
+#     #                    fixing a bug, topping up Anthropic credits, etc.
+#     #   false          — leave the conflicted entry exactly as-is; no
+#     #                    cherry-pick, no PR side-effects.
+#     # CLI flag `--retry-failed / --no-retry-failed` overrides per-invocation.
+#   recreate_closed_prs: false
+#     # When true, if state has a rebase_pr_url and that GitHub PR is closed
+#     # (not merged), allocate `<canonical>-1`, `-2`, … for the port branch
+#     # name and cherry-pick + open a fresh PR. Off by default: a closed
+#     # rebase PR just leaves the branch skipped on subsequent runs.
+
+# ── PR sources and features ─────────────────────────────────────────
+# These live in the session file, not here. Look for
+# `<name>.session.yaml` next to this config (or wherever `session_file:`
+# above points). The session file is where you edit:
 #
-#   exclude_labels: ["do-not-port", "wontfix"]
+#   * `features:` — the static list of feature branches to rebase.
+#   * `pr_sources:` — label-based discovery, explicit include/exclude,
+#                     author filters, groups, etc.
 #
-#   include_prs:
-#     - https://github.com/Altinity/ClickHouse/pull/123
-#     - https://github.com/Altinity/ClickHouse/pull/456
-#     # Cross-repo PR — fetched directly from the source repo by URL.
-#     - https://github.com/ClickHouse/ClickHouse/pull/12345
-#
-#   exclude_prs:
-#     - https://github.com/Altinity/ClickHouse/pull/789
-#
-#   # Sequential PR groups: cherry-pick multiple PRs onto a SINGLE port
-#   # branch (in listed order) and open ONE combined PR for the whole
-#   # group. Use this when PR #B depends on PR #A and they should land
-#   # together. The group `id` becomes the feature id and the branch
-#   # name (feature/<base>/<id>). Each PR can appear in at most ONE
-#   # group; PRs in groups are removed from the singleton stream.
-#   #
-#   # `exclude_prs` and `exclude_labels` still drop individual PRs from
-#   # a group; if a group ends up empty it is skipped with a warning.
-#   #
-#   # AI conflict resolution works per cherry-pick step inside a group:
-#   # if any PR in the group conflicts, Claude resolves+builds+commits
-#   # locally, then the next PR in the group is cherry-picked. Each PR
-#   # produces one commit on the branch (with a `Source-PR: #N` trailer
-#   # for clean attribution). After all PRs are applied, RelEasy pushes
-#   # the branch and opens ONE combined PR; if any step needed AI, the
-#   # PR is tagged `ai_resolve.label`.
-#   groups:
-#     - id: iceberg-rest-catalog
-#       description: "Iceberg REST catalog support"
-#       prs:
-#         - https://github.com/Altinity/ClickHouse/pull/1500   # base change
-#         - https://github.com/Altinity/ClickHouse/pull/1512   # follow-up
-#         - https://github.com/Altinity/ClickHouse/pull/1530   # final fix
-#       # if_exists: skip     # override the global pr_sources.if_exists
+# See the bundled session template for the full reference.
 
 # ── GitHub Project board ────────────────────────────────────────────
 # Sync branch status to a GitHub Project v2 board (optional).
@@ -325,10 +260,16 @@ notifications:
 # ─────────────────────────────────────────────────────────────────────
 # REVIEW RESPONSE (`releasy address-review`)
 #
-# Stateless command that reads review comments left on a PR and lets
-# the AI make code changes addressing the feedback. Off by default
-# because it spends Anthropic tokens every call and writes to your PR
-# branch.
+# Reads review comments left on a PR and lets the AI make code
+# changes addressing the feedback. Off by default because it spends
+# Anthropic tokens every call and writes to your PR branch.
+#
+# Runs in two modes:
+#   * Default            — loads this config, takes the project lock,
+#                          records timestamps in state for tracked PRs.
+#   * `--stateless`      — loads this config, but skips session/state/lock.
+#                          CLI flags (--origin / --build-command / ...)
+#                          override anything in config.
 #
 # Every comment is filtered to an explicit allowlist of trusted
 # reviewers BEFORE the AI sees it — untrusted commenters cannot smuggle
@@ -367,7 +308,7 @@ notifications:
 #   releasy run --onto v26.3.4.234-lts   # (or just: releasy run, when
 #                                        #  target_branch is set above)
 #   → creates "feature/antalya-26.3/<id>" for each PR / feature
-#   → opens PRs into antalya-26.3 (if push + pr_sources.auto_pr)
+#   → opens PRs into antalya-26.3 (if push + pr_policy.auto_pr)
 #
 # On unresolved conflict:
 #   * Singleton / first-of-group: nothing local survives — the entry is

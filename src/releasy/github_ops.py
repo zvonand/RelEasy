@@ -572,7 +572,7 @@ def fetch_pr_comments(
 def rebase_pr_was_closed_without_merge(config: Config, pr_url: str) -> bool:
     """True when the port / rebase PR exists on GitHub but is closed unmerged.
 
-    Used with ``pr_sources.recreate_closed_prs`` to open a fresh port branch
+    Used with ``pr_policy.recreate_closed_prs`` to open a fresh port branch
     (``<canonical>-1``, ``-2``, …) after the previous rebase PR was closed.
     Returns ``False`` when the PR is open, merged, the URL is invalid, or the
     lookup fails (missing token, network error) — callers treat unknown as

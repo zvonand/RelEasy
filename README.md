@@ -6,6 +6,16 @@ RelEasy automates porting features and PRs onto a stable **base branch** (a tag/
 
 A single machine can drive **multiple ongoing porting projects in parallel** (e.g. an antalya-26.3 forward-port and an antalya-25.8 backport). Each project has its own `config.yaml` with a unique `name:`; pipeline state lives outside your repo under `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml`, and a per-project lock keeps concurrent runs of the same project serialized while runs of *different* projects truly run in parallel.
 
+Each project spreads across three files with clear responsibilities:
+
+| File | What | Lifetime |
+|------|------|----------|
+| `config.yaml` | Stable infrastructure: origin remote, work_dir, target branch, AI settings, notifications, `pr_policy`. | Edited once at setup, rarely touched. |
+| `<name>.session.yaml` | Per-effort source data: `features:` list, `pr_sources:` selectors (labels, include/exclude PR URLs, groups, author filters). Lives next to `config.yaml` by default; point elsewhere with `session_file:` in config or `--session-file` on the CLI. | Edited between runs as your target work changes. |
+| `<name>.state.yaml` | Runtime progress managed by RelEasy. Lives under `${XDG_STATE_HOME:-~/.local/state}/releasy/`. | Never edited by hand. |
+
+`releasy --stateless` (e.g. `address-review --stateless`) loads `config.yaml` but skips the session and state files — useful for one-off runs where CLI flags supply everything session data would otherwise provide.
+
 ## TL;DR
 
 ```bash
@@ -13,7 +23,8 @@ export RELEASY_GITHUB_TOKEN="ghp_..."
 
 mkdir -p ~/work/antalya-26.3 && cd ~/work/antalya-26.3
 releasy new --target-branch antalya-26.3 --project antalya
-$EDITOR config.yaml          # fill in origin remote, work_dir, push: true, …
+$EDITOR config.yaml                     # origin remote, work_dir, push: true, …
+$EDITOR antalya-26.3.session.yaml       # features + pr_sources
 releasy run
 ```
 
@@ -30,10 +41,10 @@ feature/antalya-26.3/pr-99:   * --- feat  (PR → antalya-26.3)
 
 Given an existing base branch on origin, `releasy run`:
 
-1. Discovers PRs from `pr_sources` (labels, explicit include/exclude lists, groups).
+1. Discovers PRs from `pr_sources` in the session file (labels, explicit include/exclude lists, groups).
 2. For each PR / group, creates a port branch `feature/<base>/<id>` from the base.
 3. Cherry-picks the PR merge commit(s) onto the port branch.
-4. Pushes and opens a PR into the base (if `push: true` and `pr_sources.auto_pr: true` — the default).
+4. Pushes and opens a PR into the base (if `push: true` and `pr_policy.auto_pr: true` — the default).
 
 On conflict, the pipeline stops with instructions. Resolve, run `releasy continue`, then `releasy run` again to resume with the remaining PRs.
 
@@ -62,21 +73,25 @@ pip install -e .
 
 ## Quick Start
 
-1. Scaffold a config in a fresh directory (one per project):
+1. Scaffold a config + session pair in a fresh directory (one per project):
 
 ```bash
 mkdir -p ~/work/antalya-26.3 && cd ~/work/antalya-26.3
 releasy new --target-branch antalya-26.3 --project antalya
 # /home/<you>/work/antalya-26.3/config.yaml
+# /home/<you>/work/antalya-26.3/antalya-26.3.session.yaml
 ```
 
-`releasy new` writes a minimal `config.yaml` and prints its absolute path
-to stdout (everything else goes to stderr) so it composes cleanly with
-shell substitution. See [`config.yaml.example`](config.yaml.example) for
-the fully-documented reference of every available option.
+`releasy new` writes a minimal `config.yaml` plus a sibling
+`<name>.session.yaml` and prints the config's absolute path to stdout
+(everything else goes to stderr) so it composes cleanly with shell
+substitution. See [`config.yaml.example`](config.yaml.example) and
+[`session.yaml.example`](session.yaml.example) for fully-documented
+references.
 
 2. Edit `config.yaml` to fill in `origin.remote`, optionally `work_dir`,
-   `push: true`, `pr_sources`, `ai_resolve`, and `notifications`.
+   `push: true`, `pr_policy`, `ai_resolve`, and `notifications`. Edit
+   the session file to declare `features:` and `pr_sources:`.
 
 3. Set up authentication:
 
@@ -144,13 +159,23 @@ to rebind state to the new path.
 
 ## Configuration
 
-See [`config.yaml.example`](config.yaml.example) for a fully documented template.
+See [`config.yaml.example`](config.yaml.example) and
+[`session.yaml.example`](session.yaml.example) for fully documented
+templates.
+
+### config.yaml (stable infrastructure)
 
 ```yaml
 # Unique slug for this project on this machine (required).
 # Keys the per-project state file under
 #   ${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml
+# and the session file at
+#   <config-dir>/<name>.session.yaml
 name: antalya-26.3
+
+# Optional override for the session file path. Relative paths resolve
+# against this config's directory. CLI `--session-file` always wins.
+# session_file: sessions/antalya-26.3.session.yaml
 
 # Push branches and open PRs (default: false — everything stays local)
 push: true
@@ -169,6 +194,18 @@ project: antalya
 # When set, --onto becomes optional on the CLI.
 target_branch: antalya-26.3
 
+# Policy knobs applied to every discovered PR / group.
+# All fields optional; shown below are the defaults.
+# pr_policy:
+#   if_exists: skip
+#   auto_pr: true
+#   retry_failed: true
+#   recreate_closed_prs: false
+```
+
+### <name>.session.yaml (per-effort source data)
+
+```yaml
 # Static feature branches
 features:
   - id: s3-disk
@@ -217,17 +254,21 @@ pr_sources:
         - https://github.com/Altinity/ClickHouse/pull/1530
 ```
 
-### Key config options
+### Key options
+
+Options in the table below live in **config.yaml** unless marked
+*(session)*, which means they live in the session file.
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `name` | Unique slug identifying this project on this machine (required). Keys `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml`. Allowed: `A-Z a-z 0-9 . _ -` (1-64 chars). | — |
+| `name` | Unique slug identifying this project on this machine (required). Keys `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml` and (by default) `<config-dir>/<name>.session.yaml`. Allowed: `A-Z a-z 0-9 . _ -` (1-64 chars). | — |
+| `session_file` | Override the session file path. Relative paths resolve against the config's directory. | `<config-dir>/<name>.session.yaml` |
 | `push` | Push branches and open PRs | `false` |
 | `work_dir` | Path to existing repo clone (or where to clone) | cwd |
 | `origin.remote` | Origin repo URL (required) | — |
 | `project` | Short project identifier (used in derived branch names) | — |
 | `target_branch` | Explicit base branch; makes `--onto` optional | derived |
-| `sequential` | Process the merged-time-sorted PR queue one PR per `releasy run` / `releasy continue` invocation. Each invocation requires the previously opened rebase PR to have been merged into `target_branch` before porting the next one. Incompatible with `pr_sources.groups`. | `false` |
+| `sequential` | Process the merged-time-sorted PR queue one PR per `releasy run` / `releasy continue` invocation. Each invocation requires the previously opened rebase PR to have been merged into `target_branch` before porting the next one. Incompatible with session `pr_sources.groups`. | `false` |
 | `update_existing_prs` | When a PR already exists for a port branch: `true` = reuse it and overwrite its title/body; `false` = leave it exactly as-is | `false` |
 | `ai_resolve.max_iterations` | Hard cap (passed to Claude) on build attempts per conflict | `5` |
 | `ai_resolve.api_retries` | Re-invoke Claude on transient Anthropic API errors (separate from `max_iterations`) | `3` |
@@ -246,21 +287,27 @@ pr_sources:
 | `review_response.prompt_file` | Prompt template for review-response runs. | `prompts/address_review.md` |
 | `review_response.max_iterations` | Hard cap on build attempts the AI may make per address-review run. | `15` |
 | `review_response.timeout_seconds` | Per-invocation Claude timeout. | `7200` |
-| `pr_sources.auto_pr` | Open a PR for every pushed port branch (singletons, by_labels, include_prs, groups). Requires `push: true`. | `true` |
-| `pr_sources.by_labels[].labels` | Labels a PR must have (AND logic) | — |
-| `pr_sources.by_labels[].merged_only` | Only include merged PRs | `false` |
-| `pr_sources.by_labels[].if_exists` | Override `pr_sources.if_exists` per group | inherits |
-| `pr_sources.exclude_labels` | Drop PRs carrying any of these labels | `[]` |
-| `pr_sources.include_authors` | Allowlist of GitHub logins (case-insensitive); when set, only PRs by these authors are kept. Bypassed by `include_prs`. | `[]` |
-| `pr_sources.exclude_authors` | Drop PRs by these GitHub logins (case-insensitive). Bypassed by `include_prs`. | `[]` |
-| `pr_sources.include_prs` | Always include these PRs (by URL) | `[]` |
-| `pr_sources.exclude_prs` | Always exclude these PRs (by URL) | `[]` |
-| `pr_sources.groups[].id` | Group id; becomes feature id and branch name (`feature/<base>/<id>`) | — |
-| `pr_sources.groups[].prs` | Ordered list of PR URLs to cherry-pick onto a single branch and combine into one PR | — |
-| `pr_sources.groups[].description` | Title text for the combined PR | id |
-| `pr_sources.groups[].if_exists` | Override `pr_sources.if_exists` per group | inherits |
-| `pr_sources.if_exists` | When a port branch exists *locally only*: `skip` or `recreate`. Also: with `recreate`, an in-progress cherry-pick / merge / rebase at startup is auto-aborted; with `skip` the pipeline halts. Branches that already exist on the remote are always skipped. | `skip` |
-| `pr_sources.retry_failed` | When a PR unit has a `conflict` entry in state from a previous run: `true` discards the existing local / remote port branch and re-runs the cherry-pick from base; `false` leaves the entry exactly as-is. Overridable per-invocation with `--retry-failed` / `--no-retry-failed` on `releasy run`. | `true` |
+| `pr_policy.auto_pr` | Open a PR for every pushed port branch (singletons, by_labels, include_prs, groups). Requires `push: true`. | `true` |
+| `pr_policy.if_exists` | Default for session-file source entries that don't set their own: when a port branch exists *locally only*, `skip` or `recreate`. With `recreate`, an in-progress cherry-pick / merge / rebase at startup is auto-aborted; with `skip` the pipeline halts. Branches that already exist on the remote are always skipped. | `skip` |
+| `pr_policy.retry_failed` | When a PR unit has a `conflict` entry in state from a previous run: `true` discards the existing local / remote port branch and re-runs the cherry-pick from base; `false` leaves the entry exactly as-is. Overridable per-invocation with `--retry-failed` / `--no-retry-failed` on `releasy run`. | `true` |
+| `pr_policy.recreate_closed_prs` | When `true`, if state has a `rebase_pr_url` and that GitHub PR is closed (not merged), allocate `<canonical>-1`, `-2`, … for the port branch and cherry-pick + open a fresh PR. Off by default. | `false` |
+| `pr_sources.by_labels[].labels` *(session)* | Labels a PR must have (AND logic) | — |
+| `pr_sources.by_labels[].merged_only` *(session)* | Only include merged PRs | `false` |
+| `pr_sources.by_labels[].if_exists` *(session)* | Override `pr_policy.if_exists` per entry | inherits |
+| `pr_sources.exclude_labels` *(session)* | Drop PRs carrying any of these labels | `[]` |
+| `pr_sources.include_authors` *(session)* | Allowlist of GitHub logins (case-insensitive); when set, only PRs by these authors are kept. Bypassed by `include_prs`. | `[]` |
+| `pr_sources.exclude_authors` *(session)* | Drop PRs by these GitHub logins (case-insensitive). Bypassed by `include_prs`. | `[]` |
+| `pr_sources.include_prs` *(session)* | Always include these PRs (by URL) | `[]` |
+| `pr_sources.exclude_prs` *(session)* | Always exclude these PRs (by URL) | `[]` |
+| `pr_sources.groups[].id` *(session)* | Group id; becomes feature id and branch name (`feature/<base>/<id>`) | — |
+| `pr_sources.groups[].prs` *(session)* | Ordered list of PR URLs to cherry-pick onto a single branch and combine into one PR | — |
+| `pr_sources.groups[].description` *(session)* | Title text for the combined PR | id |
+| `pr_sources.groups[].if_exists` *(session)* | Override `pr_policy.if_exists` per group | inherits |
+| `features[].id` *(session)* | Feature id; used as branch suffix `feature/<base>/<id>` | — |
+| `features[].source_branch` *(session)* | Existing branch holding the feature's commits | — |
+| `features[].description` *(session)* | Shown in the PR title and project board | — |
+| `features[].enabled` *(session)* | Whether this feature is active on the next run | `true` |
+| `features[].depends_on` *(session)* | Ordered list of feature ids that must be ported first | `[]` |
 
 ### Environment variables
 
@@ -281,6 +328,7 @@ does and when to reach for it.
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--config <path>` | Path to `config.yaml` | `./config.yaml` |
+| `--session-file <path>` | Path to the session file. Overrides the `session_file:` key in config.yaml. | `<config-dir>/<name>.session.yaml` |
 | `--version` | Print version and exit | — |
 
 ### At a glance: which command does what
@@ -342,7 +390,7 @@ The five commands you'll touch on a regular release cycle.
 
 The main pipeline. Discovers PRs from `pr_sources`, creates a port branch
 per PR/group from `origin/<base_branch>`, cherry-picks the merge commit(s),
-and (when `push: true` and `pr_sources.auto_pr: true`) opens a PR per port
+and (when `push: true` and `pr_policy.auto_pr: true`) opens a PR per port
 into the base. AI-resolves **cherry-pick** conflicts inline when
 `ai_resolve.enabled` is on. Unresolved conflicts are dropped (singletons
 / first-of-group) or opened as draft PRs labelled `ai-needs-attention`
@@ -365,7 +413,7 @@ releasy run [--onto <tag-or-sha>] [--work-dir <path>]
 | `--onto <ver>` | Version label used to derive `<project>-<version>` if `target_branch` is unset. Just a string — never resolved as a git ref. | from `target_branch` |
 | `--work-dir <path>` | Working directory for git operations (overrides config `work_dir`). | from config / cwd |
 | `--resolve-conflicts` / `--no-resolve-conflicts` | Toggle the AI resolver. The flag is a kill-switch: AI runs only if both this *and* `ai_resolve.enabled` are true. | on |
-| `--retry-failed` / `--no-retry-failed` | Re-attempt PR units whose previous run ended in `conflict` status: discard the existing local / remote port branch and re-run the cherry-pick from base. With `--no-retry-failed`, those entries are left exactly as-is. | from `pr_sources.retry_failed` (true) |
+| `--retry-failed` / `--no-retry-failed` | Re-attempt PR units whose previous run ended in `conflict` status: discard the existing local / remote port branch and re-run the cherry-pick from base. With `--no-retry-failed`, those entries are left exactly as-is. | from `pr_policy.retry_failed` (true) |
 
 Exit code: `1` if any port ended up in `conflict` status, `0` otherwise.
 
@@ -461,13 +509,13 @@ releasy address-review --pr <URL>
 | `--reviewer <login>` | GitHub login (repeatable). Adds to `review_response.trusted_reviewers`; authoritative on its own (does not have to be in the config list first). Case-insensitive. | `[]` |
 | `--since <URL\|ISO8601>` | Only consider comments newer than this reference. Two forms: a GitHub comment URL (`…#issuecomment-<id>` / `#discussion_r<id>` / `#pullrequestreview-<id>`) → everything **strictly after** that comment; or an ISO-8601 timestamp → comments at or after that moment. Omit to consider every comment (or, in stateful mode, everything after the previous `address-review` run on this PR). | auto from state; else every comment |
 | `--reply` / `--no-reply` | Post an in-thread reply (with a bot footer) on every comment the AI classifies as non-actionable. Overrides `review_response.reply_to_non_addressable`. | on |
-| `--stateless` | Bypass `config.yaml` entirely — no config read, no state file, no project lock. All inputs come from CLI flags (see below). Origin is derived from `--pr` (https form) unless you pass `--origin`. | off |
-| `--origin <URL>` | (stateless only) Origin remote URL to push to. Use when you need ssh instead of https. | derived from `--pr` |
-| `--build-command <cmd>` | (stateless only) Shell command the AI may run to verify changes compile. Empty ⇒ no build. | empty |
-| `--claude-command <path>` | (stateless only) Executable used to invoke Claude. | `claude` |
-| `--prompt-file <path>` | (stateless only) Prompt template path. | bundled |
-| `--timeout <seconds>` | (stateless only) Per-invocation Claude timeout. | `7200` |
-| `--max-iterations <n>` | (stateless only) Build-attempt cap. | `15` |
+| `--stateless` | Skip the session and state files (no project lock, no ownership check, no state I/O). `config.yaml` IS still loaded from the usual `--config` / cwd resolution and supplies AI settings, trusted_reviewers, etc. If no `config.yaml` is found, a synthetic config is built from CLI flags alone. | off |
+| `--origin <URL>` | (stateless only) Override the origin remote URL from config (or derive it from `--pr` when no config). Use when you need ssh instead of https. | config value, or derived from `--pr` |
+| `--build-command <cmd>` | (stateless only) Shell command the AI may run to verify changes compile. Overrides `ai_resolve.build_command` in config. Empty ⇒ no build. | config value |
+| `--claude-command <path>` | (stateless only) Executable used to invoke Claude. Overrides `review_response.command` in config. | config value / `claude` |
+| `--prompt-file <path>` | (stateless only) Prompt template path. Overrides `review_response.prompt_file`. | config value / bundled |
+| `--timeout <seconds>` | (stateless only) Per-invocation Claude timeout. Overrides `review_response.timeout_seconds`. | config value / `7200` |
+| `--max-iterations <n>` | (stateless only) Build-attempt cap. Overrides `review_response.max_iterations`. | config value / `15` |
 | `--post-summary-comment` | (stateless only) Also post one top-level summary comment on the PR. | off |
 | `--work-dir <path>` | Working directory for git operations. | from config / cwd |
 | `--dry-run` | Fetch + print the filtered comment list, then exit. No AI, no push. | off |
@@ -480,23 +528,32 @@ answered by the commit that fixes them (the commit message references
 the comment URL). Pass `--no-reply` for a silent run that only reports
 via the AI's terminal narration.
 
-**`--stateless` mode** — for one-off runs against a PR you don't have
-a project config for:
+**`--stateless` mode** — for ad-hoc runs that should skip the session
+and state files (e.g. addressing a reviewer's feedback without taking
+the project lock or recording a timestamp):
 
 ```bash
+# Inside a project dir — config.yaml is still picked up for AI settings
+# and trusted reviewers; CLI flags override where you need them.
+cd ~/work/antalya-26.3
+releasy address-review --stateless \
+  --pr https://github.com/Altinity/ClickHouse/pull/1687 \
+  --reviewer ianton-ru
+
+# With no project config available — everything comes from CLI flags.
 releasy address-review --stateless \
   --pr https://github.com/Altinity/ClickHouse/pull/1687 \
   --reviewer ianton-ru \
   --work-dir ~/work/ClickHouse \
-  --build-command "cd build && ninja"      # optional
+  --build-command "cd build && ninja"
 ```
 
-No `config.yaml` is read, no state file is touched, no project lock is
-taken. Origin is derived from the PR URL (https form); pass `--origin
-git@github.com:...` if you need ssh. The stateless-only flags
-(`--origin`, `--build-command`, `--claude-command`, `--prompt-file`,
-`--timeout`, `--max-iterations`, `--post-summary-comment`) are
-rejected without `--stateless` so the intent stays unambiguous.
+`config.yaml` is loaded when present (use `--config <path>` to pick a
+specific one); the session and state files are always skipped. The
+stateless-only override flags (`--origin`, `--build-command`,
+`--claude-command`, `--prompt-file`, `--timeout`, `--max-iterations`,
+`--post-summary-comment`) are rejected without `--stateless` so the
+intent stays unambiguous.
 
 Config (entirely optional — the command works with just
 `--reviewer <login>` on the CLI):
@@ -583,7 +640,7 @@ invocation:
 
 Constraints:
 
-- **Incompatible with `pr_sources.groups`** — config load fails with a
+- **Incompatible with session `pr_sources.groups`** — session load fails with a
   clear error. Use `include_prs` instead (or split the group into
   individual PRs).
 - Requires `target_branch:` in config (no `--onto` derivation in
@@ -658,6 +715,10 @@ releasy new [--name <slug>] [--target-branch <branch>] [--project <id>] [--out <
 | `--target-branch <branch>` | Seeds `target_branch:` in the new config. Also drives the auto-generated name (`<target-branch>-<6hex>`) when `--name` is omitted. | empty |
 | `--project <id>` | Seeds `project:` in the new config. | empty |
 | `--out <path>` | Where to write the new file. Refuses to overwrite an existing file. | `./config.yaml` |
+
+`releasy new` writes TWO files side-by-side: `config.yaml` at `--out`
+and `<name>.session.yaml` in the same directory. Refuses to overwrite
+either if one already exists.
 
 When `--name` is omitted, the new project gets a 6-hex suffix from a
 CSPRNG so back-to-back `releasy new --target-branch X` calls produce
@@ -761,10 +822,10 @@ releasy release \
 
 ### Feature management
 
-`features:` in `config.yaml` lists static port targets — branches that
+`features:` in the session file lists static port targets — branches that
 already exist somewhere and need to be re-applied onto each base. PR
-sources (`pr_sources.*`) are the dynamic counterpart; this group manages
-the static list.
+sources (`pr_sources.*`, also in the session file) are the dynamic
+counterpart; this group manages the static list.
 
 ```bash
 releasy feature add --id <id> --source-branch <branch> --description <desc>
@@ -776,10 +837,10 @@ releasy feature list
 
 | Subcommand | Description |
 |------------|-------------|
-| `feature add` | Append a new entry to `features:` in `config.yaml`. Requires `--id`, `--source-branch`, `--description`. |
+| `feature add` | Append a new entry to `features:` in the session file. Requires `--id`, `--source-branch`, `--description`. |
 | `feature enable` | Set `enabled: true` on a feature (runs participate in `releasy run`). Requires `--id`. |
 | `feature disable` | Set `enabled: false` (skipped by `releasy run`). Requires `--id`. |
-| `feature remove` | Delete the feature from `config.yaml`. Doesn't touch any branches. Requires `--id`. |
+| `feature remove` | Delete the feature from the session file. Doesn't touch any branches. Requires `--id`. |
 | `feature list` | Print the configured features grouped by enabled / disabled. |
 
 ## Conflict Resolution
@@ -836,7 +897,7 @@ ready for review.
 
 > **Status semantics:** every successful port — clean cherry-pick or
 > AI-resolved — that has a rebase PR open lands at `needs_review`. If
-> the branch was pushed but no PR was opened (`pr_sources.auto_pr:
+> the branch was pushed but no PR was opened (`pr_policy.auto_pr:
 > false`, or a transient PR-creation failure), it lands at
 > `branch_created`; the project board card includes a *compare* URL so
 > you can open the PR with one click. Anything that needs a human to
@@ -878,9 +939,14 @@ If you ever see RelEasy attempting to write to anything other than your configur
 
 ## Files RelEasy reads & writes
 
-- `config.yaml` — your per-project configuration. The user provides
-  this; `releasy new` scaffolds it. Gitignored by default; nothing
-  prevents you from versioning it elsewhere.
+- `config.yaml` — stable per-project configuration (origin, target
+  branch, AI settings, notifications, `pr_policy`). The user provides
+  this; `releasy new` scaffolds it.
+- `<config-dir>/<name>.session.yaml` — per-effort source data:
+  `features:` list, `pr_sources:` selectors. Scaffolded alongside
+  `config.yaml` by `releasy new`; mutated by `releasy feature *`
+  subcommands. Override its path with `session_file:` in config.yaml
+  or `--session-file` on the CLI.
 - `${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml` — the
   per-project pipeline state file (phase, branch names, statuses,
   AI cost, source PR metadata). Auto-managed; not user-editable in

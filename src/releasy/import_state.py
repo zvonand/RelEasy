@@ -26,7 +26,7 @@ Scope (deliberately narrow):
 
 What the command does NOT try to recover:
 
-* Branches pushed under ``pr_sources.auto_pr: false`` that never had a
+* Branches pushed under ``pr_policy.auto_pr: false`` that never had a
   PR opened — we'd have no way to identify them without cloning. Users
   who hit this can re-run ``releasy run`` (idempotent) to reopen them.
 * Mid-flight ``failed_step_index`` / ``partial_pr_count`` — these only

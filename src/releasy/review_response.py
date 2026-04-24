@@ -270,11 +270,12 @@ def _load_tracking_state(
     Never raises — an unreadable / collision-tripped state file is not
     a reason to fail a stateless-by-design command.
     """
-    # ``--stateless`` callers construct a Config with this sentinel name
-    # specifically to skip persistence. Honour that here so we don't
-    # accidentally read a stale ``_stateless.state.yaml`` from a
-    # previous run.
-    if config.name == "_stateless":
+    # ``--stateless`` callers construct a Config via make_stateless_config
+    # / build_stateless_address_review_config specifically to skip
+    # persistence. Honour that here so we don't accidentally read a
+    # stale ``_stateless.state.yaml`` from a previous run.
+    from releasy.config import is_stateless
+    if is_stateless(config):
         return None, None
     try:
         state = load_state(config)

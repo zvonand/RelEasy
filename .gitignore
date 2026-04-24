@@ -1,8 +1,9 @@
-# Local releasy config (each user provides their own).
+# Local releasy config + session (each user provides their own).
 # Pipeline state and lock files now live under
 # ${XDG_STATE_HOME:-~/.local/state}/releasy/<name>.state.yaml,
 # outside the repo entirely.
 config.yaml
+*.session.yaml
 .releasy/
 
 # Python

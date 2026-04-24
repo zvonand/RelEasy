@@ -1,0 +1,131 @@
+# RelEasy session file — per-effort source data.
+#
+# This file drives *what* to port on a given run. It is the mutable,
+# session-level companion to config.yaml:
+#
+#   * `features:`    — static feature branches to rebase onto the base.
+#   * `pr_sources:`  — PR discovery rules (labels, explicit URLs, groups,
+#                      author filters).
+#
+# Policy knobs for how units are processed (auto_pr, if_exists,
+# retry_failed, recreate_closed_prs) live in config.yaml under
+# `pr_policy:`.
+#
+# Default path: <config-dir>/<name>.session.yaml
+#   — where <name> is config.yaml's `name:` and <config-dir> is the
+#     directory containing config.yaml. Override with
+#     `session_file:` in config.yaml or `--session-file` on the CLI.
+#
+# `releasy --stateless` (e.g. `releasy address-review --stateless`)
+# deliberately SKIPS this file — AI settings come from config.yaml and
+# everything else from CLI flags.
+
+# ── Static feature branches ────────────────────────────────────────
+# Each feature is rebased onto the base branch as a separate branch.
+# PRs can be auto-created into the base branch (if push +
+# pr_policy.auto_pr in config.yaml).
+features:
+  - id: s3-disk
+    description: "Custom S3 disk improvements"
+    source_branch: feature/antalya-s3-disk
+    enabled: true
+
+  - id: keeper-cfg
+    description: "Keeper config extensions"
+    source_branch: feature/antalya-keeper-cfg
+    enabled: true
+
+  - id: observability
+    description: "Observability hooks"
+    source_branch: feature/antalya-observability
+    enabled: false
+
+  # Feature that depends on another:
+  # - id: disk-cache
+  #   description: "Shared disk cache layer"
+  #   source_branch: feature/antalya-disk-cache
+  #   depends_on: [s3-disk]
+  #   enabled: true
+
+# ── PR sources ────────────────────────────────────────────────────
+# Discover, include, and exclude PRs from the origin repo.
+# Each matching PR becomes its own feature branch.
+# Requires RELEASY_GITHUB_TOKEN.
+#
+# Set arithmetic (evaluated in order):
+#
+#   union(by_labels) − exclude_labels + include_prs − exclude_prs
+#
+# by_labels — label-based discovery. Each entry uses AND logic (PR
+#   must carry ALL listed labels). Multiple entries are unioned.
+#   Per-entry options:
+#     merged_only: true — skip open PRs, only cherry-pick merged ones.
+#     if_exists: skip|recreate — overrides pr_policy.if_exists (in
+#                                config.yaml) for this entry.
+#     description: prefix prepended to the PR title for the feature name.
+#
+# exclude_labels — drop any PR carrying at least one of these labels,
+#   even if it matched a by_labels entry.
+#
+# include_prs — always include these PRs by URL, even if they don't
+#   match any labels or carry an excluded label. URLs may point to ANY
+#   public GitHub repo (not just origin); cross-repo PRs are fetched
+#   directly from the URL — no extra git remote is added. Their port
+#   branches get a slug-prefixed name (feature/<base>/<owner>-<repo>-pr-<N>)
+#   so a same-numbered origin PR can never clash.
+#
+# exclude_prs — always exclude these PRs by URL. Final override —
+#   a PR listed here is never processed. Matched by full owner/repo/number,
+#   so excluding e.g. ClickHouse/ClickHouse#42 won't drop Altinity/ClickHouse#42.
+#
+# include_authors (when non-empty) — restrict discovered PRs to those
+#   authored by one of the listed GitHub logins. Case-insensitive.
+#   Bypassed for PRs explicitly listed in include_prs.
+#
+# exclude_authors — drop PRs by the listed authors. Same logic.
+#
+# PRs are processed in merge order (earliest merged first).
+#
+# pr_sources:
+#   by_labels:
+#     - labels: ["forward-port", "v26.1"]
+#       description: "Forward-ported changes"
+#       merged_only: true
+#       # if_exists: recreate    # override per-group
+#
+#   exclude_labels: ["do-not-port", "wontfix"]
+#
+#   include_prs:
+#     - https://github.com/Altinity/ClickHouse/pull/123
+#     - https://github.com/Altinity/ClickHouse/pull/456
+#     # Cross-repo PR — fetched directly from the source repo by URL.
+#     - https://github.com/ClickHouse/ClickHouse/pull/12345
+#
+#   exclude_prs:
+#     - https://github.com/Altinity/ClickHouse/pull/789
+#
+#   # Sequential PR groups: cherry-pick multiple PRs onto a SINGLE port
+#   # branch (in listed order) and open ONE combined PR for the whole
+#   # group. Use this when PR #B depends on PR #A and they should land
+#   # together. The group `id` becomes the feature id and the branch
+#   # name (feature/<base>/<id>). Each PR can appear in at most ONE
+#   # group; PRs in groups are removed from the singleton stream.
+#   #
+#   # `exclude_prs` and `exclude_labels` still drop individual PRs from
+#   # a group; if a group ends up empty it is skipped with a warning.
+#   #
+#   # AI conflict resolution works per cherry-pick step inside a group:
+#   # if any PR in the group conflicts, Claude resolves+builds+commits
+#   # locally, then the next PR in the group is cherry-picked. Each PR
+#   # produces one commit on the branch (with a `Source-PR: #N` trailer
+#   # for clean attribution). After all PRs are applied, RelEasy pushes
+#   # the branch and opens ONE combined PR; if any step needed AI, the
+#   # PR is tagged `ai_resolve.label`.
+#   groups:
+#     - id: iceberg-rest-catalog
+#       description: "Iceberg REST catalog support"
+#       prs:
+#         - https://github.com/Altinity/ClickHouse/pull/1500   # base change
+#         - https://github.com/Altinity/ClickHouse/pull/1512   # follow-up
+#         - https://github.com/Altinity/ClickHouse/pull/1530   # final fix
+#       # if_exists: skip     # override pr_policy.if_exists
