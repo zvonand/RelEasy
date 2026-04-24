@@ -1219,24 +1219,6 @@ def _strip_md_sections(body: str, keywords: list[str]) -> str:
     return out.strip()
 
 
-_GFM_CHECKBOX_RE = re.compile(
-    r"^(\s*[-*+]\s*)\[[xX]\]", flags=re.MULTILINE,
-)
-
-
-def _reset_ci_checkboxes(block: str) -> str:
-    """Reset every GFM task checkbox in ``block`` to unchecked.
-
-    The CI options block we propagate into the rebase PR is built from
-    one of the source PR's bodies, but the checkbox values reviewers
-    set there were specific to that source PR's testing needs. Resetting
-    them gives the rebase PR neutral template defaults so the rebase
-    reviewer makes their own choices rather than inheriting random
-    overrides.
-    """
-    return _GFM_CHECKBOX_RE.sub(r"\1[ ]", block)
-
-
 # Per-PR body sections that the combined PR already presents once at
 # the top (changelog) or that we deliberately deduplicate / reset (CI
 # options). Stripping them from each per-PR body keeps the combined
@@ -1247,6 +1229,42 @@ _DEDUP_PR_BODY_SECTIONS = (
     "changelog entry",
     "ci/cd options",
 )
+
+# Canonical CI/CD Options block for rebase PR bodies when a source PR
+# uses the same template (heading match). Checkbox defaults are fixed
+# here so ports do not inherit ad-hoc source-PR toggles or an all-empty
+# reset.
+_DEFAULT_CI_CD_OPTIONS_BLOCK = """### CI/CD Options
+#### Exclude tests:
+- [ ] <!---ci_exclude_fast--> Fast test
+- [ ] <!---ci_exclude_integration--> Integration Tests
+- [ ] <!---ci_exclude_stateless--> Stateless tests
+- [ ] <!---ci_exclude_stateful--> Stateful tests
+- [ ] <!---ci_exclude_performance--> Performance tests
+- [ ] <!---ci_exclude_asan--> All with ASAN
+- [x] <!---ci_exclude_tsan--> All with TSAN
+- [x] <!---ci_exclude_msan--> All with MSAN
+- [x] <!---ci_exclude_ubsan--> All with UBSAN
+- [x] <!---ci_exclude_coverage--> All with Coverage
+- [ ] <!---ci_exclude_aarch64|arm--> All with Aarch64
+- [ ] <!---ci_exclude_regression--> All Regression
+- [ ] <!---no_ci_cache--> Disable CI Cache
+
+#### Regression jobs to run:
+- [ ] <!---ci_regression_common--> Fast suites (mostly <1h)
+- [ ] <!---ci_regression_aggregate_functions--> Aggregate Functions (2h)
+- [ ] <!---ci_regression_alter--> Alter (1.5h)
+- [ ] <!---ci_regression_benchmark--> Benchmark (30m)
+- [ ] <!---ci_regression_clickhouse_keeper--> ClickHouse Keeper (1h)
+- [x] <!---ci_regression_iceberg--> Iceberg (2h)
+- [ ] <!---ci_regression_ldap--> LDAP (1h)
+- [x] <!---ci_regression_parquet--> Parquet (1.5h)
+- [ ] <!---ci_regression_rbac--> RBAC (1.5h)
+- [ ] <!---ci_regression_ssl_server--> SSL Server (1h)
+- [ ] <!---ci_regression_s3--> S3 (2h)
+- [x] <!---ci_regression_s3_export--> S3 Export (2h)
+- [x] <!---ci_regression_swarms--> Swarms (30m)
+- [ ] <!---ci_regression_tiered_storage--> Tiered Storage (2h)"""
 
 
 def _extract_changelog_category(body: str) -> str | None:
@@ -1464,24 +1482,22 @@ def _maybe_synthesize_changelog(
 def _build_ci_options_block(unit: FeatureUnit) -> str | None:
     """Return a single ``### CI/CD Options`` block for the combined PR body.
 
-    Strategy: scan the unit's PRs in order and lift the CI options
-    section out of the first one that has it (so we keep whatever
-    schema the source repo's PR template currently uses, even as it
-    evolves). Every checkbox in the lifted block is reset to ``[ ]``
-    via :func:`_reset_ci_checkboxes` so the rebase PR ships with
-    template defaults instead of inheriting per-source-PR overrides.
+    When any source PR body contains a ``### CI/CD Options`` heading, we
+    insert :data:`_DEFAULT_CI_CD_OPTIONS_BLOCK` — a fixed checklist with
+    intended default checkmarks — rather than copying the source text
+    (which would inherit arbitrary reviewer toggles) or clearing every
+    box (which lost the project's preferred defaults).
 
     Returns ``None`` when no PR in the unit carries a CI options
-    section — in that case the combined body just doesn't include
-    one (we don't fabricate a block from thin air, since the schema
-    can drift between projects).
+    section — in that case the combined body omits the block so repos
+    without this template are unaffected.
     """
     for pr in unit.prs:
         section = _extract_md_section_with_subsections(
             pr.body or "", "ci/cd options",
         )
         if section:
-            return _reset_ci_checkboxes(section).rstrip()
+            return _DEFAULT_CI_CD_OPTIONS_BLOCK.rstrip()
     return None
 
 
