@@ -64,6 +64,20 @@ Anything that can't meet either bar does not belong in your resolution.
 
 ---
 
+## Special case: `src/Core/SettingsChangesHistory.cpp`
+
+When resolving a cherry-pick (or any conflict) that touches this file:
+
+1. **Incoming change adds settings** that already appear on the current branch **as commented-out lines** (same setting / same logical entry).
+
+2. **Do not** keep both: the new uncommented lines from the cherry-pick **and** the old commented block. That duplicates or contradicts history.
+
+3. **Do** prefer the existing commented lines: **uncomment them** and align their content with what the cherry-picked commit intended (same keys, same semantics), then **drop** the redundant duplicate lines from the cherry-pick side of the conflict.
+
+**Summary:** commented-out settings for the same keys → **uncomment and reconcile**, do not **append** the cherry-pick’s additions blindly.
+
+---
+
 ## Recognising a missing-prerequisite conflict
 
 Sometimes what looks like a conflict is actually the source PR depending

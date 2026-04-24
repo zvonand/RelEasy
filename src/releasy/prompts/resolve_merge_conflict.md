@@ -75,6 +75,22 @@ the same hunk — none of those fit any of the three buckets.
 
 ---
 
+## Special case: `src/Core/SettingsChangesHistory.cpp`
+
+When resolving a merge (or any conflict) that touches this file:
+
+1. **One side adds settings** (e.g. from the port or from `{base_branch}`) that already appear on the other side **as commented-out lines** (same setting / same logical entry).
+
+2. **Do not** keep both: new uncommented lines **and** the old commented block. That duplicates or contradicts history.
+
+3. **Do** prefer the existing commented lines: **uncomment them** and align their content with what the contributing side intended (same keys, same semantics), then **drop** the redundant duplicate lines from the other side of the conflict.
+
+4. If the commented block is obsolete or wrong for the merged result, resolve on substance (update or remove) rather than blindly accepting a hunk that only adds fresh lines.
+
+**Summary:** commented-out settings for the same keys → **uncomment and reconcile**, do not **append** duplicate rows blindly.
+
+---
+
 ## Task — execute these steps in order, without asking for confirmation
 
 ### Step 1 — Establish ground truth (both diffs)
