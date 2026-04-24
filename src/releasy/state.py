@@ -151,6 +151,14 @@ class FeatureState:
     # "config:groups[<id>]"). Drives the "merge unit X first" message;
     # cleared once the unit lands cleanly.
     queued_prereq_units: list[dict] = field(default_factory=list)
+    # ----- ``releasy address-review`` tracking -----
+    # ISO-8601 UTC timestamp of the most recent successful
+    # ``releasy address-review`` run on this feature's rebase PR. When
+    # present, the next address-review run on the same PR uses it as an
+    # implicit (exclusive) --since default so re-runs only consider
+    # comments posted after the last pass. Opportunistic: stateless
+    # runs (PR not tracked here) simply don't read or write this field.
+    last_review_addressed_at: str | None = None
 
 
 @dataclass
@@ -205,6 +213,7 @@ def _parse_features(raw_features: dict) -> dict[str, FeatureState]:
                 fraw.get("prereq_recovery_exhausted", False)
             ),
             queued_prereq_units=list(fraw.get("queued_prereq_units", []) or []),
+            last_review_addressed_at=fraw.get("last_review_addressed_at"),
         )
     return features
 
@@ -315,6 +324,8 @@ def save_state(state: PipelineState, config: Config) -> None:
             entry["prereq_recovery_exhausted"] = True
         if fs.queued_prereq_units:
             entry["queued_prereq_units"] = fs.queued_prereq_units
+        if fs.last_review_addressed_at:
+            entry["last_review_addressed_at"] = fs.last_review_addressed_at
         features_data[fid] = entry
 
     data: dict = {

@@ -344,6 +344,52 @@ class AutoAddPrerequisitePRsConfig:
 
 
 @dataclass
+class ReviewResponseConfig:
+    """Claude-driven PR review-response configuration.
+
+    Drives ``releasy address-review`` — an AI pass that reads review
+    feedback left on an open rebase PR and either (a) makes code
+    changes and commits them, or (b) replies to the thread explaining
+    why the comment doesn't translate to a code change. Opportunistically
+    stateful: when the PR is tracked in state RelEasy remembers the
+    last run's timestamp; otherwise it's pure stateless.
+
+    Comments authored by anyone NOT in ``trusted_reviewers`` (combined
+    with ``--reviewer`` on the CLI) are filtered out **before** the AI
+    sees the prompt, so an untrusted commenter cannot inject
+    instructions into the run. That allowlist is the only safety gate —
+    there is no master ``enabled:`` switch, because invoking the
+    subcommand is itself the explicit opt-in.
+    """
+    command: str = "claude"
+    prompt_file: str = "prompts/address_review.md"
+    timeout_seconds: int = 7200  # 2h
+    max_iterations: int = 15
+    # Allowlist of GitHub logins (compared case-insensitively). The
+    # command refuses to run when both this list and the CLI
+    # ``--reviewer`` flag are empty — there is no "process every
+    # comment" mode, because that is exactly the prompt-injection
+    # surface we're trying to avoid.
+    trusted_reviewers: list[str] = field(default_factory=list)
+    # Whether the AI posts a reply to each comment it classifies as
+    # non-actionable (already fixed / out of scope / misunderstanding).
+    # Replies include a short machine-readable footer identifying them
+    # as bot-generated. ADDRESSABLE comments are answered by the
+    # commit that fixes them, not by a reply. Default on — when off
+    # (via ``--no-reply`` or config), non-actionable comments are just
+    # listed in the AI's terminal narration.
+    reply_to_non_addressable: bool = True
+    # Optional: let the AI post one summary comment on the PR at the
+    # end of the run too, describing what it changed and which comments
+    # it declined to address. Distinct from per-comment replies; both
+    # can be on. Never resolves conversations — that's reserved for
+    # humans.
+    post_summary_comment: bool = False
+    allowed_tools: list[str] = field(default_factory=_default_allowed_tools)
+    extra_args: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AIResolveConfig:
     """Claude-driven conflict resolver configuration."""
     enabled: bool = False
@@ -419,6 +465,7 @@ class Config:
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     ai_resolve: AIResolveConfig = field(default_factory=AIResolveConfig)
     ai_changelog: AIChangelogConfig = field(default_factory=AIChangelogConfig)
+    review_response: ReviewResponseConfig = field(default_factory=ReviewResponseConfig)
     config_path: Path = field(default_factory=lambda: Path.cwd() / "config.yaml")
     work_dir: Path | None = None
     # When set, a copy of all stdout+stderr (Rich, Click, logging, tracebacks)
@@ -839,6 +886,37 @@ def load_config(config_path: Path | None = None) -> Config:
         auto_add_prerequisite_prs=auto_add_prerequisite_prs,
     )
 
+    rr_raw = raw.get("review_response", {}) or {}
+    rr_reviewers_raw = rr_raw.get("trusted_reviewers", []) or []
+    if not isinstance(rr_reviewers_raw, list) or not all(
+        isinstance(x, str) for x in rr_reviewers_raw
+    ):
+        raise ValueError(
+            "review_response.trusted_reviewers must be a list of strings"
+        )
+    rr_seen: set[str] = set()
+    rr_reviewers: list[str] = []
+    for login in rr_reviewers_raw:
+        stripped = login.strip()
+        key = stripped.lower()
+        if not stripped or key in rr_seen:
+            continue
+        rr_seen.add(key)
+        rr_reviewers.append(stripped)
+    review_response = ReviewResponseConfig(
+        command=rr_raw.get("command", "claude"),
+        prompt_file=rr_raw.get("prompt_file", "prompts/address_review.md"),
+        timeout_seconds=int(rr_raw.get("timeout_seconds", 7200)),
+        max_iterations=int(rr_raw.get("max_iterations", 15)),
+        trusted_reviewers=rr_reviewers,
+        reply_to_non_addressable=bool(
+            rr_raw.get("reply_to_non_addressable", True),
+        ),
+        post_summary_comment=bool(rr_raw.get("post_summary_comment", False)),
+        allowed_tools=rr_raw.get("allowed_tools") or _default_allowed_tools(),
+        extra_args=rr_raw.get("extra_args", []) or [],
+    )
+
     raw_work_dir = raw.get("work_dir")
     work_dir = Path(raw_work_dir).resolve() if raw_work_dir else None
 
@@ -878,6 +956,7 @@ def load_config(config_path: Path | None = None) -> Config:
         notifications=notifications,
         ai_resolve=ai_resolve,
         ai_changelog=ai_changelog,
+        review_response=review_response,
         config_path=config_path,
         work_dir=work_dir,
         log_file=log_file,
@@ -1085,6 +1164,30 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     if aic_data:
         data["ai_changelog"] = aic_data
 
+    rr = config.review_response
+    rr_defaults = ReviewResponseConfig()
+    rr_data: dict = {}
+    if rr.command != rr_defaults.command:
+        rr_data["command"] = rr.command
+    if rr.prompt_file != rr_defaults.prompt_file:
+        rr_data["prompt_file"] = rr.prompt_file
+    if rr.timeout_seconds != rr_defaults.timeout_seconds:
+        rr_data["timeout_seconds"] = rr.timeout_seconds
+    if rr.max_iterations != rr_defaults.max_iterations:
+        rr_data["max_iterations"] = rr.max_iterations
+    if rr.trusted_reviewers:
+        rr_data["trusted_reviewers"] = rr.trusted_reviewers
+    if rr.reply_to_non_addressable != rr_defaults.reply_to_non_addressable:
+        rr_data["reply_to_non_addressable"] = rr.reply_to_non_addressable
+    if rr.post_summary_comment != rr_defaults.post_summary_comment:
+        rr_data["post_summary_comment"] = rr.post_summary_comment
+    if rr.allowed_tools != _default_allowed_tools():
+        rr_data["allowed_tools"] = rr.allowed_tools
+    if rr.extra_args:
+        rr_data["extra_args"] = rr.extra_args
+    if rr_data:
+        data["review_response"] = rr_data
+
     if config.push:
         data["push"] = True
 
@@ -1154,6 +1257,72 @@ def make_stateless_config(
         push=push,
         sequential=False,
     )
+
+
+def make_stateless_address_review_config(
+    *,
+    origin_url: str,
+    work_dir: Path | None = None,
+    claude_command: str = "claude",
+    build_command: str = "",
+    prompt_file: str | None = None,
+    timeout_seconds: int = 7200,
+    max_iterations: int = 15,
+    trusted_reviewers: list[str] | None = None,
+    reply_to_non_addressable: bool = True,
+    post_summary_comment: bool = False,
+    allowed_tools: list[str] | None = None,
+    extra_args: list[str] | None = None,
+) -> Config:
+    """Build an in-memory ``Config`` for ``releasy address-review --stateless``.
+
+    Mirrors :func:`make_stateless_config` but for the review-response
+    flow: no YAML read, no state file touched, no project lock taken.
+    All review-relevant knobs come from CLI flags (or defaults).
+
+    ``prompt_file`` defaults to the bundled
+    ``src/releasy/prompts/address_review.md`` so ``--stateless`` runs
+    work without any repo-local prompt copy. The AI's build-wrapper
+    script is still materialised from ``build_command`` through
+    ``ai_resolve.build_command`` — passing an empty build command is
+    fine and simply tells the AI "there is no build; do not run the
+    wrapper."
+
+    The returned ``Config`` carries the sentinel ``name="_stateless"``;
+    callers in the address-review flow detect that name and skip
+    :func:`load_state` / :func:`save_state` (see
+    ``review_response._load_tracking_state``).
+    """
+    if prompt_file is None:
+        bundled = (
+            Path(__file__).parent / "prompts" / "address_review.md"
+        ).resolve()
+        prompt_file = str(bundled)
+
+    base = make_stateless_config(
+        origin_url,
+        work_dir=work_dir,
+        push=True,
+        auto_pr=False,
+        ai_enabled=False,
+        ai_command=claude_command,
+        ai_build_command=build_command,
+    )
+    base.review_response = ReviewResponseConfig(
+        command=claude_command,
+        prompt_file=prompt_file,
+        timeout_seconds=timeout_seconds,
+        max_iterations=max_iterations,
+        trusted_reviewers=list(trusted_reviewers or []),
+        reply_to_non_addressable=reply_to_non_addressable,
+        post_summary_comment=post_summary_comment,
+        allowed_tools=(
+            list(allowed_tools) if allowed_tools is not None
+            else _default_allowed_tools()
+        ),
+        extra_args=list(extra_args or []),
+    )
+    return base
 
 
 def get_github_token() -> str | None:

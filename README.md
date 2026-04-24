@@ -240,6 +240,12 @@ pr_sources:
 | `ai_changelog.prompt_file` | Prompt template for changelog synthesis. | `prompts/synthesize_changelog.md` |
 | `ai_changelog.timeout_seconds` | Per-call timeout for the synthesis subprocess. | `300` |
 | `ai_changelog.max_pr_body_chars` | Per-PR body trim before being inlined into the prompt. | `3000` |
+| `review_response.trusted_reviewers` | Allowlist of GitHub logins whose comments the AI will see. Combined with `--reviewer` on the CLI; if both are empty the command refuses to run. | `[]` |
+| `review_response.reply_to_non_addressable` | Post an in-thread reply (with a bot footer) on every comment the AI classifies as non-actionable. CLI override: `--reply` / `--no-reply`. | `true` |
+| `review_response.post_summary_comment` | Additionally post one top-level summary comment on the PR when done. Distinct from per-comment replies; both can be on. | `false` |
+| `review_response.prompt_file` | Prompt template for review-response runs. | `prompts/address_review.md` |
+| `review_response.max_iterations` | Hard cap on build attempts the AI may make per address-review run. | `15` |
+| `review_response.timeout_seconds` | Per-invocation Claude timeout. | `7200` |
 | `pr_sources.auto_pr` | Open a PR for every pushed port branch (singletons, by_labels, include_prs, groups). Requires `push: true`. | `true` |
 | `pr_sources.by_labels[].labels` | Labels a PR must have (AND logic) | — |
 | `pr_sources.by_labels[].merged_only` | Only include merged PRs | `false` |
@@ -282,16 +288,17 @@ does and when to reach for it.
 The three "doing" commands look similar but operate on different things —
 this matrix is the quickest way to pick the right one.
 
-| | `run` | `continue` | `refresh` |
-|--|:-----:|:----------:|:---------:|
-| Discovers new PRs from `pr_sources` (labels, include_prs, groups) | ✅ | — | — |
-| Creates new port branches (cherry-pick onto `origin/<base>`) | ✅ | — | — |
-| Opens new rebase PRs | ✅ for new ports | ✅ for branches that missed PR creation last time | — |
-| AI-resolves **cherry-pick** conflicts (initial port) | ✅ | — | — |
-| AI-resolves **merge** conflicts (target branch moved on) | — | — | ✅ |
-| Iterates entries already in the project state file | only to skip / ensure-PR | ✅ all of them | ✅ all tracked PRs |
-| Mutates your local work-dir | ✅ (cherry-picks) | ✅ (push only) | ✅ (merges) |
-| Pushes to origin | ✅ | ✅ | ✅ (only merge commits, on conflict-resolution) |
+| | `run` | `continue` | `refresh` | `address-review` |
+|--|:-----:|:----------:|:---------:|:----------------:|
+| Discovers new PRs from `pr_sources` (labels, include_prs, groups) | ✅ | — | — | — |
+| Creates new port branches (cherry-pick onto `origin/<base>`) | ✅ | — | — | — |
+| Opens new rebase PRs | ✅ for new ports | ✅ for branches that missed PR creation last time | — | — |
+| AI-resolves **cherry-pick** conflicts (initial port) | ✅ | — | — | — |
+| AI-resolves **merge** conflicts (target branch moved on) | — | — | ✅ | — |
+| AI-addresses reviewer comments on a specific PR | — | — | — | ✅ |
+| Iterates entries already in the project state file | only to skip / ensure-PR | ✅ all of them | ✅ all tracked PRs | — (stateless; acts on `--pr`) |
+| Mutates your local work-dir | ✅ (cherry-picks) | ✅ (push only) | ✅ (merges) | ✅ (appends commits) |
+| Pushes to origin | ✅ | ✅ | ✅ (only merge commits, on conflict-resolution) | ✅ (plain push, no force) |
 
 In one-line summaries:
 
@@ -306,6 +313,15 @@ In one-line summaries:
   the project state file: for each tracked PR, attempts
   `git merge origin/<base>` into the PR branch and AI-resolves any
   conflicts. Doesn't open new PRs, doesn't discover new sources.
+- **`address-review`** — *"a reviewer left comments; ask the AI to
+  apply them."* Stateless, operates on `--pr <URL>`. Fetches every
+  comment, filters down to those authored by trusted reviewers (the
+  allowlist lives in `review_response.trusted_reviewers` and/or
+  `--reviewer <login>`), then invokes the AI to append new commits
+  addressing the feedback. **Linear history only** — no amend, no
+  rebase; to retract something, the AI uses `git revert`. Plain
+  `git push` at the end; a race with the PR author aborts without
+  clobbering.
 
 > **Why both `run` and `continue`?** `run` only acts on entries it's
 > cherry-picking *right now*. If you fix a conflict by hand later in the
@@ -385,6 +401,122 @@ releasy refresh [--work-dir <path>]
 | `--resolve-conflicts` / `--no-resolve-conflicts` | Toggle the AI resolver. With `--no-resolve-conflicts`, conflicting PRs are flagged in state without an automatic fix attempt. | on |
 
 Exit code: `1` if any PR ended up in `conflict` status, `0` otherwise.
+
+#### `releasy address-review` — AI-address reviewer comments
+
+Fetches every comment on a PR (issue comments, inline review comments,
+review bodies), filters them down to **comments authored by trusted
+reviewers**, and asks Claude to append code changes addressing the
+feedback. Fully stateless — the PR does not need to be tracked in
+`state.yaml`.
+
+Injection-safety: untrusted comments are dropped at fetch time,
+*before* the prompt is rendered, so a hostile commenter cannot smuggle
+instructions into the run. The allowlist is explicit: if both
+`review_response.trusted_reviewers` and `--reviewer` are empty, the
+command refuses to run.
+
+The two sources **add together** — an explicit `--reviewer <login>`
+on the CLI is authoritative on its own and does NOT need to appear in
+the config allowlist first. That's the whole point of the flag:
+process one reviewer's feedback ad-hoc without editing `config.yaml`.
+
+**Stateful re-runs.** When `--pr` matches a rebase PR RelEasy already
+tracks in state (i.e. one it opened via `releasy run`), a successful
+`address-review` run stamps `last_review_addressed_at` onto that
+feature. The next run on the same PR uses it as an implicit (exclusive)
+`--since` default — so you can rerun with no arguments to pick up just
+the newest round of feedback. Stateless PRs (anything RelEasy didn't
+open) skip this entirely; pass `--since` explicitly when you need
+incremental behaviour there.
+
+**Linear history only:** the AI may only append new commits. No amend,
+no rebase, no `reset --hard`, no force-push. To retract a previous
+change, it uses `git revert <sha>` (which creates a new forward
+commit).
+
+**What the AI does per comment:**
+
+- **Actionable** → edits code + commits. The commit message references
+  the comment URL so the reviewer can trace it back.
+- **Non-actionable** (already fixed, out of scope, misunderstanding) →
+  posts a short in-thread reply with a `🤖 *Generated by releasy
+  address-review*` footer. Inline comments reply threaded (same
+  conversation); issue comments and review bodies reply top-level
+  (GitHub has no thread model for those).
+- **Truly out of scope** (e.g. "refactor this whole module") → AI
+  declines, surfaces in the terminal narration, human decides.
+
+```bash
+releasy address-review --pr <URL>
+                       [--reviewer <login>]...
+                       [--since <ISO8601>]
+                       [--work-dir <path>]
+                       [--dry-run]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--pr <URL>` (required) | PR on the configured origin. Head branch must also live on origin (no fork PRs in v1). | — |
+| `--reviewer <login>` | GitHub login (repeatable). Adds to `review_response.trusted_reviewers`; authoritative on its own (does not have to be in the config list first). Case-insensitive. | `[]` |
+| `--since <URL\|ISO8601>` | Only consider comments newer than this reference. Two forms: a GitHub comment URL (`…#issuecomment-<id>` / `#discussion_r<id>` / `#pullrequestreview-<id>`) → everything **strictly after** that comment; or an ISO-8601 timestamp → comments at or after that moment. Omit to consider every comment (or, in stateful mode, everything after the previous `address-review` run on this PR). | auto from state; else every comment |
+| `--reply` / `--no-reply` | Post an in-thread reply (with a bot footer) on every comment the AI classifies as non-actionable. Overrides `review_response.reply_to_non_addressable`. | on |
+| `--stateless` | Bypass `config.yaml` entirely — no config read, no state file, no project lock. All inputs come from CLI flags (see below). Origin is derived from `--pr` (https form) unless you pass `--origin`. | off |
+| `--origin <URL>` | (stateless only) Origin remote URL to push to. Use when you need ssh instead of https. | derived from `--pr` |
+| `--build-command <cmd>` | (stateless only) Shell command the AI may run to verify changes compile. Empty ⇒ no build. | empty |
+| `--claude-command <path>` | (stateless only) Executable used to invoke Claude. | `claude` |
+| `--prompt-file <path>` | (stateless only) Prompt template path. | bundled |
+| `--timeout <seconds>` | (stateless only) Per-invocation Claude timeout. | `7200` |
+| `--max-iterations <n>` | (stateless only) Build-attempt cap. | `15` |
+| `--post-summary-comment` | (stateless only) Also post one top-level summary comment on the PR. | off |
+| `--work-dir <path>` | Working directory for git operations. | from config / cwd |
+| `--dry-run` | Fetch + print the filtered comment list, then exit. No AI, no push. | off |
+
+For every comment the AI classifies as non-actionable (already fixed,
+out of scope, or a misunderstanding), it posts a short reply directly
+in-thread with a machine-readable bot footer — reviewers know at a
+glance which answers came from Claude. ADDRESSABLE comments are
+answered by the commit that fixes them (the commit message references
+the comment URL). Pass `--no-reply` for a silent run that only reports
+via the AI's terminal narration.
+
+**`--stateless` mode** — for one-off runs against a PR you don't have
+a project config for:
+
+```bash
+releasy address-review --stateless \
+  --pr https://github.com/Altinity/ClickHouse/pull/1687 \
+  --reviewer ianton-ru \
+  --work-dir ~/work/ClickHouse \
+  --build-command "cd build && ninja"      # optional
+```
+
+No `config.yaml` is read, no state file is touched, no project lock is
+taken. Origin is derived from the PR URL (https form); pass `--origin
+git@github.com:...` if you need ssh. The stateless-only flags
+(`--origin`, `--build-command`, `--claude-command`, `--prompt-file`,
+`--timeout`, `--max-iterations`, `--post-summary-comment`) are
+rejected without `--stateless` so the intent stays unambiguous.
+
+Config (entirely optional — the command works with just
+`--reviewer <login>` on the CLI):
+
+```yaml
+review_response:
+  trusted_reviewers:        # GitHub logins — case-insensitive
+    - alice
+    - bob
+  # Flip to false to skip per-comment replies (list declined comments
+  # in the AI's stdout narration only). Default: true.
+  reply_to_non_addressable: true
+  # Optional: post one extra summary comment at the end describing
+  # everything that was done. Default: false.
+  post_summary_comment: false
+```
+
+Exit code: `1` on any failure (missing allowlist, AI failed, push
+race, non-linear history detected, …); `0` on success or when there
+were no trusted comments to address.
 
 #### `releasy continue` — reconcile state after a manual fix
 

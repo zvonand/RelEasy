@@ -492,6 +492,277 @@ def refresh(
             raise SystemExit(1)
 
 
+@cli.command(
+    name="address-review",
+    short_help="AI-address reviewer feedback on a PR (stateless).",
+)
+@click.option(
+    "--pr",
+    "pr_url",
+    required=True,
+    help="GitHub URL of the PR to address. Must live on the project's "
+         "configured origin (the head branch has to be on origin so we "
+         "can push to it).",
+)
+@click.option(
+    "--reviewer",
+    "cli_reviewers",
+    multiple=True,
+    help="GitHub login (repeatable). ADDS to "
+         "review_response.trusted_reviewers from config — an explicit "
+         "--reviewer entry is authoritative on its own (the login does "
+         "NOT need to appear in the config allowlist first). Only "
+         "comments authored by a login in the resulting set are fed to "
+         "the AI; every other comment is dropped before the prompt is "
+         "rendered. Case-insensitive. The command only refuses to run "
+         "when BOTH this flag and the config list are empty.",
+)
+@click.option(
+    "--since",
+    "since_iso",
+    default=None,
+    help="Only consider comments newer than this reference. Accepts "
+         "two forms: (1) a GitHub comment URL "
+         "(e.g. https://github.com/o/r/pull/123#issuecomment-456, or "
+         "`#discussion_r<id>` / `#pullrequestreview-<id>`) — interpreted "
+         "as 'every comment STRICTLY AFTER this one'; (2) an ISO-8601 "
+         "timestamp (e.g. 2026-04-24T10:00:00Z) — interpreted as "
+         "'comments at or after this moment'. When omitted, RelEasy "
+         "also checks the state file: if this PR matches a tracked "
+         "rebase PR with a prior address-review run, the timestamp "
+         "recorded then is used as an implicit exclusive --since "
+         "default.",
+)
+@click.option(
+    "--work-dir", default=None, help="Working directory for git operations",
+)
+@click.option(
+    "--reply/--no-reply",
+    "reply_to_non_addressable",
+    default=None,
+    help="Post a reply in-thread on every comment the AI classifies as "
+         "non-actionable (already fixed / out of scope / "
+         "misunderstanding). Replies carry a bot footer. When omitted, "
+         "inherits from review_response.reply_to_non_addressable in "
+         "config (default on). Use --no-reply for a silent run that "
+         "only reports via the AI's terminal narration.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Fetch and print the filtered comment list, then exit without "
+         "invoking the AI or pushing anything. Useful to verify your "
+         "reviewer allowlist catches the right people.",
+)
+@click.option(
+    "--stateless",
+    is_flag=True,
+    default=False,
+    help="Bypass config.yaml entirely. No config file is read, no state "
+         "file is touched, no project lock is taken. All inputs come "
+         "from CLI flags (see the --origin / --build-command / "
+         "--claude-command / --prompt-file / --timeout / --max-iterations "
+         "/ --post-summary-comment options below). Origin defaults to "
+         "the PR's host repo (as https://github.com/<owner>/<repo>.git) "
+         "if you don't pass --origin. All those options are IGNORED "
+         "unless --stateless is set.",
+)
+@click.option(
+    "--origin",
+    "origin_url",
+    default=None,
+    help="(stateless only) Origin remote URL to push to. Use this if "
+         "you need an ssh-form URL (e.g. git@github.com:owner/repo.git) "
+         "instead of https. Defaults to the PR's host repo as an "
+         "https URL.",
+)
+@click.option(
+    "--build-command",
+    "build_command_cli",
+    default="",
+    help="(stateless only) Shell command the AI may run inside the "
+         "repo to verify its changes compile. Written into "
+         ".releasy/build.sh. Empty means 'no build — AI skips "
+         "verification'.",
+)
+@click.option(
+    "--claude-command",
+    "claude_command",
+    default="claude",
+    show_default=True,
+    help="(stateless only) Executable used to invoke Claude.",
+)
+@click.option(
+    "--prompt-file",
+    "prompt_file_cli",
+    default=None,
+    help="(stateless only) Path to the address-review prompt template. "
+         "Defaults to the prompt bundled with the releasy package.",
+)
+@click.option(
+    "--timeout",
+    "timeout_seconds",
+    type=int,
+    default=7200,
+    show_default=True,
+    help="(stateless only) Per-invocation Claude timeout in seconds.",
+)
+@click.option(
+    "--max-iterations",
+    "max_iterations_cli",
+    type=int,
+    default=15,
+    show_default=True,
+    help="(stateless only) Hard cap on build attempts per run.",
+)
+@click.option(
+    "--post-summary-comment",
+    "post_summary_comment_cli",
+    is_flag=True,
+    default=False,
+    help="(stateless only) Also post one top-level summary comment on "
+         "the PR when done (distinct from per-comment replies).",
+)
+@click.pass_context
+def address_review_cmd(
+    ctx: click.Context,
+    pr_url: str,
+    cli_reviewers: tuple[str, ...],
+    since_iso: str | None,
+    reply_to_non_addressable: bool | None,
+    work_dir: str | None,
+    dry_run: bool,
+    stateless: bool,
+    origin_url: str | None,
+    build_command_cli: str,
+    claude_command: str,
+    prompt_file_cli: str | None,
+    timeout_seconds: int,
+    max_iterations_cli: int,
+    post_summary_comment_cli: bool,
+) -> None:
+    """Let the AI address review feedback on a PR.
+
+    Fetches every comment on the PR (issue comments, inline review
+    comments, review bodies) and **filters them down to comments by
+    trusted reviewers** — the allowlist comes from
+    ``review_response.trusted_reviewers`` in config plus any
+    ``--reviewer`` flags. The AI only ever sees the filtered list, so
+    an untrusted commenter can't smuggle instructions into the run.
+
+    After filtering, the PR's head branch is checked out locally and
+    Claude is asked to address the feedback by appending new commits
+    (history stays linear — no amend, no rebase, no revert-via-reset).
+    Successful runs push the branch with a plain ``git push`` (no
+    force); a race with the PR author aborts without clobbering their
+    work.
+
+    Works on any PR on origin — the PR does not need to be tracked in
+    state. When it **is** tracked (i.e. RelEasy opened this rebase PR
+    itself), successful runs stamp ``last_review_addressed_at`` on the
+    feature; the next invocation uses it as an implicit exclusive
+    --since default so re-runs only pick up new feedback. For
+    untracked PRs, pass ``--since`` explicitly (URL or ISO) when you
+    want incremental behaviour.
+
+    Exit code is 1 on any failure (missing allowlist, Claude failed,
+    push race, non-linear history detected, …); 0 on success or when
+    there were no trusted comments to address.
+    """
+    from releasy.review_response import address_review
+
+    wd = Path(work_dir) if work_dir else None
+
+    # Stateless-only flags — using them without --stateless is a user
+    # error rather than a silent fallback to config, so the intent is
+    # unambiguous on both sides.
+    stateless_only_set: list[str] = []
+    if origin_url is not None:
+        stateless_only_set.append("--origin")
+    if build_command_cli:
+        stateless_only_set.append("--build-command")
+    if claude_command != "claude":
+        stateless_only_set.append("--claude-command")
+    if prompt_file_cli is not None:
+        stateless_only_set.append("--prompt-file")
+    if timeout_seconds != 7200:
+        stateless_only_set.append("--timeout")
+    if max_iterations_cli != 15:
+        stateless_only_set.append("--max-iterations")
+    if post_summary_comment_cli:
+        stateless_only_set.append("--post-summary-comment")
+
+    if not stateless and stateless_only_set:
+        raise click.UsageError(
+            f"{', '.join(stateless_only_set)} only apply with "
+            "--stateless. Drop the flags, or add --stateless to run "
+            "without config.yaml."
+        )
+
+    if stateless:
+        from releasy.config import make_stateless_address_review_config
+        from releasy.github_ops import parse_pr_url, slug_to_https_url
+
+        effective_origin = origin_url
+        if not effective_origin:
+            parsed = parse_pr_url(pr_url)
+            if parsed is None:
+                raise click.ClickException(
+                    f"Could not parse --pr URL: {pr_url!r}"
+                )
+            owner, repo, _ = parsed
+            effective_origin = slug_to_https_url(f"{owner}/{repo}")
+
+        config = make_stateless_address_review_config(
+            origin_url=effective_origin,
+            work_dir=wd,
+            claude_command=claude_command,
+            build_command=build_command_cli,
+            prompt_file=prompt_file_cli,
+            timeout_seconds=timeout_seconds,
+            max_iterations=max_iterations_cli,
+            trusted_reviewers=list(cli_reviewers),
+            reply_to_non_addressable=(
+                True if reply_to_non_addressable is None
+                else reply_to_non_addressable
+            ),
+            post_summary_comment=post_summary_comment_cli,
+        )
+        # In stateless mode, reply preference is already baked into
+        # the config we just built, so there's no CLI-vs-config
+        # precedence left to apply.
+        result = address_review(
+            config,
+            pr_url,
+            cli_reviewers=cli_reviewers,
+            since_iso=since_iso,
+            work_dir=wd,
+            dry_run=dry_run,
+            reply_override=None,
+        )
+        if not result.success:
+            if result.error:
+                raise click.ClickException(result.error)
+            raise SystemExit(1)
+        return
+
+    with _locked_config(ctx) as config:
+        result = address_review(
+            config,
+            pr_url,
+            cli_reviewers=cli_reviewers,
+            since_iso=since_iso,
+            work_dir=wd,
+            dry_run=dry_run,
+            reply_override=reply_to_non_addressable,
+        )
+        if not result.success:
+            if result.error:
+                raise click.ClickException(result.error)
+            raise SystemExit(1)
+
+
 # ---------------------------------------------------------------------------
 # Release
 # ---------------------------------------------------------------------------

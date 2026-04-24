@@ -323,6 +323,42 @@ notifications:
 #   max_pr_body_chars: 3000
 
 # ─────────────────────────────────────────────────────────────────────
+# REVIEW RESPONSE (`releasy address-review`)
+#
+# Stateless command that reads review comments left on a PR and lets
+# the AI make code changes addressing the feedback. Off by default
+# because it spends Anthropic tokens every call and writes to your PR
+# branch.
+#
+# Every comment is filtered to an explicit allowlist of trusted
+# reviewers BEFORE the AI sees it — untrusted commenters cannot smuggle
+# instructions into the run. The allowlist here is unioned with
+# `--reviewer` on the CLI; if both are empty, the command refuses to
+# run.
+#
+# Linear history is a hard rule: the AI only appends commits (it uses
+# `git revert` to retract anything, never amend / rebase / reset).
+# RelEasy pushes with plain `git push` at the end.
+#
+# review_response:
+#   trusted_reviewers:
+#     - alice
+#     - bob
+#   # Reply in-thread (with a bot footer) on every comment classified as
+#   # non-actionable. Set to false for a silent run that only reports
+#   # via the AI's terminal narration. Override per-invocation with
+#   # --reply / --no-reply.
+#   reply_to_non_addressable: true
+#   # Optional: post one extra top-level summary comment on the PR
+#   # describing what was done (distinct from per-comment replies).
+#   post_summary_comment: false
+#   # Advanced overrides — the defaults below are already sensible.
+#   # command: claude
+#   # prompt_file: prompts/address_review.md
+#   # max_iterations: 15
+#   # timeout_seconds: 7200
+
+# ─────────────────────────────────────────────────────────────────────
 # WORKFLOW
 #
 # The base branch must already exist on origin. The pipeline then ports

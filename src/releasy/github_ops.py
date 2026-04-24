@@ -413,6 +413,162 @@ def fetch_pr_by_url(
     )
 
 
+@dataclass
+class PRComment:
+    """One comment on a pull request, flattened across GitHub's three APIs.
+
+    ``kind`` is one of:
+      - ``"issue"``  — top-level conversation comment (`/issues/<n>/comments`).
+      - ``"review"`` — the summary body of a review (`/pulls/<n>/reviews`).
+                        Approvals/change-requests with no body text are
+                        dropped at fetch time; only reviews with actual
+                        prose reach this list.
+      - ``"inline"`` — line-level comment on a diff
+                        (`/pulls/<n>/comments`), carrying ``path`` +
+                        ``line`` + ``diff_hunk``.
+
+    All timestamps are ISO-8601 UTC strings (matching what PyGithub
+    emits). ``author`` is the commenter's GitHub login — missing / bot
+    authors are represented as an empty string so the trusted-reviewer
+    filter simply drops them.
+    """
+    id: int
+    kind: str
+    author: str
+    created_at: str
+    updated_at: str
+    url: str
+    body: str
+    path: str | None = None
+    line: int | None = None
+    commit_id: str | None = None
+    diff_hunk: str | None = None
+    in_reply_to_id: int | None = None
+    review_state: str | None = None
+
+
+def _safe_iso(value) -> str:  # noqa: ANN001 — PyGithub returns datetime
+    """Format a PyGithub-returned datetime as ISO-8601, or ``""`` if missing."""
+    if value is None:
+        return ""
+    try:
+        return value.isoformat()
+    except Exception:  # pragma: no cover
+        return ""
+
+
+def _comment_author_login(obj) -> str:  # noqa: ANN001
+    """Best-effort extraction of a comment author's login (``""`` on miss)."""
+    try:
+        user = obj.user
+        if user is not None and getattr(user, "login", None):
+            return user.login
+    except Exception:  # pragma: no cover
+        pass
+    return ""
+
+
+def fetch_pr_comments(
+    config: Config, pr_url: str,
+) -> tuple[list[PRComment], str | None]:
+    """Fetch every comment on ``pr_url`` from the three GitHub APIs.
+
+    Returns ``(comments, error)``. On any failure (missing token,
+    unparseable URL, GitHub API error) ``comments`` is empty and
+    ``error`` carries a human-readable reason the caller can surface to
+    the user. The three sources are:
+
+      1. Issue comments (`/issues/<n>/comments`)  — general PR discussion.
+      2. Review comments (`/pulls/<n>/comments`)  — inline on diff.
+      3. Reviews (`/pulls/<n>/reviews`)           — only those with a
+         non-empty body (pure approvals contribute no text).
+
+    Comments are sorted by ``created_at`` (stable) so consumers always
+    see them in the order they were posted. The function is
+    read-only — no filtering by author / time / trust applied here;
+    that's the caller's responsibility.
+    """
+    token = get_github_token()
+    if not token:
+        return [], "RELEASY_GITHUB_TOKEN not set — cannot fetch PR comments"
+
+    parsed = parse_pr_url(pr_url)
+    if parsed is None:
+        return [], f"Could not parse PR URL: {pr_url!r}"
+    owner, repo, number = parsed
+    slug = f"{owner}/{repo}"
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        ghrepo = gh.get_repo(slug)
+        pr = ghrepo.get_pull(number)
+
+        out: list[PRComment] = []
+
+        for ic in pr.get_issue_comments():
+            out.append(PRComment(
+                id=ic.id,
+                kind="issue",
+                author=_comment_author_login(ic),
+                created_at=_safe_iso(ic.created_at),
+                updated_at=_safe_iso(ic.updated_at),
+                url=ic.html_url,
+                body=ic.body or "",
+            ))
+
+        for rc in pr.get_review_comments():
+            # PyGithub exposes ``line`` (file line) and ``original_line``
+            # (line in the original diff). Prefer ``line`` when present
+            # so outdated threads still resolve to something useful.
+            line_num = getattr(rc, "line", None) or getattr(rc, "original_line", None)
+            out.append(PRComment(
+                id=rc.id,
+                kind="inline",
+                author=_comment_author_login(rc),
+                created_at=_safe_iso(rc.created_at),
+                updated_at=_safe_iso(rc.updated_at),
+                url=rc.html_url,
+                body=rc.body or "",
+                path=getattr(rc, "path", None),
+                line=line_num,
+                commit_id=getattr(rc, "commit_id", None),
+                diff_hunk=getattr(rc, "diff_hunk", None),
+                in_reply_to_id=getattr(rc, "in_reply_to_id", None),
+            ))
+
+        for rv in pr.get_reviews():
+            body = (rv.body or "").strip()
+            if not body:
+                # Pure approval / change-request with no prose — nothing
+                # to feed the resolver.
+                continue
+            # PyGithub's Review exposes ``submitted_at`` rather than
+            # ``created_at``; fall back to whichever is present.
+            created = (
+                _safe_iso(getattr(rv, "submitted_at", None))
+                or _safe_iso(getattr(rv, "created_at", None))
+            )
+            out.append(PRComment(
+                id=rv.id,
+                kind="review",
+                author=_comment_author_login(rv),
+                created_at=created,
+                updated_at=created,
+                url=rv.html_url,
+                body=body,
+                review_state=getattr(rv, "state", None),
+            ))
+
+        out.sort(key=lambda c: (c.created_at, c.id))
+        return out, None
+    except GithubException as exc:
+        return [], f"GitHub API error fetching {slug}#{number} comments: {exc}"
+    except Exception as exc:
+        return [], f"Unexpected error fetching {slug}#{number} comments: {exc}"
+
+
 def rebase_pr_was_closed_without_merge(config: Config, pr_url: str) -> bool:
     """True when the port / rebase PR exists on GitHub but is closed unmerged.
 
