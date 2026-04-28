@@ -105,11 +105,19 @@ features:
 #     - https://github.com/Altinity/ClickHouse/pull/789
 #
 #   # Sequential PR groups: cherry-pick multiple PRs onto a SINGLE port
-#   # branch (in listed order) and open ONE combined PR for the whole
-#   # group. Use this when PR #B depends on PR #A and they should land
-#   # together. The group `id` becomes the feature id and the branch
-#   # name (feature/<base>/<id>). Each PR can appear in at most ONE
-#   # group; PRs in groups are removed from the singleton stream.
+#   # branch and open ONE combined PR for the whole group. Use this when
+#   # PR #B depends on PR #A and they should land together. The group
+#   # `id` becomes the feature id and the branch name
+#   # (feature/<base>/<id>). Each PR can appear in at most ONE group;
+#   # PRs in groups are removed from the singleton stream.
+#   #
+#   # Cherry-pick order is controlled by `sort`:
+#   #   - "listed"     (default) walk `prs` top-to-bottom — use when
+#   #                  ordering encodes a logical dependency.
+#   #   - "merged_at"  sort by GitHub merge timestamp ascending; PR
+#   #                  number breaks ties. Convenient when you just want
+#   #                  the chronological replay and don't care about the
+#   #                  exact list order.
 #   #
 #   # `exclude_prs` and `exclude_labels` still drop individual PRs from
 #   # a group; if a group ends up empty it is skipped with a warning.
@@ -128,4 +136,5 @@ features:
 #         - https://github.com/Altinity/ClickHouse/pull/1500   # base change
 #         - https://github.com/Altinity/ClickHouse/pull/1512   # follow-up
 #         - https://github.com/Altinity/ClickHouse/pull/1530   # final fix
-#       # if_exists: skip     # override pr_policy.if_exists
+#       # if_exists: skip       # override pr_policy.if_exists
+#       # sort: merged_at       # default "listed"

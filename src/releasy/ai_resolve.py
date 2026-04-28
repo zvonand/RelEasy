@@ -288,9 +288,8 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{s // 3600}h{(s % 3600) // 60:02d}m"
 
 
-def _truncate(text: str, n: int = 120) -> str:
-    text = text.strip().replace("\n", " ⏎ ")
-    return text if len(text) <= n else text[: n - 1] + "…"
+def _flatten(text: str) -> str:
+    return text.strip().replace("\n", " ⏎ ")
 
 
 def _render_event(line: str, start: float) -> str | None:
@@ -322,11 +321,11 @@ def _render_event(line: str, start: float) -> str | None:
         for block in msg.get("content") or []:
             btype = block.get("type")
             if btype == "text":
-                txt = _truncate(block.get("text", ""))
+                txt = _flatten(block.get("text", ""))
                 if txt:
                     parts.append(f"[dim]│ [{elapsed}][/dim] [cyan]💬[/cyan] {txt}")
             elif btype == "thinking":
-                txt = _truncate(block.get("thinking", ""), 80)
+                txt = _flatten(block.get("thinking", ""))
                 if txt:
                     parts.append(f"[dim]│ [{elapsed}] 🧠 {txt}[/dim]")
             elif btype == "tool_use":
@@ -334,13 +333,13 @@ def _render_event(line: str, start: float) -> str | None:
                 inp = block.get("input") or {}
                 summary = ""
                 if name == "Bash":
-                    summary = _truncate(str(inp.get("command", "")), 100)
+                    summary = _flatten(str(inp.get("command", "")))
                 elif name in ("Read", "Write", "Edit"):
                     summary = str(inp.get("file_path") or inp.get("path") or "")
                 elif name == "Glob":
                     summary = str(inp.get("pattern") or inp.get("glob_pattern") or "")
                 elif name == "Grep":
-                    summary = _truncate(str(inp.get("pattern", "")), 80)
+                    summary = _flatten(str(inp.get("pattern", "")))
                 else:
                     keys = ", ".join(list(inp)[:3])
                     summary = f"({keys})" if keys else ""
@@ -363,7 +362,7 @@ def _render_event(line: str, start: float) -> str | None:
                     text = str(content or "")
                 is_err = block.get("is_error")
                 marker = "[red]✗[/red]" if is_err else "[green]✓[/green]"
-                summary = _truncate(text, 100)
+                summary = _flatten(text)
                 if not summary:
                     return None
                 return f"[dim]│ [{elapsed}][/dim] {marker} [dim]{summary}[/dim]"

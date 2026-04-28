@@ -130,6 +130,7 @@ class FeatureConfig:
 
 
 _VALID_IF_EXISTS = ("skip", "recreate")
+_VALID_GROUP_SORT = ("listed", "merged_at")
 
 
 @dataclass
@@ -147,9 +148,11 @@ class PRSourceConfig:
 class PRGroupConfig:
     """A sequential group of PRs ported onto a single branch as one PR.
 
-    All ``prs`` are cherry-picked, in listed order, onto the same port branch
+    All ``prs`` are cherry-picked onto the same port branch
     ``feature/<base>/<id>`` and result in a single combined PR (when push +
-    ``pr_policy.auto_pr``).
+    ``pr_policy.auto_pr``). Cherry-pick order is controlled by ``sort``:
+    ``"listed"`` (default) walks ``prs`` top-to-bottom, ``"merged_at"`` orders
+    them by GitHub merge timestamp ascending (PR number breaks ties).
     """
     id: str
     prs: list[str]
@@ -158,6 +161,11 @@ class PRGroupConfig:
     # Inherits from ``pr_policy.if_exists`` in config.yaml when not set
     # per-group.
     if_exists: str = "skip"
+    # "listed" — cherry-pick in the order PRs appear in ``prs`` (default,
+    # use when one PR depends on another in a non-chronological way).
+    # "merged_at" — sort by GitHub merge timestamp ascending before
+    # cherry-picking; PR number breaks ties.
+    sort: str = "listed"
 
 
 @dataclass
@@ -1424,12 +1432,19 @@ def load_session(
                 f"pr_sources.groups[id={gid!r}].auto_pr is no longer "
                 "supported. Use pr_policy.auto_pr in config.yaml."
             )
+        group_sort = entry.get("sort", "listed")
+        if group_sort not in _VALID_GROUP_SORT:
+            raise ValueError(
+                f"pr_sources.groups[{gid!r}].sort must be one of "
+                f"{_VALID_GROUP_SORT}, got {group_sort!r}"
+            )
         groups.append(
             PRGroupConfig(
                 id=gid,
                 prs=prs_list,
                 description=entry.get("description", ""),
                 if_exists=group_if_exists,
+                sort=group_sort,
             )
         )
 
@@ -1534,6 +1549,7 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
                     "id": g.id,
                     "description": g.description or None,
                     "if_exists": g.if_exists,
+                    "sort": g.sort if g.sort != "listed" else None,
                     "prs": g.prs,
                 }.items()
                 if v is not None

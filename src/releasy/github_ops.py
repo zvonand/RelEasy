@@ -204,6 +204,53 @@ def update_pull_request(
         return False
 
 
+def create_draft_release(
+    config: Config,
+    *,
+    tag_name: str,
+    name: str,
+    body: str,
+    target_commitish: str | None = None,
+) -> str | None:
+    """Create a draft GitHub release on the origin repo.
+
+    Returns the release HTML URL on success, ``None`` on failure. The
+    release is always created as a draft (``draft=True``); GitHub will
+    not create the tag until the draft is published.
+    """
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set — cannot create release")
+        return None
+
+    try:
+        slug = require_origin_repo_slug(config)
+    except ValueError as exc:
+        log.warning("%s", exc)
+        return None
+    _assert_writes_target_origin(config, slug, f"create draft release {tag_name!r}")
+
+    payload: dict = {
+        "tag_name": tag_name,
+        "name": name,
+        "body": body,
+        "draft": True,
+        "prerelease": False,
+    }
+    if target_commitish:
+        payload["target_commitish"] = target_commitish
+
+    status, data = _rest_api(
+        "POST", f"/repos/{slug}/releases", payload,
+        expected_statuses=(201,),
+    )
+    if status != 201 or not isinstance(data, dict):
+        log.warning("Failed to create draft release %s on %s (status %s)",
+                    tag_name, slug, status)
+        return None
+    return data.get("html_url")
+
+
 # ---------------------------------------------------------------------------
 # PR search by label
 # ---------------------------------------------------------------------------

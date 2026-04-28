@@ -1189,6 +1189,101 @@ def release(
             raise SystemExit(1)
 
 
+@cli.command(
+    name="draft-release",
+    short_help="Generate a release changelog from merge commits.",
+)
+@click.option(
+    "--from", "from_ref", required=True,
+    help="Starting commit / tag (NON-inclusive). Typically the upstream "
+         "tag the target branch was branched from (e.g. v26.1.6.6-stable).",
+)
+@click.option(
+    "--to", "to_ref", required=True,
+    help="Ending commit / tag (inclusive). Usually the tip of the release "
+         "branch or the tag you're cutting.",
+)
+@click.option(
+    "--name", "release_name", default=None,
+    help="GitHub release tag (e.g. v26.1.6.20001.altinityantalya). "
+         "Defaults to --to when omitted. Used verbatim as the tag on the "
+         "draft release; see --title for the human-readable heading.",
+)
+@click.option(
+    "--title", "release_title", default=None,
+    help="Human-readable title used in the changelog heading and as the "
+         "draft release's display name. Defaults to a prettified --name "
+         "(e.g. v26.1.6.20001.altinityantalya → "
+         "'26.1.6.20001 Altinity Antalya').",
+)
+@click.option(
+    "-o", "--output", "output_file",
+    default=None,
+    type=click.Path(dir_okay=False, file_okay=True, path_type=Path),
+    help="Write the rendered markdown to this file instead of creating "
+         "a draft release on GitHub.",
+)
+@click.option(
+    "--work-dir", default=None,
+    help="Working directory for the local clone used to walk merge commits.",
+)
+@click.option(
+    "--compared-to-url", default=None,
+    help="Override the URL used in the 'as compared to' header link. "
+         "When omitted, RelEasy links to the upstream release page if "
+         "--from looks like a tag and an upstream remote is configured, "
+         "otherwise to the origin commit page.",
+)
+@click.option(
+    "--docker-image-url", default=None,
+    help="Full URL to the Docker image (typically the SHA-pinned "
+         "hub.docker.com/layers/... link). When omitted, RelEasy emits "
+         "a placeholder ending in `sha256-TBD` so the digest can be "
+         "filled in mechanically after the image is pushed.",
+)
+@click.pass_context
+def draft_release_cmd(
+    ctx: click.Context,
+    from_ref: str,
+    to_ref: str,
+    release_name: str | None,
+    release_title: str | None,
+    output_file: Path | None,
+    work_dir: str | None,
+    compared_to_url: str | None,
+    docker_image_url: str | None,
+) -> None:
+    """Build a categorised release changelog from target-branch merges.
+
+    Walks the first-parent merge commits in ``--from..--to``, extracts
+    the merged PRs from origin, drops anything labelled / titled as a
+    forward-port, classifies each PR by its Changelog category, and
+    renders the markdown body in Altinity's release-notes format.
+
+    With ``-o`` the markdown is written to disk and nothing is published.
+    Without ``-o`` a DRAFT GitHub release is created on origin (tag =
+    ``--name``, target commitish = ``--to``); the draft URL is printed
+    on stdout.
+    """
+    from releasy.changelog import emit_changelog
+
+    config = _load_and_verify(ctx, session="skip")
+    wd = Path(work_dir) if work_dir else None
+    name = release_name or to_ref
+    if not emit_changelog(
+        config,
+        from_ref=from_ref,
+        to_ref=to_ref,
+        release_name=name,
+        display_title=release_title,
+        output_file=output_file,
+        work_dir=wd,
+        compared_to_url=compared_to_url,
+        docker_image_url=docker_image_url,
+    ):
+        raise SystemExit(1)
+
+
 # ---------------------------------------------------------------------------
 # Project setup
 # ---------------------------------------------------------------------------

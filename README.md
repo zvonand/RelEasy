@@ -245,9 +245,12 @@ pr_sources:
   # open ONE combined PR. Use when later PRs depend on earlier ones.
   # AI conflict resolution runs per cherry-pick step (resolve+build+
   # commit locally); push and combined PR happen once after the last step.
+  # `sort:` controls cherry-pick order — "listed" (default) walks the
+  # `prs:` list, "merged_at" sorts by GitHub merge timestamp ascending.
   groups:
     - id: iceberg-rest
       description: "Iceberg REST catalog support"
+      # sort: merged_at
       prs:
         - https://github.com/Altinity/ClickHouse/pull/1500
         - https://github.com/Altinity/ClickHouse/pull/1512
@@ -311,6 +314,7 @@ Options in the table below live in **config.yaml** unless marked
 | `pr_sources.groups[].prs` *(session)* | Ordered list of PR URLs to cherry-pick onto a single branch and combine into one PR | — |
 | `pr_sources.groups[].description` *(session)* | Title text for the combined PR | id |
 | `pr_sources.groups[].if_exists` *(session)* | Override `pr_policy.if_exists` per group | inherits |
+| `pr_sources.groups[].sort` *(session)* | Cherry-pick order within the group: `listed` (top-to-bottom of `prs:`) or `merged_at` (ascending GitHub merge timestamp; PR number breaks ties) | `listed` |
 | `features[].id` *(session)* | Feature id; used as branch suffix `feature/<base>/<id>` | — |
 | `features[].source_branch` *(session)* | Existing branch holding the feature's commits | — |
 | `features[].description` *(session)* | Shown in the PR title and project board | — |

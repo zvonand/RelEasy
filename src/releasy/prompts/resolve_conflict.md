@@ -72,9 +72,18 @@ When resolving a cherry-pick (or any conflict) that touches this file:
 
 2. **Do not** keep both: the new uncommented lines from the cherry-pick **and** the old commented block. That duplicates or contradicts history.
 
-3. **Do** prefer the existing commented lines: **uncomment them** and align their content with what the cherry-picked commit intended (same keys, same semantics), then **drop** the redundant duplicate lines from the cherry-pick side of the conflict.
+3. **Do** prefer the existing commented lines: **uncomment them in place** by removing the `//` (and any leading whitespace introduced by the comment) from the *existing* line, and align their content with what the cherry-picked commit intended (same keys, same semantics). Then **drop** the redundant duplicate lines from the cherry-pick side of the conflict.
 
-**Summary:** commented-out settings for the same keys → **uncomment and reconcile**, do not **append** the cherry-pick’s additions blindly.
+4. **Uncomment in place — never duplicate.** "Uncomment" means edit the existing commented line so the `//` is gone. It does **not** mean "leave the `// ...` line where it is and add an uncommented copy below it." If after your resolution the file contains both:
+
+   ```cpp
+   // {"foo", true, true, "..."},
+   {"foo", true, true, "..."},
+   ```
+
+   you have done it wrong. Delete the `//`-prefixed line; only the uncommented one should remain. The same applies if the commented and uncommented copies are not adjacent — search the hunk (and any nearby hunks the cherry-pick touched) for a `// {"<same_key>", ...}` twin and remove it.
+
+**Summary:** commented-out settings for the same keys → **uncomment the existing line in place (no duplicate copy left behind) and reconcile**, do not **append** the cherry-pick’s additions blindly.
 
 ---
 
@@ -97,8 +106,24 @@ Signals that may warrant investigation (not a checklist — use judgment):
 - The conflict marker shows "ours" with a completely different structure
   in the same region, not a line-level divergence.
 
-When you suspect this, investigate before touching the conflict. Search
-for the missing identifier in the source-repo history:
+When you suspect this, investigate before touching the conflict.
+
+**Special case — the conflicted file does not exist on `{base_branch}` at
+all.** This is the strongest signal of a missing prereq, and it has a
+direct query: ask the *source PR's branch* who introduced the file.
+
+```bash
+git log --oneline {source_pr_merge_sha} -- <file>
+git log --oneline --diff-filter=A {source_pr_merge_sha} -- <file>
+```
+
+The `--diff-filter=A` form gives you the introducing commit. If that
+commit is a GitHub merge commit (`Merge pull request #NNN ...`), the
+prereq PR number is right there. Run this **before** falling back to
+`git log -S` identifier searches; it is more direct.
+
+For the harder case (file exists on `{base_branch}` but a specific
+*symbol* it uses doesn't), use:
 
 ```bash
 git log -S '<identifier>' --oneline {origin_remote_name}/{origin_branch} -- <file>
@@ -135,14 +160,35 @@ git grep -n '<concept_keyword>' -- <expected_file_or_dir>
 git log --oneline {base_branch} -- <expected_file>
 ```
 
-If you find that `{base_branch}` already has equivalent functionality
-under a different shape (renamed function, restructured type, moved
-location), the prereq is **not missing** — the source PR just needs a
-bucket-2 mechanical adaptation to use the names/shapes `{base_branch}`
-exposes. Proceed to standard resolution; do not report MISSING_PREREQS.
+**The bar for "equivalent on `{base_branch}`" is high.** Name overlap
+is not equivalence. Before concluding the prereq already landed under
+a different shape, check that **the specific symbols the source PR's
+diff touches** are present on `{base_branch}`:
 
-Only when the foundation is *genuinely absent* on `{base_branch}` — no
-equivalent code, no renamed version, no parallel landing — report:
+- Same class/type that the source PR modifies? (Not just a class with a
+  similar name — the *same* class, possibly renamed.)
+- Same cached type / same function signatures the source PR's added
+  code calls into?
+- Would the source PR's `+` lines, with at most a token-level rename,
+  compile against the `{base_branch}` version?
+
+If the answer to any of these is "no — `{base_branch}` has a *different*
+abstraction in the same area" (different cached type, different key
+type, different layer of the stack, etc.), that's a **parallel module**,
+not a renamed prereq. The prereq is still missing. Two caches in the
+same directory caching different things at different layers do not
+substitute for each other.
+
+When uncertain, prefer reporting `MISSING_PREREQS` over `UNRESOLVED`:
+the human reviewer can override a false-positive prereq, but a false-
+negative `UNRESOLVED` strands the PR and every later PR in the group.
+
+Only when the foundation is *genuinely* on `{base_branch}` — same
+abstraction, same API surface that the source PR's diff depends on,
+just possibly renamed or moved — proceed with bucket-2 adaptation
+instead of reporting `MISSING_PREREQS`.
+
+Otherwise, report:
 
 ```
 MISSING_PREREQS: <url1> <url2>
@@ -294,7 +340,13 @@ For every `<<<<<<< ... ======= ... >>>>>>>` block:
    `ProfileEvents`, changelog tables): **only** keep the rows the source
    PR itself adds. The bucket-2 carve-out does **not** apply to these
    append-only registries — re-adding "missing" rows from other PRs is
-   exactly what bucket-2 is *not* about.
+   exactly what bucket-2 is *not* about. **And for
+   `SettingsChangesHistory.cpp` specifically:** if a row the source PR
+   adds already exists on `ours` as a `// ...` commented-out line for
+   the *same key*, uncomment that existing line in place and drop the
+   cherry-pick's duplicate — see the "Special case" section above.
+   Never leave both a `// {"foo", ...}` and a `{"foo", ...}` for the
+   same key in the file.
 
 ### Hard prohibitions
 

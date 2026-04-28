@@ -296,6 +296,15 @@ def _build_group_units(
                 "filtering, skipping[/yellow]"
             )
             continue
+        if group.sort == "merged_at":
+            # Unmerged PRs sort to the end via the "9999" sentinel; PR
+            # number breaks ties between same-timestamp (or both-unmerged)
+            # entries deterministically.
+            group_prs.sort(key=lambda p: (p.merged_at or "9999", p.number))
+            console.print(
+                f"    [dim]Sorted by merged_at: "
+                f"{', '.join(pr_ref_label(pr.repo_slug, pr.number, origin_slug) for pr in group_prs)}[/dim]"
+            )
         units.append(FeatureUnit(
             feature_id=group.id,
             prs=group_prs,
