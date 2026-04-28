@@ -287,6 +287,14 @@ Options in the table below live in **config.yaml** unless marked
 | `review_response.prompt_file` | Prompt template for review-response runs. | `prompts/address_review.md` |
 | `review_response.max_iterations` | Hard cap on build attempts the AI may make per address-review run. | `15` |
 | `review_response.timeout_seconds` | Per-invocation Claude timeout. | `7200` |
+| `analyze_fails.command` | Claude executable used by `analyze-fails`. | `claude` |
+| `analyze_fails.prompt_file` | Prompt template for `analyze-fails`. | `prompts/analyze_fails.md` |
+| `analyze_fails.timeout_seconds` | Per-invocation Claude timeout for `analyze-fails`. | `7200` |
+| `analyze_fails.max_iterations` | Build-attempt cap per failed test the AI investigates. | `6` |
+| `analyze_fails.max_prs_per_run` | Cap on tracked PRs iterated when `--pr` is omitted (0 = no cap). | `0` |
+| `analyze_fails.flaky_elsewhere_threshold` | A failed test seen on this many OTHER tracked PRs is flagged to Claude as a probable master-side flake. `0` disables the heuristic. | `2` |
+| `analyze_fails.flaky_check_prs` | Cap on PRs scanned to build the flaky-elsewhere map. | `12` |
+| `analyze_fails.post_comment_to_pr` | Post a top-level summary comment on each processed PR (per-shard outcomes, AI narration, commit + push status). | `true` |
 | `pr_policy.auto_pr` | Open a PR for every pushed port branch (singletons, by_labels, include_prs, groups). Requires `push: true`. | `true` |
 | `pr_policy.if_exists` | Default for session-file source entries that don't set their own: when a port branch exists *locally only*, `skip` or `recreate`. With `recreate`, an in-progress cherry-pick / merge / rebase at startup is auto-aborted; with `skip` the pipeline halts. Branches that already exist on the remote are always skipped. | `skip` |
 | `pr_policy.retry_failed` | When a PR unit has a `conflict` entry in state from a previous run: `true` discards the existing local / remote port branch and re-runs the cherry-pick from base; `false` leaves the entry exactly as-is. Overridable per-invocation with `--retry-failed` / `--no-retry-failed` on `releasy run`. | `true` |
@@ -333,20 +341,21 @@ does and when to reach for it.
 
 ### At a glance: which command does what
 
-The three "doing" commands look similar but operate on different things —
+The four "doing" commands look similar but operate on different things —
 this matrix is the quickest way to pick the right one.
 
-| | `run` | `continue` | `refresh` | `address-review` |
-|--|:-----:|:----------:|:---------:|:----------------:|
-| Discovers new PRs from `pr_sources` (labels, include_prs, groups) | ✅ | — | — | — |
-| Creates new port branches (cherry-pick onto `origin/<base>`) | ✅ | — | — | — |
-| Opens new rebase PRs | ✅ for new ports | ✅ for branches that missed PR creation last time | — | — |
-| AI-resolves **cherry-pick** conflicts (initial port) | ✅ | — | — | — |
-| AI-resolves **merge** conflicts (target branch moved on) | — | — | ✅ | — |
-| AI-addresses reviewer comments on a specific PR | — | — | — | ✅ |
-| Iterates entries already in the project state file | only to skip / ensure-PR | ✅ all of them | ✅ all tracked PRs | — (stateless; acts on `--pr`) |
-| Mutates your local work-dir | ✅ (cherry-picks) | ✅ (push only) | ✅ (merges) | ✅ (appends commits) |
-| Pushes to origin | ✅ | ✅ | ✅ (only merge commits, on conflict-resolution) | ✅ (plain push, no force) |
+| | `run` | `continue` | `refresh` | `address-review` | `analyze-fails` |
+|--|:-----:|:----------:|:---------:|:----------------:|:---------------:|
+| Discovers new PRs from `pr_sources` (labels, include_prs, groups) | ✅ | — | — | — | — |
+| Creates new port branches (cherry-pick onto `origin/<base>`) | ✅ | — | — | — | — |
+| Opens new rebase PRs | ✅ for new ports | ✅ for branches that missed PR creation last time | — | — | — |
+| AI-resolves **cherry-pick** conflicts (initial port) | ✅ | — | — | — | — |
+| AI-resolves **merge** conflicts (target branch moved on) | — | — | ✅ | — | — |
+| AI-addresses reviewer comments on a specific PR | — | — | — | ✅ | — |
+| AI-investigates failing CI tests on a PR | — | — | — | — | ✅ |
+| Iterates entries already in the project state file | only to skip / ensure-PR | ✅ all of them | ✅ all tracked PRs | — (stateless; acts on `--pr`) | ✅ all tracked PRs (or just `--pr`) |
+| Mutates your local work-dir | ✅ (cherry-picks) | ✅ (push only) | ✅ (merges) | ✅ (appends commits) | ✅ (appends commits) |
+| Pushes to origin | ✅ | ✅ | ✅ (only merge commits, on conflict-resolution) | ✅ (plain push, no force) | ✅ (plain push, no force) |
 
 In one-line summaries:
 
@@ -361,6 +370,21 @@ In one-line summaries:
   the project state file: for each tracked PR, attempts
   `git merge origin/<base>` into the PR branch and AI-resolves any
   conflicts. Doesn't open new PRs, doesn't discover new sources.
+- **`analyze-fails`** — *"CI is red; ask the AI to triage and fix
+  what it can."* Walks the failed CI statuses on a PR's head commit
+  (or every tracked PR when `--pr` is omitted), filters down to the
+  human-readable praktika reports (Fast test / Stateless tests /
+  Integration tests), and invokes Claude **once per failed CI shard**
+  with the full bundled failure list. Claude runs an iterative loop
+  inside that one session: read every failure, group by likely root
+  cause, fix the highest-leverage one, build, re-run **all** the
+  still-failing tests in a single batch, see what's left, repeat.
+  Many tests in CI fail for the same regression — this shape lets a
+  single fix knock dozens of tests green at once instead of asking
+  Claude to investigate each one independently. A "flaky-elsewhere"
+  map cross-checks failure names against other tracked PRs and is
+  fed into the prompt so master-side flakes get classified as
+  `UNRELATED` instead of fix-attempts. Plain push at the end.
 - **`address-review`** — *"a reviewer left comments; ask the AI to
   apply them."* Stateless, operates on `--pr <URL>`. Fetches every
   comment, filters down to those authored by trusted reviewers (the
@@ -449,6 +473,141 @@ releasy refresh [--work-dir <path>]
 | `--resolve-conflicts` / `--no-resolve-conflicts` | Toggle the AI resolver. With `--no-resolve-conflicts`, conflicting PRs are flagged in state without an automatic fix attempt. | on |
 
 Exit code: `1` if any PR ended up in `conflict` status, `0` otherwise.
+
+#### `releasy analyze-fails` — investigate red CI on a PR (or every tracked PR)
+
+Walks the **commit-status** entries on the PR's head SHA whose
+`target_url` points at the praktika JSON viewer (typically
+`https://altinity-build-artifacts.s3.amazonaws.com/json.html?…`),
+classifies them as Fast test / Stateless / Integration, fetches the
+underlying `result_*.json` artefact for each failed shard, and bundles
+**all the failures from one shard** into a single Claude invocation.
+GitHub-Actions job logs (e.g. `PR / Fast test (pull_request)`,
+`RegressionTestsRelease / Iceberg (1) / iceberg_1`) are deliberately
+ignored — only the parsed praktika reports drive per-test analysis.
+
+The shape per shard is **iterative**, not one-shot:
+
+1. Claude triages every failure in the shard, separating likely-related
+   failures from flake / pre-existing issues.
+2. Picks the highest-leverage root cause (the one fix that plausibly
+   resolves the most tests).
+3. Makes the smallest possible change, builds.
+4. Re-runs every still-failing test from the shard in **one batch**
+   (e.g. `tests/clickhouse-test t1 t2 t3 …` rather than once per test).
+5. Reads what passes now, what's still failing.
+6. Repeats steps 2–5 with the shrinking failure set, up to
+   `max_iterations` build attempts per shard.
+
+The full failed-test list for the shard is dropped on disk at
+`.releasy/failed-tests.txt` so Claude has a reliable handle on it
+even when the count exceeds what the prompt can inline.
+
+By default the command also builds a **flaky-elsewhere map**: every
+tracked PR's failed-test list is cross-referenced, and any test failing
+on `flaky_elsewhere_threshold` (default 2) other tracked PRs is
+flagged in the prompt as a likely master-side flake.
+
+Per-shard outcomes:
+
+- `DONE` — every test in the shard's input list now passes locally
+  (or is confirmed `[unrelated]` flake).
+- `PARTIAL` — at least one test was fixed; some are still failing or
+  weren't investigated within budget. The common case for tricky
+  shards.
+- `UNRELATED` — the entire shard is master-side flake; no code
+  changes.
+- `UNRESOLVED` — Claude couldn't make progress (build broken, every
+  attempt regressed).
+
+The Anthropic spend for each PR is added to the matching feature's
+`ai_cost_usd` (same field cherry-pick conflict resolution and
+`refresh` write to), so the GitHub Project board's **AI Cost** column
+shows the cumulative spend across every Claude-driven workflow on
+that port — `releasy run` / `releasy refresh` / `releasy
+analyze-fails` all roll up to one number per feature. The board sync
+runs automatically at the end of an `analyze-fails` invocation when
+`push: true`; if it's off, the cost still lands in `state.yaml` and
+the next `releasy sync-project` (or any other syncing command) picks
+it up.
+
+```bash
+releasy analyze-fails [--pr <URL>]
+                      [--work-dir <path>]
+                      [--dry-run]
+                      [--push | --no-push]
+                      [--no-flaky-check]
+                      [--stateless ...]
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--pr <URL>` | PR on the configured origin. Omit to iterate every tracked PR with a `rebase_pr_url` in state. | — |
+| `--work-dir <path>` | Working directory for git operations. | from config / cwd |
+| `--dry-run` | List failed tests + flaky-elsewhere counts and exit. No Claude, no push. | off |
+| `--push` / `--no-push` | Push the AI's commits to each PR's head branch. Plain push, no force; a race aborts. | on |
+| `--no-flaky-check` | Skip the flaky-elsewhere assessment (don't fetch reports for other tracked PRs). | off |
+| `--post-comment` / `--no-post-comment` | Post a top-level summary comment on each processed PR. The comment carries the per-shard classifications (`DONE` / `PARTIAL` / `UNRELATED` / `UNRESOLVED`), Claude's narration in a `<details>` block, and an explicit "Commits added: N (pushed / NOT pushed / —)" line so the operator can tell at a glance what actually changed. | `analyze_fails.post_comment_to_pr` (`true`) |
+| `--stateless` | Skip session/state/lock and run against `--pr` alone. config.yaml is still loaded if present so AI settings, origin, and the build command are inherited. | off |
+| `--origin <URL>` *(stateless only)* | Override origin remote URL. | config / derived from `--pr` |
+| `--build-command <cmd>` *(stateless only)* | Shell command Claude runs to build before reproducing the failure. | from `ai_resolve.build_command` |
+| `--claude-command <path>` *(stateless only)* | Executable used to invoke Claude. | from `analyze_fails.command` / `claude` |
+| `--prompt-file <path>` *(stateless only)* | Prompt template. | bundled `prompts/analyze_fails.md` |
+| `--timeout <seconds>` *(stateless only)* | Per-invocation Claude timeout. | from config / `7200` |
+| `--max-iterations <n>` *(stateless only)* | Build-attempt cap per failed test. | from config / `6` |
+| `--max-prs <n>` *(stateless only)* | Cap on tracked PRs to iterate when `--pr` is omitted (0 = no cap). | from config / `0` |
+
+Config block (all optional):
+
+```yaml
+analyze_fails:
+  command: claude                       # Claude executable
+  prompt_file: prompts/analyze_fails.md # path resolved against config dir
+  timeout_seconds: 7200
+  max_iterations: 6
+  max_prs_per_run: 0                    # 0 = no cap
+  flaky_elsewhere_threshold: 2          # 0 = disable heuristic
+  flaky_check_prs: 12                   # cap on cross-check PRs
+  post_comment_to_pr: true              # post a summary comment per run
+
+  # Optional: extend the Claude allowlist for the test runners /
+  # binaries Claude needs to invoke. Use {work_dir} (alias: {repo_dir},
+  # {cwd}) where you'd otherwise have to hardcode your absolute repo
+  # path; RelEasy substitutes the live work-dir at invocation time.
+  # allowed_tools:
+  #   - Read
+  #   - Edit
+  #   - Write
+  #   - Glob
+  #   - Grep
+  #   - Bash(git:*)
+  #   - Bash(gh:*)
+  #   - Bash(cd:*)
+  #   - Bash(bash:*)
+  #   - Bash(rm:*)
+  #   - Bash(ls:*)
+  #   - Bash(cat:*)
+  #   - Bash(head:*)
+  #   - Bash(tail:*)
+  #   - Bash(tee:*)
+  #   - Bash(rg:*)
+  #   - Bash(ninja:*)
+  #   - Bash(cmake:*)
+  #   - Bash(make:*)
+  #   - Bash(tests/clickhouse-test:*)
+  #   - Bash(tests/integration/runner:*)
+  #   - Bash(pytest:*)
+  #   - Bash({work_dir}/build/programs/clickhouse:*)
+```
+
+Exit code: `1` on any per-PR failure (couldn't fetch metadata, push
+race, non-linear history, …); `0` otherwise even if every test was
+classified `UNRELATED`.
+
+> **Linear history only**, same rules as `address-review`: Claude may
+> only append new commits — no amend, no rebase, no `reset --hard`,
+> no force-push. Retracting a previous change happens via
+> `git revert <sha>`.
 
 #### `releasy address-review` — AI-address reviewer comments
 

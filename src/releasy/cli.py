@@ -872,6 +872,290 @@ def address_review_cmd(
             raise SystemExit(1)
 
 
+@cli.command(
+    name="analyze-fails",
+    short_help="Investigate failed CI tests on a PR (or every tracked PR).",
+)
+@click.option(
+    "--pr",
+    "pr_url",
+    default=None,
+    help="GitHub URL of the PR to analyse. When omitted, every PR "
+         "RelEasy currently tracks in state (with a rebase_pr_url) is "
+         "processed in turn.",
+)
+@click.option("--work-dir", default=None, help="Working directory for git operations")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Discover failed tests, build the flaky-elsewhere map, and "
+         "print what would happen — without invoking Claude or pushing.",
+)
+@click.option(
+    "--push/--no-push",
+    default=True,
+    help="Push commits the AI appended to each PR's head branch. "
+         "Default: on.",
+)
+@click.option(
+    "--no-flaky-check",
+    is_flag=True,
+    default=False,
+    help="Skip the flaky-elsewhere assessment (don't fetch reports for "
+         "other tracked PRs to corroborate flake signals). Faster, "
+         "but Claude has to judge unrelated-vs-related from the diff "
+         "alone.",
+)
+@click.option(
+    "--post-comment/--no-post-comment",
+    "post_comment",
+    default=None,
+    help="Post a top-level summary comment on each processed PR "
+         "(per-shard outcomes, AI narration, commit + push status). "
+         "Defaults to the `analyze_fails.post_comment_to_pr` config "
+         "value (default: on). Use --no-post-comment for silent "
+         "runs that only narrate to local stdout.",
+)
+@click.option(
+    "--stateless",
+    is_flag=True,
+    default=False,
+    help="Skip the session and state files: no per-project lock, no "
+         "ownership check, no state mutations. config.yaml IS still "
+         "loaded (with the usual --config override) so AI settings, "
+         "origin, etc. are inherited. Required if --pr points at a "
+         "repo that's not the project origin, or when no project "
+         "config exists in cwd.",
+)
+@click.option(
+    "--origin",
+    "origin_url",
+    default=None,
+    help="(stateless only) Origin remote URL to push to. Use this if "
+         "you need an ssh-form URL instead of https. When config.yaml "
+         "is present its origin is used unless this flag overrides.",
+)
+@click.option(
+    "--build-command",
+    "build_command_cli",
+    default=None,
+    help="(stateless only) Shell command the AI may run inside the "
+         "repo to verify its changes compile and to (re)build "
+         "ClickHouse before reproducing the failing test. Empty means "
+         "'no build'. Overrides ai_resolve.build_command in config.",
+)
+@click.option(
+    "--claude-command",
+    "claude_command",
+    default=None,
+    help="(stateless only) Executable used to invoke Claude. "
+         "Overrides analyze_fails.command in config.",
+)
+@click.option(
+    "--prompt-file",
+    "prompt_file_cli",
+    default=None,
+    help="(stateless only) Path to the analyze-fails prompt template. "
+         "Overrides analyze_fails.prompt_file in config. Defaults to "
+         "the prompt bundled with the releasy package.",
+)
+@click.option(
+    "--timeout",
+    "timeout_seconds",
+    type=int,
+    default=None,
+    help="(stateless only) Per-invocation Claude timeout in seconds.",
+)
+@click.option(
+    "--max-iterations",
+    "max_iterations_cli",
+    type=int,
+    default=None,
+    help="(stateless only) Hard cap on build attempts per failed test.",
+)
+@click.option(
+    "--max-prs",
+    "max_prs_cli",
+    type=int,
+    default=None,
+    help="(stateless only) Cap on how many tracked PRs to process when "
+         "--pr is omitted (0 = no cap). Overrides "
+         "analyze_fails.max_prs_per_run.",
+)
+@click.pass_context
+def analyze_fails_cmd(
+    ctx: click.Context,
+    pr_url: str | None,
+    work_dir: str | None,
+    dry_run: bool,
+    push: bool,
+    no_flaky_check: bool,
+    post_comment: bool | None,
+    stateless: bool,
+    origin_url: str | None,
+    build_command_cli: str | None,
+    claude_command: str | None,
+    prompt_file_cli: str | None,
+    timeout_seconds: int | None,
+    max_iterations_cli: int | None,
+    max_prs_cli: int | None,
+) -> None:
+    """Walk failed CI on a PR (or every tracked PR), debug + fix per test.
+
+    For each failed test that surfaces in a praktika JSON report
+    (Fast test / Stateless tests / Integration tests), Claude:
+
+    \b
+    1. Reads the failure excerpt and the PR's diff.
+    2. Decides "related to this PR" vs "unrelated flake on master".
+    3. If related, reproduces the failure locally, fixes the test or
+       the code under test, and commits.
+
+    A "flaky-elsewhere" assessment is built from the OTHER tracked
+    PRs' reports — when a test is failing in N >= threshold other PRs,
+    Claude is told so and is encouraged to exit with UNRELATED. The
+    final classification is always Claude's call (the heuristic is a
+    hint, not a hard cutoff), so disable it with --no-flaky-check if
+    you want every test investigated regardless.
+
+    Exit code is 1 on any per-PR failure (couldn't fetch metadata,
+    push race, non-linear history, …); 0 on success even if every
+    test was UNRELATED.
+    """
+    from releasy.analyze_fails import analyze_fails
+
+    wd = Path(work_dir) if work_dir else None
+
+    stateless_only_set: list[str] = []
+    if origin_url is not None:
+        stateless_only_set.append("--origin")
+    if build_command_cli is not None:
+        stateless_only_set.append("--build-command")
+    if claude_command is not None:
+        stateless_only_set.append("--claude-command")
+    if prompt_file_cli is not None:
+        stateless_only_set.append("--prompt-file")
+    if timeout_seconds is not None:
+        stateless_only_set.append("--timeout")
+    if max_iterations_cli is not None:
+        stateless_only_set.append("--max-iterations")
+    if max_prs_cli is not None:
+        stateless_only_set.append("--max-prs")
+
+    if not stateless and stateless_only_set:
+        raise click.UsageError(
+            f"{', '.join(stateless_only_set)} only apply with "
+            "--stateless. Drop the flags, or add --stateless to skip "
+            "the session/state/lock layer."
+        )
+
+    if stateless:
+        from releasy.config import (
+            build_stateless_analyze_fails_config,
+            load_config,
+            overlay_analyze_fails_overrides,
+        )
+        from releasy.github_ops import parse_pr_url, slug_to_https_url
+
+        config_path = ctx.obj.get("config_path")
+        config: Config | None = None
+        try:
+            config = load_config(
+                Path(config_path) if config_path else None,
+            )
+        except FileNotFoundError:
+            config = None
+        except Exception as e:
+            raise click.ClickException(f"Failed to load config: {e}")
+
+        if config is None:
+            effective_origin = origin_url
+            if not effective_origin:
+                if not pr_url:
+                    raise click.ClickException(
+                        "Stateless run without config.yaml requires "
+                        "either --origin or --pr (so the origin can be "
+                        "derived from the PR URL)."
+                    )
+                parsed = parse_pr_url(pr_url)
+                if parsed is None:
+                    raise click.ClickException(
+                        f"Could not parse --pr URL: {pr_url!r}"
+                    )
+                owner, repo, _ = parsed
+                effective_origin = slug_to_https_url(f"{owner}/{repo}")
+            config = build_stateless_analyze_fails_config(
+                origin_url=effective_origin,
+                work_dir=wd,
+                claude_command=claude_command or "claude",
+                build_command=build_command_cli or "",
+                prompt_file=prompt_file_cli,
+                timeout_seconds=(
+                    timeout_seconds if timeout_seconds is not None else 7200
+                ),
+                max_iterations=(
+                    max_iterations_cli
+                    if max_iterations_cli is not None else 6
+                ),
+                max_prs_per_run=(
+                    max_prs_cli if max_prs_cli is not None else 0
+                ),
+            )
+        else:
+            if origin_url:
+                config.origin.remote = origin_url
+            overlay_analyze_fails_overrides(
+                config,
+                claude_command=claude_command,
+                build_command=build_command_cli,
+                prompt_file=prompt_file_cli,
+                timeout_seconds=timeout_seconds,
+                max_iterations=max_iterations_cli,
+                max_prs_per_run=max_prs_cli,
+            )
+
+        config.session = None
+        config.stateless = True
+        result = analyze_fails(
+            config, pr_url=pr_url, work_dir=wd, dry_run=dry_run,
+            push=push, no_flaky_check=no_flaky_check,
+            post_comment=post_comment,
+        )
+        if not result.success:
+            if result.error:
+                raise click.ClickException(result.error)
+            raise SystemExit(1)
+        for r in result.runs:
+            if r.comment_url:
+                click.echo(f"PR comment: {r.comment_url}")
+        return
+
+    if pr_url is None:
+        # Multi-PR mode needs the state file to enumerate tracked PRs.
+        with _locked_config(ctx, session="optional") as config:
+            result = analyze_fails(
+                config, pr_url=None, work_dir=wd, dry_run=dry_run,
+                push=push, no_flaky_check=no_flaky_check,
+            )
+            if not result.success:
+                if result.error:
+                    raise click.ClickException(result.error)
+                raise SystemExit(1)
+        return
+
+    with _locked_config(ctx, session="skip") as config:
+        result = analyze_fails(
+            config, pr_url=pr_url, work_dir=wd, dry_run=dry_run,
+            push=push, no_flaky_check=no_flaky_check,
+            post_comment=post_comment,
+        )
+        if not result.success:
+            if result.error:
+                raise click.ClickException(result.error)
+            raise SystemExit(1)
+
+
 # ---------------------------------------------------------------------------
 # Release
 # ---------------------------------------------------------------------------

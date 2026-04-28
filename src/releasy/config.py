@@ -311,6 +311,60 @@ def _default_allowed_tools() -> list[str]:
     ]
 
 
+def _default_analyze_fails_allowed_tools() -> list[str]:
+    """Allowlist for ``releasy analyze-fails`` — strictly additive to the
+    base list.
+
+    Investigating CI failures naturally needs a few capabilities the
+    cherry-pick / review flows don't:
+
+    * ``WebFetch`` / ``WebSearch`` so Claude can pull upstream issue
+      threads, ClickHouse docs, error-message references, and the
+      praktika report itself when it needs more than the inlined
+      excerpt.
+    * Test-runner binaries (``tests/clickhouse-test``,
+      ``tests/integration/runner``, ``pytest``).
+    * ``rm`` for the ``rm -rf ci/tmp`` directive baked into the prompt.
+    * ``echo`` / ``wc`` / ``grep`` / ``awk`` / ``sed`` — staples of any
+      shell-driven log triage.
+
+    Users can override this entirely via
+    ``analyze_fails.allowed_tools`` in config.yaml; the
+    ``{work_dir}`` / ``{repo_dir}`` / ``{cwd}`` placeholders resolve to
+    the live repo path each invocation, so absolute-binary entries
+    stay portable.
+    """
+    return _default_allowed_tools() + [
+        "WebFetch", "WebSearch",
+        # File-system mutation needed by test runners that materialise
+        # config trees (e.g. ClickHouse's ``ci/tmp/etc/...`` for an
+        # integration scenario) before invoking the binary. Claude
+        # Code's allowlist doesn't support path-scoped Bash patterns,
+        # so these are deliberately broad — the safety net is that
+        # Claude operates from the repo dir, ``ci/tmp`` is gitignored,
+        # and the post-run linear-history + working-tree-clean check
+        # rejects any drift before push.
+        "Bash(rm:*)", "Bash(mkdir:*)", "Bash(touch:*)",
+        "Bash(cp:*)", "Bash(mv:*)",
+        "Bash(chmod:*)",
+        "Bash(echo:*)", "Bash(wc:*)", "Bash(grep:*)",
+        "Bash(awk:*)", "Bash(sed:*)", "Bash(find:*)",
+        "Bash(diff:*)", "Bash(sort:*)", "Bash(uniq:*)",
+        "Bash(xargs:*)", "Bash(tr:*)", "Bash(cut:*)",
+        "Bash(tests/clickhouse-test:*)",
+        "Bash(tests/integration/runner:*)",
+        "Bash(./tests/clickhouse-test:*)",
+        "Bash(./tests/integration/runner:*)",
+        "Bash(pytest:*)",
+        "Bash(python:*)", "Bash(python3:*)",
+        # Project-binary paths that {work_dir} resolves to at runtime;
+        # see analyze_fails._resolve_tool_paths.
+        "Bash({work_dir}/build/programs/clickhouse:*)",
+        "Bash({work_dir}/tests/clickhouse-test:*)",
+        "Bash({work_dir}/tests/integration/runner:*)",
+    ]
+
+
 @dataclass
 class AIChangelogConfig:
     """Claude-driven CHANGELOG entry synthesis for grouped PR ports.
@@ -408,6 +462,54 @@ class ReviewResponseConfig:
 
 
 @dataclass
+class AnalyzeFailsConfig:
+    """Claude-driven CI-failure investigator configuration.
+
+    Drives ``releasy analyze-fails`` — an AI pass that walks failed CI
+    statuses on a PR's head commit, fetches the parsed praktika JSON
+    reports, and invokes Claude per failed test to reproduce + fix it
+    (or classify it as an unrelated flake).
+
+    The build wrapper materialised inside the repo reuses
+    ``ai_resolve.build_command`` (so a project that already configured
+    a build for conflict resolution gets the same one here for free).
+    Per-test reproduction commands are baked into the prompt; this
+    config controls only how Claude is invoked.
+    """
+    command: str = "claude"
+    prompt_file: str = "prompts/analyze_fails.md"
+    # Full build + per-test rerun cycles routinely take 30-60 minutes,
+    # so 2h gives Claude headroom for one iteration plus a retry.
+    timeout_seconds: int = 7200  # 2h
+    # Build attempts cap — the prompt forwards this verbatim and Claude
+    # is instructed to exit with UNRESOLVED if it hits the wall.
+    max_iterations: int = 6
+    # When `--pr` is omitted, only this many tracked PRs are processed
+    # per invocation (0 = no cap). Keeps a stray cron run from
+    # cherry-picking everyone's CI bill at once.
+    max_prs_per_run: int = 0
+    # The same test failing in this many OTHER recent tracked PRs
+    # earns it the "likely unrelated flake" label, which Claude is told
+    # about in the prompt. Set to 0 to disable the heuristic entirely
+    # (Claude will then judge purely by diff inspection).
+    flaky_elsewhere_threshold: int = 2
+    # Cap on how many other tracked PRs we'll fetch reports for to
+    # build the flaky-elsewhere map. Cheap reads from S3, but each one
+    # is a network round-trip per shard, so we don't want it unbounded.
+    flaky_check_prs: int = 12
+    # When the PR is on origin, post a top-level comment summarising
+    # each shard's outcome (test counts, classification, Claude's
+    # narration tail, commits added, cost). The comment is the durable
+    # record of what an investigation concluded — local stdout is
+    # cropped by the terminal, the comment is not.
+    post_comment_to_pr: bool = True
+    allowed_tools: list[str] = field(
+        default_factory=_default_analyze_fails_allowed_tools,
+    )
+    extra_args: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AIResolveConfig:
     """Claude-driven conflict resolver configuration."""
     enabled: bool = False
@@ -500,6 +602,7 @@ class Config:
     ai_resolve: AIResolveConfig = field(default_factory=AIResolveConfig)
     ai_changelog: AIChangelogConfig = field(default_factory=AIChangelogConfig)
     review_response: ReviewResponseConfig = field(default_factory=ReviewResponseConfig)
+    analyze_fails: AnalyzeFailsConfig = field(default_factory=AnalyzeFailsConfig)
     config_path: Path = field(default_factory=lambda: Path.cwd() / "config.yaml")
     work_dir: Path | None = None
     # When set, a copy of all stdout+stderr (Rich, Click, logging, tracebacks)
@@ -918,6 +1021,27 @@ def load_config(config_path: Path | None = None) -> Config:
         extra_args=rr_raw.get("extra_args", []) or [],
     )
 
+    af_raw = raw.get("analyze_fails", {}) or {}
+    analyze_fails = AnalyzeFailsConfig(
+        command=af_raw.get("command", "claude"),
+        prompt_file=af_raw.get(
+            "prompt_file", "prompts/analyze_fails.md",
+        ),
+        timeout_seconds=int(af_raw.get("timeout_seconds", 7200)),
+        max_iterations=int(af_raw.get("max_iterations", 6)),
+        max_prs_per_run=int(af_raw.get("max_prs_per_run", 0)),
+        flaky_elsewhere_threshold=int(
+            af_raw.get("flaky_elsewhere_threshold", 2),
+        ),
+        flaky_check_prs=int(af_raw.get("flaky_check_prs", 12)),
+        post_comment_to_pr=bool(af_raw.get("post_comment_to_pr", True)),
+        allowed_tools=(
+            af_raw.get("allowed_tools")
+            or _default_analyze_fails_allowed_tools()
+        ),
+        extra_args=af_raw.get("extra_args", []) or [],
+    )
+
     raw_work_dir = raw.get("work_dir")
     work_dir = Path(raw_work_dir).resolve() if raw_work_dir else None
 
@@ -964,6 +1088,7 @@ def load_config(config_path: Path | None = None) -> Config:
         ai_resolve=ai_resolve,
         ai_changelog=ai_changelog,
         review_response=review_response,
+        analyze_fails=analyze_fails,
         config_path=config_path,
         work_dir=work_dir,
         log_file=log_file,
@@ -1579,6 +1704,109 @@ def build_stateless_address_review_config(
         allowed_tools=(
             list(allowed_tools) if allowed_tools is not None
             else _default_allowed_tools()
+        ),
+        extra_args=list(extra_args or []),
+    )
+    return base
+
+
+def overlay_analyze_fails_overrides(
+    config: Config,
+    *,
+    claude_command: str | None = None,
+    build_command: str | None = None,
+    prompt_file: str | None = None,
+    timeout_seconds: int | None = None,
+    max_iterations: int | None = None,
+    max_prs_per_run: int | None = None,
+    flaky_elsewhere_threshold: int | None = None,
+    flaky_check_prs: int | None = None,
+    post_comment_to_pr: bool | None = None,
+    allowed_tools: list[str] | None = None,
+    extra_args: list[str] | None = None,
+) -> None:
+    """Apply CLI overrides on top of a loaded ``Config`` for ``analyze-fails``.
+
+    Mutates ``config`` in place. ``None`` arguments leave the existing
+    value untouched. Like ``overlay_address_review_overrides``, a
+    ``--build-command`` override flows into ``ai_resolve.build_command``
+    so the build wrapper materialised in the work-dir matches.
+    """
+    af = config.analyze_fails
+    if claude_command is not None:
+        af.command = claude_command
+    if prompt_file is not None:
+        af.prompt_file = prompt_file
+    if timeout_seconds is not None:
+        af.timeout_seconds = timeout_seconds
+    if max_iterations is not None:
+        af.max_iterations = max_iterations
+    if max_prs_per_run is not None:
+        af.max_prs_per_run = max_prs_per_run
+    if flaky_elsewhere_threshold is not None:
+        af.flaky_elsewhere_threshold = flaky_elsewhere_threshold
+    if flaky_check_prs is not None:
+        af.flaky_check_prs = flaky_check_prs
+    if post_comment_to_pr is not None:
+        af.post_comment_to_pr = post_comment_to_pr
+    if allowed_tools is not None:
+        af.allowed_tools = list(allowed_tools)
+    if extra_args is not None:
+        af.extra_args = list(extra_args)
+    if build_command is not None:
+        config.ai_resolve.build_command = build_command
+
+
+def build_stateless_analyze_fails_config(
+    *,
+    origin_url: str,
+    work_dir: Path | None = None,
+    claude_command: str = "claude",
+    build_command: str = "",
+    prompt_file: str | None = None,
+    timeout_seconds: int = 7200,
+    max_iterations: int = 6,
+    max_prs_per_run: int = 0,
+    flaky_elsewhere_threshold: int = 2,
+    flaky_check_prs: int = 12,
+    post_comment_to_pr: bool = True,
+    allowed_tools: list[str] | None = None,
+    extra_args: list[str] | None = None,
+) -> Config:
+    """Build an in-memory ``Config`` for ``releasy analyze-fails`` with no
+    on-disk ``config.yaml``.
+
+    Prefer :func:`load_config` + :func:`overlay_analyze_fails_overrides`
+    when a config file exists — that path inherits AI settings,
+    notifications, and the build command from the project's config.
+    """
+    if prompt_file is None:
+        bundled = (
+            Path(__file__).parent / "prompts" / "analyze_fails.md"
+        ).resolve()
+        prompt_file = str(bundled)
+
+    base = make_stateless_config(
+        origin_url,
+        work_dir=work_dir,
+        push=True,
+        auto_pr=False,
+        ai_enabled=False,
+        ai_command=claude_command,
+        ai_build_command=build_command,
+    )
+    base.analyze_fails = AnalyzeFailsConfig(
+        command=claude_command,
+        prompt_file=prompt_file,
+        timeout_seconds=timeout_seconds,
+        max_iterations=max_iterations,
+        max_prs_per_run=max_prs_per_run,
+        flaky_elsewhere_threshold=flaky_elsewhere_threshold,
+        flaky_check_prs=flaky_check_prs,
+        post_comment_to_pr=post_comment_to_pr,
+        allowed_tools=(
+            list(allowed_tools) if allowed_tools is not None
+            else _default_analyze_fails_allowed_tools()
         ),
         extra_args=list(extra_args or []),
     )
