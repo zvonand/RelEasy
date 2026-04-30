@@ -204,6 +204,56 @@ def update_pull_request(
         return False
 
 
+def close_pull_request(
+    config: Config,
+    pr_number: int,
+    *,
+    comment: str | None = None,
+) -> bool:
+    """Close an open PR **on the origin repo**, optionally leaving a comment.
+
+    Returns True on success (the PR is closed after the call) or when the
+    PR was already closed, False on any GitHub failure. Like the other
+    write helpers this only ever targets the configured origin.
+    """
+    token = get_github_token()
+    if not token:
+        log.warning("RELEASY_GITHUB_TOKEN not set — cannot close PR")
+        return False
+
+    try:
+        slug = require_origin_repo_slug(config)
+    except ValueError as exc:
+        log.warning("%s", exc)
+        return False
+    _assert_writes_target_origin(config, slug, f"close PR #{pr_number}")
+
+    try:
+        from github import Github, GithubException
+
+        gh = Github(token)
+        repo = gh.get_repo(slug)
+        pr = repo.get_pull(pr_number)
+        if comment:
+            try:
+                pr.create_issue_comment(comment)
+            except GithubException as exc:
+                log.warning(
+                    "Failed to post superseded-by comment on %s#%d: %s",
+                    slug, pr_number, exc,
+                )
+        if pr.state == "closed":
+            return True
+        pr.edit(state="closed")
+        return True
+    except GithubException as exc:
+        log.warning("Failed to close PR %s#%d: %s", slug, pr_number, exc)
+        return False
+    except Exception as exc:
+        log.warning("Unexpected error closing PR %s#%d: %s", slug, pr_number, exc)
+        return False
+
+
 def create_draft_release(
     config: Config,
     *,

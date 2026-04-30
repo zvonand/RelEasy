@@ -503,49 +503,268 @@ def import_cmd(ctx: click.Context) -> None:
             raise SystemExit(1)
 
 
-@cli.command(short_help="Merge target branch into each tracked PR.")
+@cli.command(
+    short_help="Resolve target-branch conflicts on a PR (or every tracked PR).",
+)
+@click.option(
+    "--pr",
+    "pr_url",
+    default=None,
+    help="GitHub URL of a single PR to merge target into and AI-resolve "
+         "conflicts on. When omitted, walks every PR currently tracked "
+         "in the project state file. Required when --stateless is set.",
+)
 @click.option(
     "--work-dir", default=None, help="Working directory for git operations",
 )
 @click.option(
     "--resolve-conflicts/--no-resolve-conflicts",
+    "ai_resolve_flag",
     default=True,
     help="Invoke the AI resolver on merge conflicts (requires "
-         "ai_resolve.enabled in config). With --no-resolve-conflicts, "
-         "any tracked PR that conflicts with the target branch is just "
-         "flagged in state without attempting an automatic fix. "
-         "Default: on.",
+         "ai_resolve.enabled in config — automatically flipped on with "
+         "--stateless). With --no-resolve-conflicts, conflicts are "
+         "flagged but no automatic fix is attempted. Default: on.",
+)
+@click.option(
+    "--stateless",
+    is_flag=True,
+    default=False,
+    help="Skip the session and state files: no per-project lock, no "
+         "ownership check, no state mutations. config.yaml IS still "
+         "loaded (with the usual --config override) when present, so AI "
+         "settings, origin, etc. are inherited from it. The --origin / "
+         "--build-command / --claude-command / --prompt-file / --timeout "
+         "/ --max-iterations overrides below apply only with --stateless. "
+         "When no config.yaml is present in cwd, a synthetic config is "
+         "built from the flags; --origin defaults to the PR's host repo "
+         "as an https URL in that case. Requires --pr.",
+)
+@click.option(
+    "--origin",
+    "origin_url",
+    default=None,
+    help="(stateless only) Origin remote URL to push to. Use this if "
+         "you need an ssh-form URL (e.g. git@github.com:owner/repo.git) "
+         "instead of https. When config.yaml is present its origin is "
+         "used unless this flag overrides.",
+)
+@click.option(
+    "--build-command",
+    "build_command_cli",
+    default=None,
+    help="(stateless only) Shell command the AI may run inside the "
+         "repo to verify its conflict resolution compiles. Empty means "
+         "'no build — AI skips verification'. Overrides "
+         "ai_resolve.build_command in config.",
+)
+@click.option(
+    "--claude-command",
+    "claude_command",
+    default=None,
+    help="(stateless only) Executable used to invoke Claude. "
+         "Overrides ai_resolve.command in config.",
+)
+@click.option(
+    "--prompt-file",
+    "prompt_file_cli",
+    default=None,
+    help="(stateless only) Path to the merge-conflict prompt template. "
+         "Overrides ai_resolve.merge_prompt_file in config. Defaults to "
+         "the prompt bundled with the releasy package.",
+)
+@click.option(
+    "--timeout",
+    "timeout_seconds",
+    type=int,
+    default=None,
+    help="(stateless only) Per-invocation Claude timeout in seconds. "
+         "Overrides ai_resolve.timeout_seconds in config.",
+)
+@click.option(
+    "--max-iterations",
+    "max_iterations_cli",
+    type=int,
+    default=None,
+    help="(stateless only) Hard cap on build attempts per resolve. "
+         "Overrides ai_resolve.max_iterations in config.",
 )
 @click.pass_context
 def refresh(
-    ctx: click.Context, work_dir: str | None, resolve_conflicts: bool,
+    ctx: click.Context,
+    pr_url: str | None,
+    work_dir: str | None,
+    ai_resolve_flag: bool,
+    stateless: bool,
+    origin_url: str | None,
+    build_command_cli: str | None,
+    claude_command: str | None,
+    prompt_file_cli: str | None,
+    timeout_seconds: int | None,
+    max_iterations_cli: int | None,
 ) -> None:
-    """Merge target branch into each tracked PR (AI-resolves conflicts).
+    """Merge target branch into a PR (or every tracked PR), AI-resolve conflicts.
+
+    Three modes:
+
+    \b
+    1. (no flags)                — walk every tracked PR in state.
+    2. ``--pr <url>``            — operate on one PR by URL (state
+                                   updated if the URL matches a tracked
+                                   rebase PR).
+    3. ``--stateless --pr <url>``— pure standalone: no session, no
+                                   state, no lock. Only RELEASY_GITHUB_TOKEN
+                                   and the PR URL are required; config.yaml
+                                   is read if present, otherwise a synthetic
+                                   config is built from the stateless flags.
 
     Strictly a maintenance pass — never opens new PRs, never creates
-    new branches, never discovers new PR sources. Only operates on
-    entries already present in the project state file.
+    new branches, never discovers new PR sources. For each in-scope PR:
+    fetch the latest target + PR branch, attempt ``git merge --no-ff
+    origin/<base>`` into the PR branch, and:
 
-    For every PR tracked in state that has a rebase PR open and a
-    branch on origin: fetch the latest target + PR branch, attempt
-    ``git merge --no-ff origin/<base>`` into the PR branch, and:
-
+    \b
     - clean merge: leave the PR alone (use GitHub's *Update branch* if
       you want a fresh merge commit pushed),
-    - conflict + AI resolves it: push the resolved merge commit
-      (status preserved, ``ai_resolved`` flag set),
+    - conflict + AI resolves it: push the resolved merge commit (plain
+      push — never force; status preserved, ``ai_resolved`` flag set
+      when state is tracked),
     - conflict + AI gives up / disabled: abort the merge, hard-reset
       the local branch back to its original tip, mark the entry as
-      ``conflict`` in state + project board.
+      ``conflict`` (stateful modes only).
 
     Exit code is 1 if any PR ended up in conflict status, 0 otherwise —
     suitable for cron / CI loops.
     """
-    from releasy.refresh import refresh_tracked_prs
+    from releasy.refresh import (
+        refresh_tracked_prs,
+        resolve_conflicts_for_pr,
+    )
+
+    wd = Path(work_dir) if work_dir else None
+
+    stateless_only_set: list[str] = []
+    if origin_url is not None:
+        stateless_only_set.append("--origin")
+    if build_command_cli is not None:
+        stateless_only_set.append("--build-command")
+    if claude_command is not None:
+        stateless_only_set.append("--claude-command")
+    if prompt_file_cli is not None:
+        stateless_only_set.append("--prompt-file")
+    if timeout_seconds is not None:
+        stateless_only_set.append("--timeout")
+    if max_iterations_cli is not None:
+        stateless_only_set.append("--max-iterations")
+
+    if not stateless and stateless_only_set:
+        raise click.UsageError(
+            f"{', '.join(stateless_only_set)} only apply with "
+            "--stateless. Drop the flags, or add --stateless to skip "
+            "the session/state/lock layer."
+        )
+
+    if stateless:
+        if pr_url is None:
+            raise click.UsageError(
+                "--stateless requires --pr <url>: there is no state "
+                "file to enumerate tracked PRs from."
+            )
+        from releasy.config import (
+            make_stateless_config,
+            load_config,
+        )
+        from releasy.github_ops import parse_pr_url, slug_to_https_url
+
+        config_path = ctx.obj.get("config_path")
+        config: Config | None = None
+        try:
+            config = load_config(
+                Path(config_path) if config_path else None,
+            )
+        except FileNotFoundError:
+            config = None
+        except Exception as e:
+            raise click.ClickException(f"Failed to load config: {e}")
+
+        if config is None:
+            effective_origin = origin_url
+            if not effective_origin:
+                parsed = parse_pr_url(pr_url)
+                if parsed is None:
+                    raise click.ClickException(
+                        f"Could not parse --pr URL: {pr_url!r}"
+                    )
+                owner, repo, _ = parsed
+                effective_origin = slug_to_https_url(f"{owner}/{repo}")
+            # ``ai_resolve.prompt_file`` defaults to the cherry-pick
+            # prompt; the merge prompt slot is set explicitly below.
+            config = make_stateless_config(
+                effective_origin,
+                work_dir=wd,
+                push=True,
+                auto_pr=False,
+                ai_enabled=ai_resolve_flag,
+                ai_command=claude_command or "claude",
+                ai_build_command=build_command_cli or "",
+                ai_prompt_file=None,
+                ai_timeout_seconds=(
+                    timeout_seconds if timeout_seconds is not None else 7200
+                ),
+                ai_max_iterations=(
+                    max_iterations_cli
+                    if max_iterations_cli is not None else 5
+                ),
+            )
+            # Bundled merge prompt so a user with no project config can
+            # still run the resolver.
+            if prompt_file_cli is not None:
+                config.ai_resolve.merge_prompt_file = prompt_file_cli
+            else:
+                bundled = (
+                    Path(__file__).parent / "prompts"
+                    / "resolve_merge_conflict.md"
+                ).resolve()
+                config.ai_resolve.merge_prompt_file = str(bundled)
+        else:
+            if origin_url:
+                config.origin.remote = origin_url
+            if claude_command is not None:
+                config.ai_resolve.command = claude_command
+            if build_command_cli is not None:
+                config.ai_resolve.build_command = build_command_cli
+            if prompt_file_cli is not None:
+                config.ai_resolve.merge_prompt_file = prompt_file_cli
+            if timeout_seconds is not None:
+                config.ai_resolve.timeout_seconds = timeout_seconds
+            if max_iterations_cli is not None:
+                config.ai_resolve.max_iterations = max_iterations_cli
+            # AI must be enabled for the merge prompt to fire — flip it
+            # on when the user kept the default --resolve-conflicts.
+            if ai_resolve_flag:
+                config.ai_resolve.enabled = True
+
+        config.session = None
+        config.stateless = True
+        if not resolve_conflicts_for_pr(
+            config, pr_url, wd, resolve_conflicts=ai_resolve_flag,
+        ):
+            raise SystemExit(1)
+        return
+
+    # Non-stateless paths: load + lock the project's config.
+    if pr_url is None:
+        with _locked_config(ctx, session="skip") as config:
+            if not refresh_tracked_prs(
+                config, wd, resolve_conflicts=ai_resolve_flag,
+            ):
+                raise SystemExit(1)
+        return
 
     with _locked_config(ctx, session="skip") as config:
-        wd = Path(work_dir) if work_dir else None
-        if not refresh_tracked_prs(config, wd, resolve_conflicts=resolve_conflicts):
+        if not resolve_conflicts_for_pr(
+            config, pr_url, wd, resolve_conflicts=ai_resolve_flag,
+        ):
             raise SystemExit(1)
 
 
@@ -1153,6 +1372,82 @@ def analyze_fails_cmd(
         if not result.success:
             if result.error:
                 raise click.ClickException(result.error)
+            raise SystemExit(1)
+
+
+@cli.command(
+    name="rebase",
+    short_help="Port an existing rebase PR onto a different target branch.",
+)
+@click.option(
+    "--pr",
+    "pr_url",
+    default=None,
+    help="GitHub URL of the rebase PR to port. When omitted, RelEasy "
+         "walks every tracked rebase PR in the project state file and "
+         "rebases each one (skipping any that already target --target).",
+)
+@click.option(
+    "--target",
+    "target_branch",
+    required=True,
+    help="Branch on origin to rebase the PR(s) onto (e.g. antalya-26.3). "
+         "Must already exist on the origin remote.",
+)
+@click.option("--work-dir", default=None, help="Working directory for git operations")
+@click.option(
+    "--resolve-conflicts/--no-resolve-conflicts",
+    default=True,
+    help="Invoke the AI resolver on cherry-pick conflicts (requires "
+         "ai_resolve.enabled in config). Default: on.",
+)
+@click.pass_context
+def rebase_cmd(
+    ctx: click.Context,
+    pr_url: str | None,
+    target_branch: str,
+    work_dir: str | None,
+    resolve_conflicts: bool,
+) -> None:
+    """Re-port a rebase PR onto a different target branch.
+
+    For each PR in scope:
+
+    \b
+    1. Skip when the PR already targets ``--target``.
+    2. Branch off origin/<target>, cherry-pick the PR's commits one
+       at a time (AI-resolving conflicts as they appear). If the
+       cherry-pick path can't be made to apply, fall back to a single
+       squashed ``git merge --squash`` of the PR's head onto the new
+       target.
+    3. Push the new branch and open a fresh PR (same title and body,
+       prefixed with a ``Port of <old PR> onto <target>`` reference).
+    4. Close the original PR with a ``superseded by <new PR>`` comment.
+
+    With ``--pr <url>`` only that PR is processed. Without ``--pr`` the
+    project state file is read and every tracked rebase PR is rebased
+    in turn.
+
+    The state file is never mutated — rebased PRs belong to a different
+    project (whose target branch is ``--target``); this command is only
+    a one-way porter, not a state migration.
+    """
+    from releasy.rebase import rebase_all_tracked, rebase_single
+
+    wd = Path(work_dir) if work_dir else None
+
+    with _locked_config(ctx, session="skip") as config:
+        if pr_url is not None:
+            summary = rebase_single(
+                config, pr_url, target_branch,
+                work_dir=wd, resolve_conflicts=resolve_conflicts,
+            )
+        else:
+            summary = rebase_all_tracked(
+                config, target_branch,
+                work_dir=wd, resolve_conflicts=resolve_conflicts,
+            )
+        if not summary.all_succeeded:
             raise SystemExit(1)
 
 

@@ -33,13 +33,16 @@ and the in-progress operation differ.
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from releasy.termlog import console
 
 from releasy.ai_resolve import AIResolveContext, attempt_ai_resolve
-from releasy.config import Config
+from releasy.config import Config, get_github_token
 from releasy.git_ops import (
+    fetch_remote,
     get_conflict_files,
     is_operation_in_progress,
     remote_branch_exists,
@@ -48,6 +51,8 @@ from releasy.git_ops import (
 )
 from releasy.github_ops import (
     PRInfo,
+    fetch_pr_by_url,
+    get_origin_repo_slug,
     parse_pr_url,
     sync_project,
 )
@@ -266,66 +271,83 @@ def refresh_tracked_prs(
 # ---------------------------------------------------------------------------
 
 
-def _process_one(
+@dataclass
+class MergeResolveOutcome:
+    """Structured result of one merge-into-PR-branch attempt.
+
+    Decoupled from :class:`FeatureState` so the same core helper can be
+    driven by ``releasy refresh`` (state-tracked PRs) and
+    ``releasy resolve-conflicts`` (URL-driven, possibly stateless).
+    Callers translate ``status`` + cost / iteration counters into
+    whatever bookkeeping they own.
+    """
+    status: str  # "clean" | "resolved" | "conflict" | "skipped"
+    conflict_files: list[str] = field(default_factory=list)
+    ai_iterations: int | None = None
+    ai_cost_usd: float | None = None
+    pushed: bool = False
+    error: str | None = None
+
+
+def run_merge_resolve(
     config: Config,
     repo_path: Path,
-    state: PipelineState,
-    fid: str,
-    fs: FeatureState,
+    *,
+    head_branch: str,
     base_branch: str,
-    base_ref: str,
-    remote: str,
+    source_pr: PRInfo,
+    rebase_pr_url: str | None,
     ai_active: bool,
-) -> str:
-    """Drive merge + (optional) AI resolve for ONE tracked PR.
+    remote: str | None = None,
+) -> MergeResolveOutcome:
+    """Drive merge + (optional) AI resolve for ONE PR branch.
 
-    Returns one of:
-      * ``"clean"``   — merge had nothing to do or was a clean merge we
-                         deliberately discarded (per spec we only push
-                         on conflict-resolution).
-      * ``"resolved"`` — there was a conflict and the AI resolved it;
-                         the merge commit was pushed.
-      * ``"conflict"`` — conflict could not be resolved (AI off, AI gave
-                         up, or some other failure); local branch reset
-                         to its original tip and state flipped to
-                         ``conflict``.
-      * ``"skipped"`` — nothing actionable (branch missing on remote,
-                         unrecoverable checkout failure, …).
+    Pure git/AI/push: never touches the state file. Caller decides how
+    to record the outcome (FeatureState updates, GitHub project sync,
+    nothing at all in the stateless case).
+
+    Preconditions:
+      * ``repo_path`` is a usable clone with origin already fetched.
+      * ``head_branch`` (the PR's head ref) and ``base_branch`` exist
+        on ``remote``.
+
+    Postconditions:
+      * On ``"resolved"``: merge commit pushed to origin/<head_branch>.
+      * On ``"clean"``: working tree reset to head_branch's original
+        tip — we deliberately don't push clean merges (use GitHub's
+        "Update branch" button if you want a fresh merge commit).
+      * On ``"conflict"`` / ``"skipped"``: working tree reset to the
+        original tip; nothing pushed.
     """
-    branch = fs.branch_name
-    assert branch is not None  # caller filtered
+    if remote is None:
+        remote = config.origin.remote_name
+    base_ref = f"{remote}/{base_branch}"
 
-    label = (
-        f"PR #{fs.pr_number}" if fs.pr_number else fid
-    )
-    rebase_label = (
-        fs.rebase_pr_url.rsplit("/", 1)[-1]
-        if fs.rebase_pr_url else "?"
-    )
-    console.print(
-        f"\n  [cyan]{branch}[/cyan]  "
-        f"[dim](source {label} → rebase PR #{rebase_label})[/dim]"
-    )
-
-    if not remote_branch_exists(repo_path, branch, remote):
+    if not remote_branch_exists(repo_path, head_branch, remote):
         console.print(
-            f"    [yellow]−[/yellow] branch missing on "
-            f"[cyan]{remote}[/cyan], skipping"
+            f"    [yellow]−[/yellow] branch [cyan]{head_branch}[/cyan] "
+            f"missing on [cyan]{remote}[/cyan], skipping"
         )
-        return "skipped"
+        return MergeResolveOutcome(
+            status="skipped",
+            error=f"branch {head_branch!r} missing on {remote}",
+        )
 
-    start_sha = _refresh_local_branch(repo_path, branch, remote)
+    start_sha = _refresh_local_branch(repo_path, head_branch, remote)
     if start_sha is None:
         console.print(
             f"    [yellow]−[/yellow] could not check out "
-            f"[cyan]{branch}[/cyan], skipping"
+            f"[cyan]{head_branch}[/cyan], skipping"
         )
-        return "skipped"
+        return MergeResolveOutcome(
+            status="skipped",
+            error=f"could not check out {head_branch!r}",
+        )
 
     # Attempt the merge. ``--no-ff`` mirrors GitHub's "Update branch"
     # button — we want a real merge commit so the PR explicitly records
     # the conflict-resolution decision in its history.
-    merge_msg = f"Merge {base_ref} into {branch}"
+    merge_msg = f"Merge {base_ref} into {head_branch}"
     merge = run_git(
         ["merge", "--no-ff", "--no-edit", "-m", merge_msg, base_ref],
         repo_path, check=False,
@@ -349,21 +371,13 @@ def _process_one(
                 "    [dim]already up-to-date with "
                 f"[cyan]{base_ref}[/cyan][/dim]"
             )
-        # If the entry was previously marked as conflict but now merges
-        # cleanly (someone else fixed it), surface that by clearing the
-        # conflict markers on the local entry. Status itself is left
-        # alone — the entry is still tracked, GitHub will reflect the
-        # mergeable state on its own.
-        if fs.status == "conflict" and fs.conflict_files:
-            fs.conflict_files = []
-            _persist(config, state)
-        return "clean"
+        return MergeResolveOutcome(status="clean")
 
     conflict_files = get_conflict_files(repo_path)
     if not conflict_files:
         # Merge failed for some other reason — abort and warn so the
-        # user can investigate manually instead of us silently flipping
-        # the entry to "conflict" with no useful info.
+        # user can investigate manually instead of silently flipping the
+        # PR to "conflict" with no useful info.
         msg = (merge.stderr or "").strip().splitlines()[:3]
         _abort_any_merge(repo_path, start_sha)
         console.print(
@@ -372,7 +386,10 @@ def _process_one(
         )
         for line in msg:
             console.print(f"      [dim]{line}[/dim]")
-        return "skipped"
+        return MergeResolveOutcome(
+            status="skipped",
+            error=(merge.stderr or "merge failed without conflict markers").strip(),
+        )
 
     console.print(
         f"    [red]✗[/red] {len(conflict_files)} conflicted file(s) "
@@ -383,40 +400,22 @@ def _process_one(
 
     if not ai_active:
         _abort_any_merge(repo_path, start_sha)
-        _record_conflict(config, state, fs, conflict_files)
-        return "conflict"
-
-    source_pr = _synthesise_source_pr(fs)
-    if source_pr is None:
-        # Shouldn't normally happen — we only iterate entries with
-        # ``pr_url`` set elsewhere — but be defensive: without source
-        # PR context the prompt has nothing to ground the resolution
-        # in, so don't even attempt it.
-        _abort_any_merge(repo_path, start_sha)
-        console.print(
-            "    [yellow]![/yellow] no source PR metadata — cannot "
-            "build resolver prompt, marking conflict."
+        return MergeResolveOutcome(
+            status="conflict", conflict_files=conflict_files,
+            error="AI resolver disabled",
         )
-        _record_conflict(config, state, fs, conflict_files)
-        return "conflict"
 
     ctx = AIResolveContext(
-        port_branch=branch,
+        port_branch=head_branch,
         base_branch=base_branch,
         source_pr=source_pr,
         conflict_files=conflict_files,
         start_sha=start_sha,
         operation="merge",
-        rebase_pr_url=fs.rebase_pr_url,
+        rebase_pr_url=rebase_pr_url,
     )
 
     result = attempt_ai_resolve(config, repo_path, ctx)
-
-    # Cost is billed even when the resolve failed — accumulate before
-    # branching on success so the project board reflects what we spent.
-    if result.cost_usd is not None:
-        prior = fs.ai_cost_usd or 0.0
-        fs.ai_cost_usd = prior + result.cost_usd
 
     if not result.success:
         reason = result.error or (
@@ -429,22 +428,23 @@ def _process_one(
         console.print(
             f"    [yellow]AI resolve failed:[/yellow] {reason}{cost_note}"
         )
-        # ``attempt_ai_resolve`` already aborted + reset on failure, so
-        # the worktree is back at start_sha. Just record the status.
-        _record_conflict(config, state, fs, conflict_files)
-        return "conflict"
+        # ``attempt_ai_resolve`` already aborted + reset on failure.
+        return MergeResolveOutcome(
+            status="conflict",
+            conflict_files=conflict_files,
+            ai_iterations=result.iterations,
+            ai_cost_usd=result.cost_usd,
+            error=f"AI resolve failed: {reason}",
+        )
 
     # Push the merge commit. Plain (non-force) push is correct: local
     # is start_sha + merge commit, origin is at start_sha — fast-forward.
-    # Falling back to ``force_push`` here would risk clobbering any new
-    # commit the PR author themselves pushed between our fetch and our
-    # push.
+    # ``force_push`` would risk clobbering any new commit the PR author
+    # themselves pushed between our fetch and our push.
     push = run_git(
-        ["push", remote, branch], repo_path, check=False,
+        ["push", remote, head_branch], repo_path, check=False,
     )
     if push.returncode != 0:
-        # Don't flip status to conflict — the resolution itself worked,
-        # the push race is a separate problem the user can retry.
         console.print(
             f"    [yellow]![/yellow] merge resolved locally but push "
             f"failed (origin moved? auth?). Leaving local commit; "
@@ -452,12 +452,12 @@ def _process_one(
         )
         for line in (push.stderr or "").strip().splitlines()[:3]:
             console.print(f"      [dim]{line}[/dim]")
-        # Persist the cost we already incurred even though the push will
-        # be retried — losing it would understate the bill on the project
-        # board if the user fixed the push problem out-of-band.
-        if result.cost_usd is not None:
-            _persist(config, state)
-        return "skipped"
+        return MergeResolveOutcome(
+            status="skipped",
+            ai_iterations=result.iterations,
+            ai_cost_usd=result.cost_usd,
+            error=f"push failed: {(push.stderr or '').strip()}",
+        )
 
     iters = (
         f" (iterations: {result.iterations})" if result.iterations else ""
@@ -467,13 +467,98 @@ def _process_one(
         if result.cost_usd is not None else ""
     )
     console.print(
-        f"    [green]✓[/green] AI resolved + pushed [cyan]{branch}[/cyan]"
-        f"{iters}{cost}"
+        f"    [green]✓[/green] AI resolved + pushed "
+        f"[cyan]{head_branch}[/cyan]{iters}{cost}"
+    )
+    return MergeResolveOutcome(
+        status="resolved",
+        ai_iterations=result.iterations,
+        ai_cost_usd=result.cost_usd,
+        pushed=True,
     )
 
-    # Promote any prior "conflict" status back to needs_review since the
-    # PR is now mergeable again. Also record AI involvement so the
-    # status table / board show the magenta marker.
+
+def _process_one(
+    config: Config,
+    repo_path: Path,
+    state: PipelineState,
+    fid: str,
+    fs: FeatureState,
+    base_branch: str,
+    base_ref: str,
+    remote: str,
+    ai_active: bool,
+) -> str:
+    """Drive merge + (optional) AI resolve for ONE state-tracked PR.
+
+    Thin wrapper over :func:`run_merge_resolve` that translates the
+    structured outcome into FeatureState updates + project-board sync.
+    """
+    branch = fs.branch_name
+    assert branch is not None  # caller filtered
+
+    label = (
+        f"PR #{fs.pr_number}" if fs.pr_number else fid
+    )
+    rebase_label = (
+        fs.rebase_pr_url.rsplit("/", 1)[-1]
+        if fs.rebase_pr_url else "?"
+    )
+    console.print(
+        f"\n  [cyan]{branch}[/cyan]  "
+        f"[dim](source {label} → rebase PR #{rebase_label})[/dim]"
+    )
+
+    source_pr = _synthesise_source_pr(fs)
+    if source_pr is None:
+        # Defensive — we only iterate entries with ``pr_url`` set, but
+        # without source PR context the prompt has nothing to ground
+        # the resolution in.
+        console.print(
+            "    [yellow]![/yellow] no source PR metadata — cannot "
+            "build resolver prompt, marking conflict."
+        )
+        _record_conflict(config, state, fs, [])
+        return "conflict"
+
+    outcome = run_merge_resolve(
+        config, repo_path,
+        head_branch=branch,
+        base_branch=base_branch,
+        source_pr=source_pr,
+        rebase_pr_url=fs.rebase_pr_url,
+        ai_active=ai_active,
+        remote=remote,
+    )
+
+    # Cost is billed even when the resolve failed — accumulate before
+    # branching on outcome so the project board reflects what we spent.
+    if outcome.ai_cost_usd is not None:
+        prior = fs.ai_cost_usd or 0.0
+        fs.ai_cost_usd = prior + outcome.ai_cost_usd
+
+    if outcome.status == "clean":
+        # If the entry was previously marked conflict but now merges
+        # cleanly (someone else fixed it), surface that by clearing the
+        # conflict markers on the local entry. Status itself is left
+        # alone — GitHub will reflect mergeable state on its own.
+        if fs.status == "conflict" and fs.conflict_files:
+            fs.conflict_files = []
+            _persist(config, state)
+        return "clean"
+
+    if outcome.status == "skipped":
+        # Cost may still have been incurred (push race after AI resolve);
+        # persist if so, leave status untouched otherwise.
+        if outcome.ai_cost_usd is not None:
+            _persist(config, state)
+        return "skipped"
+
+    if outcome.status == "conflict":
+        _record_conflict(config, state, fs, outcome.conflict_files)
+        return "conflict"
+
+    # outcome.status == "resolved"
     fs.conflict_files = []
     if fs.status == "conflict":
         fs.status = "needs_review"
@@ -483,9 +568,9 @@ def _process_one(
         fs.failed_step_index = None
         fs.partial_pr_count = None
     fs.ai_resolved = True
-    if result.iterations:
+    if outcome.ai_iterations:
         prior = fs.ai_iterations or 0
-        fs.ai_iterations = prior + result.iterations
+        fs.ai_iterations = prior + outcome.ai_iterations
     _persist(config, state)
     return "resolved"
 
@@ -507,3 +592,313 @@ def _record_conflict(
     fs.status = "conflict"
     fs.conflict_files = conflict_files
     _persist(config, state)
+
+
+# ---------------------------------------------------------------------------
+# URL-driven entry point (``releasy resolve-conflicts --pr <url>``)
+# ---------------------------------------------------------------------------
+
+
+# Match a "Cherry-picked from #N" / "Cherry-picked from owner/repo#N" /
+# full GitHub PR URL near the top of a rebase PR body. RelEasy's own
+# pipeline writes one of these on every rebase PR it opens (see
+# ``pipeline._build_pr_body``), so for PRs we ourselves created we can
+# recover the source PR without an extra CLI flag.
+_SOURCE_PR_URL_RE = re.compile(
+    r"https://github\.com/[^/\s]+/[^/\s]+?(?:\.git)?/pull/\d+\b",
+)
+_SOURCE_PR_SLUG_RE = re.compile(
+    r"\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)\b",
+)
+_SOURCE_PR_HASH_RE = re.compile(r"(?<![\w/])#(\d+)\b")
+
+
+def _find_source_pr_url(rebase_pr_body: str, rebase_slug: str) -> str | None:
+    """Best-effort source-PR-URL extraction from a rebase PR's body.
+
+    RelEasy's pipeline writes the source PR reference near the top of
+    every rebase PR body (``Cherry-picked from <ref>``). We search the
+    whole body since the marker may shift slightly between versions or
+    when ``update_existing_prs`` rewrites it.
+
+    Returns the source PR's URL, or ``None`` when no recognisable
+    reference was found — caller falls back to using the rebase PR as
+    its own "source" for prompt-rendering purposes.
+    """
+    if not rebase_pr_body:
+        return None
+
+    m = _SOURCE_PR_URL_RE.search(rebase_pr_body)
+    if m:
+        return m.group(0)
+
+    m2 = _SOURCE_PR_SLUG_RE.search(rebase_pr_body)
+    if m2:
+        return f"https://github.com/{m2.group(1)}/pull/{m2.group(2)}"
+
+    m3 = _SOURCE_PR_HASH_RE.search(rebase_pr_body)
+    if m3 and rebase_slug:
+        return f"https://github.com/{rebase_slug}/pull/{m3.group(1)}"
+
+    return None
+
+
+def _resolve_source_pr(
+    config: Config, rebase_pr: PRInfo,
+) -> PRInfo:
+    """Resolve the upstream source PR a rebase PR ports.
+
+    For RelEasy-created rebase PRs the body includes a ``Cherry-picked
+    from <ref>`` marker — we follow that to fetch the real source PR's
+    metadata so the merge prompt has accurate ``source_pr_*``
+    placeholders. When the marker is missing or unfetchable, we fall
+    back to the rebase PR itself: the prompt loses some specificity
+    but still has *something* to ground the resolution in.
+    """
+    source_url = _find_source_pr_url(rebase_pr.body or "", rebase_pr.repo_slug)
+    if source_url and source_url != rebase_pr.url:
+        fetched = fetch_pr_by_url(config, source_url, include_closed=True)
+        if fetched is not None:
+            return fetched
+        console.print(
+            f"    [dim]source PR {source_url} referenced in rebase PR "
+            "body but couldn't be fetched — falling back to rebase PR "
+            "metadata for prompt context.[/dim]"
+        )
+    return rebase_pr
+
+
+def _fetch_pr_refs(
+    pr_url: str,
+) -> tuple[str, str, str, str, int] | None:
+    """Look up the PR's head branch / head repo / base branch / head sha.
+
+    Returns ``(head_ref, head_repo_slug, base_ref, head_sha, number)``
+    or ``None`` if the lookup fails. Mirrors
+    :func:`releasy.review_response._fetch_pr_head` — kept local to avoid
+    a cross-module dependency for one helper.
+    """
+    token = get_github_token()
+    if not token:
+        return None
+    parsed = parse_pr_url(pr_url)
+    if parsed is None:
+        return None
+    owner, repo, number = parsed
+    try:
+        from github import Github
+
+        gh = Github(token)
+        ghrepo = gh.get_repo(f"{owner}/{repo}")
+        pr = ghrepo.get_pull(number)
+        head_repo = None
+        if pr.head.repo is not None:
+            head_repo = pr.head.repo.full_name
+        return (
+            pr.head.ref,
+            head_repo or f"{owner}/{repo}",
+            pr.base.ref,
+            pr.head.sha,
+            pr.number,
+        )
+    except Exception:  # pragma: no cover — network / permissions
+        return None
+
+
+def resolve_conflicts_for_pr(
+    config: Config,
+    pr_url: str,
+    work_dir: Path | None = None,
+    *,
+    resolve_conflicts: bool = True,
+) -> bool:
+    """Drive ``releasy resolve-conflicts --pr <url>`` end-to-end.
+
+    Looks up the PR's head/base refs from GitHub, sets up the work
+    repo, and runs the same merge + AI-resolve + push loop as
+    ``releasy refresh`` — but for one PR identified by URL rather than
+    by walking the state file.
+
+    When ``config.stateless`` is False and the PR matches a tracked
+    rebase PR, the corresponding :class:`FeatureState` is updated as
+    if the PR had been picked up by ``refresh``. Otherwise no state is
+    touched.
+
+    Returns False on any unresolved conflict (or hard failure) so the
+    CLI can pick a non-zero exit code.
+    """
+    from releasy.pipeline import _setup_repo
+
+    parsed = parse_pr_url(pr_url)
+    if parsed is None:
+        console.print(f"[red]✗[/red] Could not parse PR URL: {pr_url!r}")
+        return False
+    pr_owner, pr_repo, _pr_num = parsed
+    pr_slug = f"{pr_owner}/{pr_repo}"
+
+    origin_slug = get_origin_repo_slug(config)
+    if origin_slug and origin_slug.lower() != pr_slug.lower():
+        console.print(
+            f"[red]✗[/red] --pr points at {pr_slug} but the configured "
+            f"origin is {origin_slug}. RelEasy can only push to the "
+            "configured origin — use --stateless --origin to target a "
+            "different repo, or run from a config.yaml whose origin "
+            "matches."
+        )
+        return False
+
+    rebase_pr = fetch_pr_by_url(config, pr_url, include_closed=True)
+    if rebase_pr is None:
+        console.print(
+            f"[red]✗[/red] Could not fetch PR {pr_url} — check "
+            "RELEASY_GITHUB_TOKEN scope and the URL."
+        )
+        return False
+
+    refs = _fetch_pr_refs(pr_url)
+    if refs is None:
+        console.print(
+            f"[red]✗[/red] Could not look up head/base refs for "
+            f"{pr_url} — check token scope."
+        )
+        return False
+    head_ref, head_repo, base_ref_branch, _head_sha, _pr_number = refs
+
+    if origin_slug and head_repo.lower() != origin_slug.lower():
+        console.print(
+            f"[red]✗[/red] PR head branch lives on {head_repo}, but "
+            f"RelEasy only pushes to origin ({origin_slug}). Cannot "
+            "resolve conflicts on a PR whose head is on a fork."
+        )
+        return False
+
+    repo_path = _setup_repo(config, work_dir, base_ref_branch)
+
+    if is_operation_in_progress(repo_path):
+        console.print(
+            f"\n[red]✗[/red] A git operation is still in progress in "
+            f"[cyan]{repo_path}[/cyan]. Finish or abort it first."
+        )
+        return False
+
+    remote = config.origin.remote_name
+    # Refresh remote pointers so we operate on the latest tips.
+    fetch_remote(repo_path, remote)
+
+    if not remote_branch_exists(repo_path, base_ref_branch, remote):
+        console.print(
+            f"\n[red]✗[/red] Base branch [cyan]{base_ref_branch}[/cyan] "
+            f"not found on [cyan]{remote}[/cyan]. Cannot merge."
+        )
+        return False
+
+    ai_active = resolve_conflicts and config.ai_resolve.enabled
+    if ai_active:
+        console.print(
+            f"[dim]AI conflict resolver: enabled "
+            f"(command='{config.ai_resolve.command}', "
+            f"prompt='{config.ai_resolve.merge_prompt_file}', "
+            f"max_iterations={config.ai_resolve.max_iterations})[/dim]"
+        )
+    else:
+        why = (
+            "disabled via --no-resolve-conflicts" if not resolve_conflicts
+            else "disabled in config"
+        )
+        console.print(f"[dim]AI conflict resolver: {why}[/dim]")
+
+    source_pr = _resolve_source_pr(config, rebase_pr)
+
+    console.print(
+        f"\n[bold]Phase:[/bold] Merging "
+        f"[cyan]{remote}/{base_ref_branch}[/cyan] into "
+        f"[cyan]{head_ref}[/cyan]"
+    )
+    console.print(
+        f"  [dim](rebase PR #{rebase_pr.number} → source "
+        f"{source_pr.url})[/dim]"
+    )
+
+    outcome = run_merge_resolve(
+        config, repo_path,
+        head_branch=head_ref,
+        base_branch=base_ref_branch,
+        source_pr=source_pr,
+        rebase_pr_url=rebase_pr.url,
+        ai_active=ai_active,
+        remote=remote,
+    )
+
+    # Optional state sync: if a state file is around AND a tracked
+    # FeatureState's rebase_pr_url matches, fold the outcome into it
+    # so the project board / status views stay coherent.
+    _maybe_update_tracked_state(config, rebase_pr.url, outcome)
+
+    if outcome.status == "conflict":
+        console.print(
+            "[yellow]PR is still in conflict — resolve it on GitHub "
+            "(or locally + push), then re-run.[/yellow]"
+        )
+        return False
+    if outcome.status == "skipped" and outcome.error:
+        console.print(f"[yellow]Skipped: {outcome.error}[/yellow]")
+        return False
+    return True
+
+
+def _maybe_update_tracked_state(
+    config: Config, rebase_pr_url: str, outcome: MergeResolveOutcome,
+) -> None:
+    """Reflect a URL-driven outcome on a matching tracked FeatureState.
+
+    No-op when ``config.stateless`` is set or no FeatureState matches
+    the rebase PR URL — keeping the URL-driven flow usable without a
+    state file at all.
+    """
+    if getattr(config, "stateless", False):
+        return
+    try:
+        state = load_state(config)
+    except Exception:  # pragma: no cover — bad state file
+        return
+    if not state.features:
+        return
+
+    target = rebase_pr_url.rstrip("/")
+    matched: FeatureState | None = None
+    for fs in state.features.values():
+        if fs.rebase_pr_url and fs.rebase_pr_url.rstrip("/") == target:
+            matched = fs
+            break
+    if matched is None:
+        return
+
+    if outcome.ai_cost_usd is not None:
+        prior = matched.ai_cost_usd or 0.0
+        matched.ai_cost_usd = prior + outcome.ai_cost_usd
+
+    if outcome.status == "clean":
+        if matched.status == "conflict" and matched.conflict_files:
+            matched.conflict_files = []
+            _persist(config, state)
+        return
+
+    if outcome.status == "resolved":
+        matched.conflict_files = []
+        if matched.status == "conflict":
+            matched.status = "needs_review"
+            matched.failed_step_index = None
+            matched.partial_pr_count = None
+        matched.ai_resolved = True
+        if outcome.ai_iterations:
+            prior = matched.ai_iterations or 0
+            matched.ai_iterations = prior + outcome.ai_iterations
+        _persist(config, state)
+        return
+
+    if outcome.status == "conflict":
+        _record_conflict(config, state, matched, outcome.conflict_files)
+        return
+
+    if outcome.status == "skipped" and outcome.ai_cost_usd is not None:
+        _persist(config, state)
