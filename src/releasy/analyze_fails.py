@@ -32,6 +32,10 @@ import shutil
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from releasy.pipeline import OnlyFilter
 
 from releasy.ai_resolve import (
     _build_claude_argv,
@@ -122,20 +126,28 @@ class AnalyzeFailsResult:
 # ---------------------------------------------------------------------------
 
 
-def _tracked_pr_urls(state: PipelineState | None) -> list[str]:
+def _tracked_pr_urls(
+    state: PipelineState | None,
+    only: OnlyFilter | None = None,
+) -> list[str]:
     """Every PR URL ``releasy run`` has opened that's still in state.
 
     Skips entries without a ``rebase_pr_url`` (those are still pending
     a PR — nothing to analyse) and de-duplicates while preserving
     insertion order. Returns ``[]`` when ``state`` is ``None``.
+
+    ``only`` (optional) restricts the result to the single tracked
+    feature whose URL or feature-id matches the filter.
     """
     if state is None:
         return []
     seen: set[str] = set()
     out: list[str] = []
-    for fs in state.features.values():
+    for fid, fs in state.features.items():
         url = fs.rebase_pr_url
         if not url or url in seen:
+            continue
+        if only is not None and not only.matches_state(fid, fs):
             continue
         seen.add(url)
         out.append(url)
@@ -1144,8 +1156,14 @@ def analyze_fails(
     push: bool = True,
     no_flaky_check: bool = False,
     post_comment: bool | None = None,
+    only: OnlyFilter | None = None,
 ) -> AnalyzeFailsResult:
-    """Drive one ``releasy analyze-fails`` run end-to-end."""
+    """Drive one ``releasy analyze-fails`` run end-to-end.
+
+    ``only`` (optional) restricts the multi-PR walk to a single tracked
+    feature (matched by URL or feature / group ID). Mutually exclusive
+    with ``pr_url`` at the CLI layer.
+    """
     if not get_origin_repo_slug(config):
         return AnalyzeFailsResult(
             success=False,
@@ -1178,8 +1196,16 @@ def analyze_fails(
     if pr_url:
         primary_pr_urls = [pr_url]
     else:
-        primary_pr_urls = _tracked_pr_urls(state)
+        primary_pr_urls = _tracked_pr_urls(state, only=only)
         if not primary_pr_urls:
+            if only is not None:
+                return AnalyzeFailsResult(
+                    success=False,
+                    error=(
+                        f"--only={only.label!r} matched no tracked PRs. "
+                        "Check the URL / group id and re-run."
+                    ),
+                )
             return AnalyzeFailsResult(
                 success=False,
                 error=(
@@ -1197,6 +1223,12 @@ def analyze_fails(
     if not no_flaky_check:
         if pr_url:
             scan = [u for u in _tracked_pr_urls(state) if u != pr_url]
+        elif only is not None:
+            # --only narrowed primary down to a single PR; cross-check
+            # against every OTHER tracked PR so flake signals still pick
+            # up wider patterns rather than just the one we're working on.
+            primary_set = set(primary_pr_urls)
+            scan = [u for u in _tracked_pr_urls(state) if u not in primary_set]
         else:
             scan = list(primary_pr_urls)
         if scan:

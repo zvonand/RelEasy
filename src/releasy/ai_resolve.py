@@ -60,6 +60,23 @@ class AIResolveContext:
     # kept current. Rendered into the merge prompt so Claude can name it
     # in commit messages / log lines if it wants. Ignored for cherry-pick.
     rebase_pr_url: str | None = None
+    # Free-form note the user attached to this PR / group / feature in
+    # the session file via ``ai_context:``. Surfaced verbatim in a
+    # dedicated section of the rendered prompt. Empty string ⇒ no
+    # section is rendered.
+    user_context: str = ""
+    # Cherry-pick split-commit mode (see ``ai_resolve.split_conflict_commit``):
+    # when True, RelEasy has already concluded the cherry-pick by committing
+    # the conflict markers as a stand-alone "with conflicts" commit, and
+    # Claude's job is to make a SECOND commit on top with the resolution.
+    # Selects ``ai_resolve.split_prompt_file`` instead of ``prompt_file``
+    # and tightens postcondition checks (HEAD must have advanced past
+    # ``pre_resolve_sha``, not just ``start_sha``). Ignored for merge.
+    split_mode: bool = False
+    # SHA of HEAD AFTER the "with conflicts" commit but BEFORE Claude
+    # ran. Used in split-mode postcondition checks: a successful resolve
+    # must add at least one new commit on top of this SHA.
+    pre_resolve_sha: str | None = None
 
 
 @dataclass
@@ -142,14 +159,18 @@ def _write_build_script(repo_path: Path, build_command: str) -> None:
 def _resolve_prompt_template(config: Config, ctx: AIResolveContext) -> Path:
     """Pick the prompt file path for ``ctx.operation`` and resolve it.
 
-    Cherry-pick uses ``ai_resolve.prompt_file``; merge uses
-    ``ai_resolve.merge_prompt_file`` so the two flows can have distinct
-    instructions (`git cherry-pick --continue` vs `git commit --no-edit`,
-    different framing of "what's in progress") while sharing the same
-    placeholder vocabulary.
+    Cherry-pick uses ``ai_resolve.prompt_file`` for the legacy single-
+    commit flow (cherry-pick still in progress, Claude resolves and
+    runs ``git cherry-pick --continue``), or ``ai_resolve.split_prompt_file``
+    in split-commit mode (cherry-pick already concluded as a "with
+    conflicts" commit, Claude makes a second resolution commit on top).
+    Merge uses ``ai_resolve.merge_prompt_file``. The three templates
+    share the same placeholder vocabulary but differ in flow narrative.
     """
     if ctx.operation == "merge":
         raw = config.ai_resolve.merge_prompt_file
+    elif ctx.split_mode:
+        raw = config.ai_resolve.split_prompt_file
     else:
         raw = config.ai_resolve.prompt_file
     prompt_path = Path(raw)
@@ -163,10 +184,12 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
     prompt_path = _resolve_prompt_template(config, ctx)
 
     if not prompt_path.exists():
-        which = (
-            "ai_resolve.merge_prompt_file" if ctx.operation == "merge"
-            else "ai_resolve.prompt_file"
-        )
+        if ctx.operation == "merge":
+            which = "ai_resolve.merge_prompt_file"
+        elif ctx.split_mode:
+            which = "ai_resolve.split_prompt_file"
+        else:
+            which = "ai_resolve.prompt_file"
         raise FileNotFoundError(
             f"AI prompt template not found: {prompt_path}. "
             f"Set {which} in config."
@@ -225,6 +248,31 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
             "above is searched)_\n"
         )
 
+    # The user can attach a per-PR / per-group note to the resolver via
+    # ``ai_context:`` in the session file. We render it as a dedicated
+    # section so it's prominent without us having to edit the template
+    # for every consumer; when the user supplied nothing, the placeholder
+    # collapses to an empty string so the prompt simply skips the
+    # section. Leading newline keeps an empty render flush against the
+    # surrounding content (no stray blank lines), and the trailing
+    # newlines keep the populated render from running into whatever
+    # follows in the template (notably a `---` separator that would
+    # otherwise be parsed as a setext heading underline for the last
+    # line of the user's note).
+    user_context_text = (ctx.user_context or "").strip()
+    if user_context_text:
+        user_context_section = (
+            "\n## User-supplied context (from session.yaml)\n\n"
+            "> The operator attached this note to this PR / group when "
+            "configuring the run. Treat it as authoritative guidance from "
+            "the human driving the port — but it does NOT override the "
+            "diff-fidelity rule below: the source PR's diff is still the "
+            "only authoritative list of what the port wants to add.\n\n"
+            f"{user_context_text}\n"
+        )
+    else:
+        user_context_section = ""
+
     placeholders = {
         "repo_slug": repo_slug,
         "cwd": str(repo_path),
@@ -252,6 +300,10 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
         "upstream_remote_name": upstream_remote_name,
         "upstream_branch": upstream_branch,
         "upstream_fetch_section": upstream_fetch_section,
+        # User-supplied per-PR / per-group note from the session file.
+        # Either an empty string (no note ⇒ section skipped) or a fully
+        # rendered "## User-supplied context" markdown block.
+        "user_context_section": user_context_section,
     }
 
     def _replace(match: re.Match[str]) -> str:
@@ -686,7 +738,12 @@ def _verify_postconditions(
     - no cherry-pick / merge / rebase still in progress,
     - working tree is clean (no unstaged conflict-resolution leftovers),
     - the port branch advanced past ``ctx.start_sha`` (i.e. at least one
-      commit was actually made).
+      commit was actually made),
+    - in split mode, additionally HEAD has advanced past
+      ``ctx.pre_resolve_sha`` so the resolution lives in its own commit
+      on top of the "with conflicts" commit (Claude must not have
+      amended that one), and HEAD is not a fixup of HEAD~1 — there
+      really is a separate resolution commit.
 
     Returns ``(ok, new_head_sha, error_message)``.
     """
@@ -717,6 +774,12 @@ def _verify_postconditions(
     if ctx.start_sha and new_head == ctx.start_sha:
         return False, new_head, (
             "no new commits — cherry-pick was not concluded"
+        )
+
+    if ctx.split_mode and ctx.pre_resolve_sha and new_head == ctx.pre_resolve_sha:
+        return False, new_head, (
+            "no resolution commit on top of the 'with conflicts' commit "
+            "— claude did not produce a second commit"
         )
 
     return True, new_head, None

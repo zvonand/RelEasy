@@ -196,6 +196,19 @@ def cli(
          "exactly as-is. Defaults to the `pr_policy.retry_failed` value "
          "in config (true unless overridden).",
 )
+@click.option(
+    "--only",
+    "only",
+    default=None,
+    help="Restrict this run to a single PR (URL) or to a single group / "
+         "feature ID. URL form: full GitHub PR link "
+         "(https://github.com/owner/repo/pull/N) — only the matching "
+         "discovered unit is processed. Name form: a `pr_sources.groups[].id` "
+         "from the session file, or a singleton feature id like `pr-123` "
+         "(`<owner>-<repo>-pr-N` for cross-repo PRs). Other discovered "
+         "units are dropped before any side-effects. Exits non-zero if "
+         "nothing matches.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -203,9 +216,15 @@ def run(
     work_dir: str | None,
     resolve_conflicts: bool,
     retry_failed: bool | None,
+    only: str | None,
 ) -> None:
     """Discover and port new PRs onto the base branch (cherry-pick + open PR)."""
-    from releasy.pipeline import run_pipeline, run_sequential
+    from releasy.pipeline import parse_only, run_pipeline, run_sequential
+
+    try:
+        only_filter = parse_only(only)
+    except ValueError as e:
+        raise click.UsageError(str(e))
 
     with _locked_config(ctx, session="required") as config:
         if not onto:
@@ -226,6 +245,7 @@ def run(
                 config, onto, wd,
                 resolve_conflicts=resolve_conflicts,
                 retry_failed=effective_retry_failed,
+                only=only_filter,
             )
             return
 
@@ -233,6 +253,7 @@ def run(
             config, onto, wd,
             resolve_conflicts=resolve_conflicts,
             retry_failed=effective_retry_failed,
+            only=only_filter,
         )
 
         has_conflicts = any(
@@ -589,6 +610,15 @@ def import_cmd(ctx: click.Context) -> None:
     help="(stateless only) Hard cap on build attempts per resolve. "
          "Overrides ai_resolve.max_iterations in config.",
 )
+@click.option(
+    "--only",
+    "only",
+    default=None,
+    help="Restrict the multi-PR walk to a single tracked PR (URL — "
+         "source or rebase) or a single feature / group ID. "
+         "Mutually exclusive with --pr and --stateless. "
+         "Exits non-zero if nothing matches.",
+)
 @click.pass_context
 def refresh(
     ctx: click.Context,
@@ -602,6 +632,7 @@ def refresh(
     prompt_file_cli: str | None,
     timeout_seconds: int | None,
     max_iterations_cli: int | None,
+    only: str | None,
 ) -> None:
     """Merge target branch into a PR (or every tracked PR), AI-resolve conflicts.
 
@@ -636,12 +667,32 @@ def refresh(
     Exit code is 1 if any PR ended up in conflict status, 0 otherwise —
     suitable for cron / CI loops.
     """
+    from releasy.pipeline import parse_only
     from releasy.refresh import (
         refresh_tracked_prs,
         resolve_conflicts_for_pr,
     )
 
     wd = Path(work_dir) if work_dir else None
+
+    if only is not None:
+        if pr_url is not None:
+            raise click.UsageError(
+                "--only and --pr are mutually exclusive: --only filters "
+                "the multi-PR walk; --pr already names a single PR."
+            )
+        if stateless:
+            raise click.UsageError(
+                "--only is incompatible with --stateless: stateless mode "
+                "always operates on a single PR (--pr) without a state "
+                "file to filter against."
+            )
+        try:
+            only_filter = parse_only(only)
+        except ValueError as e:
+            raise click.UsageError(str(e))
+    else:
+        only_filter = None
 
     stateless_only_set: list[str] = []
     if origin_url is not None:
@@ -757,6 +808,7 @@ def refresh(
         with _locked_config(ctx, session="skip") as config:
             if not refresh_tracked_prs(
                 config, wd, resolve_conflicts=ai_resolve_flag,
+                only=only_filter,
             ):
                 raise SystemExit(1)
         return
@@ -1202,6 +1254,15 @@ def address_review_cmd(
          "--pr is omitted (0 = no cap). Overrides "
          "analyze_fails.max_prs_per_run.",
 )
+@click.option(
+    "--only",
+    "only",
+    default=None,
+    help="Restrict the multi-PR walk to a single tracked PR (URL — "
+         "source or rebase) or a single feature / group ID. "
+         "Mutually exclusive with --pr and --stateless. "
+         "Exits non-zero if nothing matches.",
+)
 @click.pass_context
 def analyze_fails_cmd(
     ctx: click.Context,
@@ -1219,6 +1280,7 @@ def analyze_fails_cmd(
     timeout_seconds: int | None,
     max_iterations_cli: int | None,
     max_prs_cli: int | None,
+    only: str | None,
 ) -> None:
     """Walk failed CI on a PR (or every tracked PR), debug + fix per test.
 
@@ -1243,8 +1305,28 @@ def analyze_fails_cmd(
     test was UNRELATED.
     """
     from releasy.analyze_fails import analyze_fails
+    from releasy.pipeline import parse_only
 
     wd = Path(work_dir) if work_dir else None
+
+    if only is not None:
+        if pr_url is not None:
+            raise click.UsageError(
+                "--only and --pr are mutually exclusive: --only filters "
+                "the multi-PR walk; --pr already names a single PR."
+            )
+        if stateless:
+            raise click.UsageError(
+                "--only is incompatible with --stateless: stateless mode "
+                "always operates on a single PR (--pr) without a state "
+                "file to filter against."
+            )
+        try:
+            only_filter = parse_only(only)
+        except ValueError as e:
+            raise click.UsageError(str(e))
+    else:
+        only_filter = None
 
     stateless_only_set: list[str] = []
     if origin_url is not None:
@@ -1356,6 +1438,7 @@ def analyze_fails_cmd(
             result = analyze_fails(
                 config, pr_url=None, work_dir=wd, dry_run=dry_run,
                 push=push, no_flaky_check=no_flaky_check,
+                only=only_filter,
             )
             if not result.success:
                 if result.error:
@@ -1401,6 +1484,14 @@ def analyze_fails_cmd(
     help="Invoke the AI resolver on cherry-pick conflicts (requires "
          "ai_resolve.enabled in config). Default: on.",
 )
+@click.option(
+    "--only",
+    "only",
+    default=None,
+    help="Restrict the multi-PR walk to a single tracked PR (URL — "
+         "source or rebase) or a single feature / group ID. "
+         "Mutually exclusive with --pr. Exits non-zero if nothing matches.",
+)
 @click.pass_context
 def rebase_cmd(
     ctx: click.Context,
@@ -1408,6 +1499,7 @@ def rebase_cmd(
     target_branch: str,
     work_dir: str | None,
     resolve_conflicts: bool,
+    only: str | None,
 ) -> None:
     """Re-port a rebase PR onto a different target branch.
 
@@ -1432,9 +1524,20 @@ def rebase_cmd(
     project (whose target branch is ``--target``); this command is only
     a one-way porter, not a state migration.
     """
+    from releasy.pipeline import parse_only
     from releasy.rebase import rebase_all_tracked, rebase_single
 
     wd = Path(work_dir) if work_dir else None
+
+    if only is not None and pr_url is not None:
+        raise click.UsageError(
+            "--only and --pr are mutually exclusive: --only filters the "
+            "multi-PR walk; --pr already names a single PR."
+        )
+    try:
+        only_filter = parse_only(only)
+    except ValueError as e:
+        raise click.UsageError(str(e))
 
     with _locked_config(ctx, session="skip") as config:
         if pr_url is not None:
@@ -1446,6 +1549,7 @@ def rebase_cmd(
             summary = rebase_all_tracked(
                 config, target_branch,
                 work_dir=wd, resolve_conflicts=resolve_conflicts,
+                only=only_filter,
             )
         if not summary.all_succeeded:
             raise SystemExit(1)
@@ -1501,8 +1605,11 @@ def release(
 @click.option(
     "--name", "release_name", default=None,
     help="GitHub release tag (e.g. v26.1.6.20001.altinityantalya). "
-         "Defaults to --to when omitted. Used verbatim as the tag on the "
-         "draft release; see --title for the human-readable heading.",
+         "Defaults to --to when --to is itself a tag; if --to is a "
+         "commit / branch and --name is omitted, the draft release's "
+         "tag field is left blank (no new tag is created). Used "
+         "verbatim as the tag on the draft release; see --title for "
+         "the human-readable heading.",
 )
 @click.option(
     "--title", "release_title", default=None,
@@ -1558,18 +1665,19 @@ def draft_release_cmd(
     With ``-o`` the markdown is written to disk and nothing is published.
     Without ``-o`` a DRAFT GitHub release is created on origin (tag =
     ``--name``, target commitish = ``--to``); the draft URL is printed
-    on stdout.
+    on stdout. When ``--name`` is omitted and ``--to`` is not an actual
+    tag, the draft's tag field is left blank instead of being defaulted
+    to the commit / branch in ``--to``.
     """
     from releasy.changelog import emit_changelog
 
     config = _load_and_verify(ctx, session="skip")
     wd = Path(work_dir) if work_dir else None
-    name = release_name or to_ref
     if not emit_changelog(
         config,
         from_ref=from_ref,
         to_ref=to_ref,
-        release_name=name,
+        release_name=release_name,
         display_title=release_title,
         output_file=output_file,
         work_dir=wd,

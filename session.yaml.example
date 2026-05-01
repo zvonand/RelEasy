@@ -24,6 +24,11 @@
 # Each feature is rebased onto the base branch as a separate branch.
 # PRs can be auto-created into the base branch (if push +
 # pr_policy.auto_pr in config.yaml).
+#
+# Optional: `ai_context:` is a free-form note appended to the AI
+# conflict-resolver prompt for this entry. Use it to call out gotchas
+# the model can't infer from the diff alone (e.g. "this depends on the
+# auth refactor — prefer the local change in case of doubt").
 features:
   - id: s3-disk
     description: "Custom S3 disk improvements"
@@ -34,6 +39,9 @@ features:
     description: "Keeper config extensions"
     source_branch: feature/antalya-keeper-cfg
     enabled: true
+    # ai_context: |
+    #   Conflicts here usually come from the keeper-config rename in
+    #   master. Prefer keeping our snake_case keys.
 
   - id: observability
     description: "Observability hooks"
@@ -63,6 +71,10 @@ features:
 #     if_exists: skip|recreate — overrides pr_policy.if_exists (in
 #                                config.yaml) for this entry.
 #     description: prefix prepended to the PR title for the feature name.
+#     ai_context: free-form note appended to the AI conflict-resolver
+#                 prompt for every PR matched by this entry. Keep it
+#                 short and high-signal — the model already gets the
+#                 source PR body and diff.
 #
 # exclude_labels — drop any PR carrying at least one of these labels,
 #   even if it matched a by_labels entry.
@@ -73,6 +85,13 @@ features:
 #   directly from the URL — no extra git remote is added. Their port
 #   branches get a slug-prefixed name (feature/<base>/<owner>-<repo>-pr-<N>)
 #   so a same-numbered origin PR can never clash.
+#
+#   Each entry is either a bare URL string, OR a mapping:
+#       - url: https://github.com/owner/repo/pull/N
+#         ai_context: |
+#           Free-form note attached to this specific PR. Surfaced to
+#           the AI conflict resolver if (and only if) this PR conflicts.
+#   Mix and match freely.
 #
 # exclude_prs — always exclude these PRs by URL. Final override —
 #   a PR listed here is never processed. Matched by full owner/repo/number,
@@ -100,6 +119,11 @@ features:
 #     - https://github.com/Altinity/ClickHouse/pull/456
 #     # Cross-repo PR — fetched directly from the source repo by URL.
 #     - https://github.com/ClickHouse/ClickHouse/pull/12345
+#     # Dict form — attach an AI resolver note to a specific PR:
+#     - url: https://github.com/Altinity/ClickHouse/pull/789
+#       ai_context: |
+#         The base branch renamed `Foo::run` to `Foo::execute`.
+#         Adapt the PR's call sites accordingly.
 #
 #   exclude_prs:
 #     - https://github.com/Altinity/ClickHouse/pull/789
@@ -132,9 +156,23 @@ features:
 #   groups:
 #     - id: iceberg-rest-catalog
 #       description: "Iceberg REST catalog support"
+#       # ai_context: free-form note appended to the AI conflict-resolver
+#       # prompt for EVERY cherry-pick step in this group. Use it for
+#       # cross-cutting guidance ("all three PRs depend on the catalog
+#       # interface introduced in master commit abc123 — adapt to its
+#       # current shape").
+#       # ai_context: |
+#       #   These three PRs all depend on the new IcebergCatalog interface
+#       #   on master. If a hunk references the old `Catalog` shim, port
+#       #   it to the new interface.
 #       prs:
 #         - https://github.com/Altinity/ClickHouse/pull/1500   # base change
 #         - https://github.com/Altinity/ClickHouse/pull/1512   # follow-up
-#         - https://github.com/Altinity/ClickHouse/pull/1530   # final fix
+#         # Dict form — attach a per-PR ai_context that is added on top
+#         # of the group-level one (concatenated, blank-line separated).
+#         - url: https://github.com/Altinity/ClickHouse/pull/1530   # final fix
+#           ai_context: |
+#             This one specifically renames `IcebergCatalog::list_tables`
+#             to `list_namespaces`. Update call sites added by #1500.
 #       # if_exists: skip       # override pr_policy.if_exists
 #       # sort: merged_at       # default "listed"

@@ -28,6 +28,7 @@ from releasy.git_ops import (
     local_branch_exists,
     remote_branch_exists,
     cherry_pick_merge_commit,
+    commit_cherry_pick_conflict_as_is,
     create_branch_from_ref,
     ensure_work_repo,
     fetch_commit,
@@ -141,6 +142,17 @@ class FeatureUnit:
     title_prefix: str = ""        # used for both single-PR and group titles
     is_group: bool = False
     group_id: str | None = None   # filled when is_group
+    # Free-form note appended to the AI conflict-resolver prompt for
+    # every cherry-pick step in this unit. Populated from the matching
+    # ``pr_sources.by_labels[].ai_context`` (singletons) or
+    # ``pr_sources.groups[].ai_context`` (groups). Empty string when the
+    # user supplied none.
+    ai_context: str = ""
+    # Per-PR ai_context for entries inside ``include_prs`` /
+    # ``pr_sources.groups[].prs`` that used the dict form. Keyed by PR
+    # URL. Combined with ``ai_context`` above when a step's source PR
+    # has a matching entry.
+    per_pr_ai_context: dict[str, str] = field(default_factory=dict)
     # Mutable per-run bookkeeping (set by _process_feature_unit):
     ai_resolved_count: int = 0
     ai_iterations_total: int = 0
@@ -170,6 +182,68 @@ class FeatureUnit:
 
 
 PRRef = tuple[str, str, int]
+
+
+@dataclass
+class OnlyFilter:
+    """``--only`` filter: scope an action to a single PR (URL) or group/feature ID.
+
+    The CLI flag accepts either a GitHub PR URL or a free-form name; the
+    name is matched against group IDs (``pr_sources.groups[].id``) and
+    singleton feature IDs (``pr-<N>``, ``<owner>-<repo>-pr-<N>``). URLs
+    are parsed into a ``(owner, repo, number)`` tuple so cross-repo
+    sources can't collide with same-numbered origin PRs.
+    """
+    raw: str
+    pr_ref: PRRef | None
+    name: str | None
+
+    @property
+    def label(self) -> str:
+        if self.pr_ref is not None:
+            owner, repo, num = self.pr_ref
+            return f"{owner}/{repo}#{num}"
+        return self.name or self.raw
+
+    def matches_unit(self, unit: "FeatureUnit") -> bool:
+        if self.pr_ref is not None:
+            return any(pr.ref() == self.pr_ref for pr in unit.prs)
+        return unit.feature_id == self.name or unit.group_id == self.name
+
+    def matches_state(self, fid: str, fs: FeatureState) -> bool:
+        if self.pr_ref is not None:
+            for url in (fs.rebase_pr_url, fs.pr_url, *fs.pr_urls):
+                if not url:
+                    continue
+                if parse_pr_url(url) == self.pr_ref:
+                    return True
+            return False
+        return fid == self.name
+
+
+def parse_only(only: str | None) -> OnlyFilter | None:
+    """Parse a ``--only`` argument into an :class:`OnlyFilter`.
+
+    Returns ``None`` when the flag was not given. A value that looks
+    like a GitHub PR URL is parsed to ``(owner, repo, number)``;
+    anything else is taken as a group / feature ID.
+    """
+    if not only:
+        return None
+    only = only.strip()
+    if not only:
+        return None
+    parsed = parse_pr_url(only)
+    if parsed is not None:
+        return OnlyFilter(raw=only, pr_ref=parsed, name=None)
+    if only.startswith(("http://", "https://")):
+        # Looks like a URL but didn't parse as a PR URL — better to
+        # surface this clearly than silently treat it as a group name.
+        raise ValueError(
+            f"--only={only!r} looks like a URL but isn't a "
+            "https://github.com/<owner>/<repo>/pull/<N> link."
+        )
+    return OnlyFilter(raw=only, pr_ref=None, name=only)
 
 
 def _singleton_feature_id(pr: PRInfo, origin_slug: str | None) -> str:
@@ -219,12 +293,20 @@ def _build_singleton_units(
 ) -> list[FeatureUnit]:
     units: list[FeatureUnit] = []
     origin_slug = get_origin_repo_slug(config)
+    include_pr_contexts = config.pr_sources.include_pr_contexts
     for pr, src in collected.values():
+        # Singletons get the matching by_labels entry's ai_context as
+        # unit-level context. include_prs entries use the per-PR dict
+        # form, which is keyed by URL — promote it to unit-level for the
+        # singleton (only one cherry-pick step, so the distinction is
+        # cosmetic).
+        unit_ai_context = src.ai_context or include_pr_contexts.get(pr.url, "")
         units.append(FeatureUnit(
             feature_id=_singleton_feature_id(pr, origin_slug),
             prs=[pr],
             if_exists=src.if_exists,
             title_prefix=src.description,
+            ai_context=unit_ai_context,
         ))
     return units
 
@@ -312,6 +394,8 @@ def _build_group_units(
             title_prefix=group.description,
             is_group=True,
             group_id=group.id,
+            ai_context=group.ai_context,
+            per_pr_ai_context=dict(group.pr_ai_contexts),
         ))
     return units, claimed
 
@@ -534,6 +618,7 @@ def run_pipeline(
     work_dir: Path | None = None,
     resolve_conflicts: bool = True,
     retry_failed: bool = True,
+    only: OnlyFilter | None = None,
 ) -> PipelineState:
     """Port PRs onto ``origin/<base_branch>``.
 
@@ -546,6 +631,10 @@ def run_pipeline(
     is re-attempted from base; when false, the entry is skipped entirely
     (no cherry-pick, no PR side-effects). Defaults to true to match the
     config-level default.
+
+    ``only`` (optional) restricts processing to a single PR (matched by
+    URL) or a single group / feature ID. Other discovered units are
+    dropped before any side-effects.
     """
     state = load_state(config)
     _prune_superseded_singletons(config, state)
@@ -632,6 +721,20 @@ def run_pipeline(
 
     units = discover_feature_units(config)
 
+    if only is not None:
+        before = len(units)
+        units = [u for u in units if only.matches_unit(u)]
+        console.print(
+            f"\n  [dim]--only={only.label}: "
+            f"kept {len(units)}/{before} discovered unit(s)[/dim]"
+        )
+        if not units:
+            console.print(
+                f"\n[red]✗[/red] --only={only.label!r} matched no "
+                "discovered units. Check the URL / group id and re-run."
+            )
+            raise SystemExit(2)
+
     if not units:
         console.print("\n  [dim]No PRs or groups to process after filtering[/dim]")
 
@@ -689,6 +792,7 @@ def run_sequential(
     work_dir: Path | None = None,
     resolve_conflicts: bool = True,
     retry_failed: bool = True,
+    only: OnlyFilter | None = None,
 ) -> PipelineState:
     """Process the merged-time-sorted PR queue one PR per invocation.
 
@@ -805,6 +909,21 @@ def run_sequential(
     )
 
     units = discover_feature_units(config)
+
+    if only is not None:
+        before = len(units)
+        units = [u for u in units if only.matches_unit(u)]
+        console.print(
+            f"\n  [dim]--only={only.label}: "
+            f"kept {len(units)}/{before} discovered unit(s)[/dim]"
+        )
+        if not units:
+            console.print(
+                f"\n[red]✗[/red] --only={only.label!r} matched no "
+                "discovered units. Check the URL / group id and re-run."
+            )
+            raise SystemExit(2)
+
     if not units:
         console.print("\n  [dim]No PRs to process after filtering[/dim]")
         state.phase = "ports_done"
@@ -1625,12 +1744,6 @@ def _unit_body(
         for pr, ref in zip(unit.prs, refs):
             lines.append(f"- {ref} — {pr.title}")
         lines.append("")  # blank
-        for pr, ref in zip(unit.prs, refs):
-            cleaned = _strip_md_sections(
-                pr.body or "", list(_DEDUP_PR_BODY_SECTIONS),
-            )
-            if cleaned:
-                lines.append(f"\n---\n### {ref}: {pr.title}\n\n{cleaned}")
     else:
         pr = unit.prs[0]
         lines.append(f"Cherry-picked from {source_refs}.")
@@ -2025,6 +2138,16 @@ def _attempt_cherry_picks(
                 f"    [dim]→ cherry-picking {ref} "
                 f"({idx + 1}/{len(unit.prs)})[/dim]"
             )
+
+        # Capture the port-branch tip BEFORE the cherry-pick so we can
+        # roll back cleanly on AI failure (and use it as a known-good
+        # reset target in split-commit mode where one or two commits
+        # may need to come off).
+        head_before = run_git(
+            ["rev-parse", "--verify", "HEAD"], repo_path, check=False,
+        )
+        start_sha = head_before.stdout.strip() if head_before.returncode == 0 else None
+
         cp_result = _cherry_pick_pr(repo_path, config, pr)
 
         if cp_result.success:
@@ -2039,11 +2162,42 @@ def _attempt_cherry_picks(
         for cf in cp_result.conflict_files:
             console.print(f"      [red]•[/red] {cf}")
 
+        # Split-commit mode: before handing control to Claude, conclude
+        # the in-progress cherry-pick by committing the conflict markers
+        # as a stand-alone "with conflicts" commit. The AI then makes a
+        # second commit on top with the resolution, so the port branch's
+        # `git log` shows the conflict and its fix as separate diffs.
+        # Only triggered when both AI is active (otherwise there's no
+        # second commit to make and the legacy unresolved-conflict path
+        # below is the right behaviour) and the config knob is on.
+        pre_resolve_sha: str | None = None
+        if ai_active and config.ai_resolve.split_conflict_commit:
+            committed, pre_resolve_sha = commit_cherry_pick_conflict_as_is(
+                repo_path, source_pr_url=pr.url,
+            )
+            if committed and pre_resolve_sha:
+                console.print(
+                    f"    [dim]✎ committed conflict markers as "
+                    f"{pre_resolve_sha[:12]} — Claude will add a "
+                    f"resolution commit on top[/dim]"
+                )
+            else:
+                # Failed to pre-commit (very unusual — empty stage,
+                # missing MERGE_MSG). Fall back to the legacy in-progress
+                # cherry-pick flow so the pipeline doesn't get stuck.
+                console.print(
+                    "    [yellow]![/yellow] could not pre-commit conflict "
+                    "markers — falling back to single-commit AI resolve"
+                )
+                pre_resolve_sha = None
+
         ai_outcome: _AIStepOutcome | None = None
         if ai_active:
             ai_outcome = _try_ai_resolve_step(
                 config, repo_path, unit, new_branch, base_branch, pr,
                 cp_result.conflict_files,
+                start_sha=start_sha,
+                pre_resolve_sha=pre_resolve_sha,
             )
 
         if ai_outcome is not None and ai_outcome.handled:
@@ -3090,6 +3244,24 @@ def _handle_unresolved_conflict(
     _persist_state(config, state)
 
 
+def _combine_user_context(unit: FeatureUnit, pr: PRInfo) -> str:
+    """Build the ``user_context`` string for a single cherry-pick step.
+
+    Combines the unit-level ``ai_context`` (set during discovery from
+    ``pr_sources.by_labels[].ai_context`` / ``pr_sources.groups[].ai_context``
+    / ``pr_sources.include_prs[].ai_context``) with the per-PR override
+    for this step's source PR (``pr_sources.groups[].prs[].ai_context``).
+    Returns ``""`` when the user supplied no context.
+    """
+    parts: list[str] = []
+    if unit.ai_context:
+        parts.append(unit.ai_context)
+    per_pr = unit.per_pr_ai_context.get(pr.url, "")
+    if per_pr and per_pr != unit.ai_context:
+        parts.append(per_pr)
+    return "\n\n".join(parts)
+
+
 def _try_ai_resolve_step(
     config: Config,
     repo_path: Path,
@@ -3098,6 +3270,9 @@ def _try_ai_resolve_step(
     base_branch: str,
     pr: PRInfo,
     conflict_files: list[str],
+    *,
+    start_sha: str | None = None,
+    pre_resolve_sha: str | None = None,
 ) -> "_AIStepOutcome":
     """Invoke Claude to resolve ONE conflicted cherry-pick step in place.
 
@@ -3129,6 +3304,16 @@ def _try_ai_resolve_step(
         source_pr=pr,
         conflict_files=conflict_files,
         operation="cherry-pick",
+        user_context=_combine_user_context(unit, pr),
+        # Split-commit mode: ``pre_resolve_sha`` is set iff RelEasy already
+        # concluded the cherry-pick as a "with conflicts" commit before
+        # this call (see ``_attempt_cherry_picks``). The AI prompt and
+        # post-condition checks both branch on this. ``start_sha`` is the
+        # branch tip BEFORE the cherry-pick so cleanup-on-failure rolls
+        # back both the pre-commit and any partial resolution.
+        split_mode=pre_resolve_sha is not None,
+        pre_resolve_sha=pre_resolve_sha,
+        start_sha=start_sha,
     )
 
     result = attempt_ai_resolve(config, repo_path, ctx)

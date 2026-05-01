@@ -36,11 +36,15 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from releasy.pipeline import OnlyFilter
 
 from releasy.termlog import console
 
 from releasy.ai_resolve import AIResolveContext, attempt_ai_resolve
-from releasy.config import Config, get_github_token
+from releasy.config import Config, get_github_token, lookup_pr_ai_context
 from releasy.git_ops import (
     fetch_remote,
     get_conflict_files,
@@ -152,12 +156,16 @@ def refresh_tracked_prs(
     config: Config,
     work_dir: Path | None = None,
     resolve_conflicts: bool = True,
+    only: OnlyFilter | None = None,
 ) -> bool:
     """Walk tracked PRs, merge target into each, AI-resolve any conflicts.
 
     Strictly a maintenance / refresh pass: never opens new PRs, never
     creates new branches, never discovers new PR sources. Only
     operates on entries already present in ``state.features``.
+
+    ``only`` (optional) restricts the walk to a single tracked PR
+    (matched by URL — source or rebase) or a single feature / group ID.
 
     See module docstring for the detailed contract. Returns False when
     one or more PRs ended up in (or stayed in) ``conflict`` status — so
@@ -234,6 +242,20 @@ def refresh_tracked_prs(
         if not fs.branch_name or not fs.rebase_pr_url:
             continue
         candidates.append((fid, fs))
+
+    if only is not None:
+        before = len(candidates)
+        candidates = [(fid, fs) for fid, fs in candidates if only.matches_state(fid, fs)]
+        console.print(
+            f"  [dim]--only={only.label}: kept "
+            f"{len(candidates)}/{before} tracked PR(s)[/dim]"
+        )
+        if not candidates:
+            console.print(
+                f"\n[red]✗[/red] --only={only.label!r} matched no tracked "
+                "PRs. Check the URL / group id and re-run."
+            )
+            return False
 
     if not candidates:
         console.print(
@@ -413,6 +435,9 @@ def run_merge_resolve(
         start_sha=start_sha,
         operation="merge",
         rebase_pr_url=rebase_pr_url,
+        user_context=lookup_pr_ai_context(
+            config.pr_sources, source_pr.url,
+        ),
     )
 
     result = attempt_ai_resolve(config, repo_path, ctx)

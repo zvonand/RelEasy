@@ -19,6 +19,7 @@ from releasy.config import Config
 from releasy.git_ops import (
     ensure_remote,
     ensure_work_repo,
+    is_tag_ref,
     resolve_ref,
     run_git,
 )
@@ -607,7 +608,7 @@ def build_changelog(
     work_dir: Path | None = None,
     compared_to_url: str | None = None,
     docker_image_url: str | None = None,
-) -> tuple[str, str] | None:
+) -> tuple[str, str, bool] | None:
     """Walk merge commits, fetch + classify PRs, render the changelog.
 
     ``release_name`` is the GitHub release **tag** (e.g.
@@ -616,7 +617,9 @@ def build_changelog(
     when omitted it's auto-derived from ``release_name`` via
     :func:`format_display_title`.
 
-    Returns ``(markdown, to_sha)`` on success, ``None`` on failure.
+    Returns ``(markdown, to_sha, to_is_tag)`` on success, ``None`` on
+    failure. ``to_is_tag`` is True iff ``to_ref`` resolves to an actual
+    git tag in the repo (vs. a branch / commit SHA).
     """
     origin_slug = get_origin_repo_slug(config)
     if not origin_slug:
@@ -739,6 +742,8 @@ def build_changelog(
     title = display_title or format_display_title(release_name)
     packages_block = render_packages_block(release_name, docker_image_url)
 
+    to_is_tag = is_tag_ref(repo_path, to_ref)
+
     if not merges:
         from_label, from_sha, from_url = _resolve_compared_to(
             config, repo_path, from_ref, compared_to_url,
@@ -753,7 +758,7 @@ def build_changelog(
             origin_slug=origin_slug,
             packages_block=packages_block,
         )
-        return md, to_sha
+        return md, to_sha, to_is_tag
 
     entries: list[ChangelogEntry] = []
     upstream_cache: dict[tuple[str, int], PRInfo | None] = {}
@@ -832,7 +837,7 @@ def build_changelog(
         full_changelog_url=full_changelog_url,
         packages_block=packages_block,
     )
-    return md, to_sha
+    return md, to_sha, to_is_tag
 
 
 def emit_changelog(
@@ -840,7 +845,7 @@ def emit_changelog(
     *,
     from_ref: str,
     to_ref: str,
-    release_name: str,
+    release_name: str | None,
     output_file: Path | None,
     display_title: str | None = None,
     work_dir: Path | None = None,
@@ -849,14 +854,21 @@ def emit_changelog(
 ) -> bool:
     """Run the changelog build and either write to file or open a draft release.
 
+    ``release_name`` is the GitHub release tag. When ``None``, it
+    defaults to ``to_ref`` for display purposes only — and on the
+    GitHub draft release the tag field is left blank if ``to_ref`` is
+    not an actual tag (so we don't mint a tag from a commit SHA).
+
     Returns True on success.
     """
-    title = display_title or format_display_title(release_name)
+    name_explicit = release_name is not None
+    effective_name = release_name or to_ref
+    title = display_title or format_display_title(effective_name)
     result = build_changelog(
         config,
         from_ref=from_ref,
         to_ref=to_ref,
-        release_name=release_name,
+        release_name=effective_name,
         display_title=title,
         work_dir=work_dir,
         compared_to_url=compared_to_url,
@@ -864,7 +876,7 @@ def emit_changelog(
     )
     if result is None:
         return False
-    markdown, to_sha = result
+    markdown, to_sha, to_is_tag = result
 
     if output_file is not None:
         output_file = output_file.expanduser().resolve()
@@ -873,11 +885,23 @@ def emit_changelog(
         console.print(f"[green]Wrote changelog to[/green] {output_file}")
         return True
 
-    # The release name on GitHub gets the prettified title; the tag stays
-    # as the raw ref so it round-trips with origin and `git fetch`.
+    # The release name on GitHub gets the prettified title; the tag
+    # stays as the raw ref so it round-trips with origin and
+    # ``git fetch``. But when --name was not provided and --to is a
+    # commit / branch (not a tag), leave the tag field blank — we don't
+    # want to mint a brand-new tag from a commit SHA.
+    if name_explicit or to_is_tag:
+        tag_name = effective_name
+    else:
+        tag_name = ""
+        console.print(
+            f"[dim]--to {to_ref!r} is not a tag and --name was not "
+            f"provided; leaving the draft release's tag field blank.[/dim]"
+        )
+
     url = create_draft_release(
         config,
-        tag_name=release_name,
+        tag_name=tag_name,
         name=title,
         body=markdown,
         target_commitish=to_sha,

@@ -305,21 +305,24 @@ Options in the table below live in **config.yaml** unless marked
 | `pr_sources.by_labels[].labels` *(session)* | Labels a PR must have (AND logic) | — |
 | `pr_sources.by_labels[].merged_only` *(session)* | Only include merged PRs | `false` |
 | `pr_sources.by_labels[].if_exists` *(session)* | Override `pr_policy.if_exists` per entry | inherits |
+| `pr_sources.by_labels[].ai_context` *(session)* | Free-form note appended to the AI conflict-resolver prompt for every PR matched by this entry | `""` |
 | `pr_sources.exclude_labels` *(session)* | Drop PRs carrying any of these labels | `[]` |
 | `pr_sources.include_authors` *(session)* | Allowlist of GitHub logins (case-insensitive); when set, only PRs by these authors are kept. Bypassed by `include_prs`. | `[]` |
 | `pr_sources.exclude_authors` *(session)* | Drop PRs by these GitHub logins (case-insensitive). Bypassed by `include_prs`. | `[]` |
-| `pr_sources.include_prs` *(session)* | Always include these PRs (by URL) | `[]` |
+| `pr_sources.include_prs` *(session)* | Always include these PRs. Each entry is either a bare URL string, or a mapping `{url: <URL>, ai_context: <text>}` to attach a per-PR note to the AI conflict resolver. | `[]` |
 | `pr_sources.exclude_prs` *(session)* | Always exclude these PRs (by URL) | `[]` |
 | `pr_sources.groups[].id` *(session)* | Group id; becomes feature id and branch name (`feature/<base>/<id>`) | — |
-| `pr_sources.groups[].prs` *(session)* | Ordered list of PR URLs to cherry-pick onto a single branch and combine into one PR | — |
+| `pr_sources.groups[].prs` *(session)* | Ordered list of PRs to cherry-pick onto a single branch and combine into one PR. Each entry is either a bare URL string, or a mapping `{url: <URL>, ai_context: <text>}` for a per-PR note to the AI conflict resolver. | — |
 | `pr_sources.groups[].description` *(session)* | Title text for the combined PR | id |
 | `pr_sources.groups[].if_exists` *(session)* | Override `pr_policy.if_exists` per group | inherits |
 | `pr_sources.groups[].sort` *(session)* | Cherry-pick order within the group: `listed` (top-to-bottom of `prs:`) or `merged_at` (ascending GitHub merge timestamp; PR number breaks ties) | `listed` |
+| `pr_sources.groups[].ai_context` *(session)* | Free-form note appended to the AI conflict-resolver prompt for every cherry-pick step in this group. Combined (blank-line separated) with any per-PR `ai_context`. | `""` |
 | `features[].id` *(session)* | Feature id; used as branch suffix `feature/<base>/<id>` | — |
 | `features[].source_branch` *(session)* | Existing branch holding the feature's commits | — |
 | `features[].description` *(session)* | Shown in the PR title and project board | — |
 | `features[].enabled` *(session)* | Whether this feature is active on the next run | `true` |
 | `features[].depends_on` *(session)* | Ordered list of feature ids that must be ported first | `[]` |
+| `features[].ai_context` *(session)* | Free-form note appended to the AI conflict-resolver prompt when porting this feature conflicts | `""` |
 
 ### Environment variables
 
@@ -442,6 +445,7 @@ releasy run [--onto <tag-or-sha>] [--work-dir <path>]
 | `--work-dir <path>` | Working directory for git operations (overrides config `work_dir`). | from config / cwd |
 | `--resolve-conflicts` / `--no-resolve-conflicts` | Toggle the AI resolver. The flag is a kill-switch: AI runs only if both this *and* `ai_resolve.enabled` are true. | on |
 | `--retry-failed` / `--no-retry-failed` | Re-attempt PR units whose previous run ended in `conflict` status: discard the existing local / remote port branch and re-run the cherry-pick from base. With `--no-retry-failed`, those entries are left exactly as-is. | from `pr_policy.retry_failed` (true) |
+| `--only <url-or-id>` | Restrict this run to a single PR (full GitHub PR URL) **or** a `pr_sources.groups[].id` / singleton feature id (`pr-<N>`, `<owner>-<repo>-pr-N`). All other discovered units are dropped before any side-effects. Exits non-zero if nothing matches. | — |
 
 Exit code: `1` if any port ended up in `conflict` status, `0` otherwise.
 
@@ -475,6 +479,7 @@ releasy refresh [--work-dir <path>]
 |--------|-------------|---------|
 | `--work-dir <path>` | Working directory for git operations. | from config / cwd |
 | `--resolve-conflicts` / `--no-resolve-conflicts` | Toggle the AI resolver. With `--no-resolve-conflicts`, conflicting PRs are flagged in state without an automatic fix attempt. | on |
+| `--only <url-or-id>` | Restrict the multi-PR walk to a single tracked PR (URL — source or rebase) or a single feature / group id. Mutually exclusive with `--pr` and `--stateless`. Exits non-zero if nothing matches. | — |
 
 Exit code: `1` if any PR ended up in `conflict` status, `0` otherwise.
 
@@ -560,6 +565,7 @@ releasy analyze-fails [--pr <URL>]
 | `--timeout <seconds>` *(stateless only)* | Per-invocation Claude timeout. | from config / `7200` |
 | `--max-iterations <n>` *(stateless only)* | Build-attempt cap per failed test. | from config / `6` |
 | `--max-prs <n>` *(stateless only)* | Cap on tracked PRs to iterate when `--pr` is omitted (0 = no cap). | from config / `0` |
+| `--only <url-or-id>` | Restrict the multi-PR walk to a single tracked PR (URL — source or rebase) or a single feature / group id. Mutually exclusive with `--pr` and `--stateless`. Exits non-zero if nothing matches. | — |
 
 Config block (all optional):
 
@@ -1070,6 +1076,60 @@ ready for review.
 > project card body explains what happened). The `ai_resolved` field on
 > the entry (and the `ai-resolved` PR label) carries the "AI was
 > involved" signal.
+
+### Per-PR / per-group AI context (`ai_context`)
+
+You often know something about a specific PR (or group of PRs) that the
+model can't see in the diff alone — e.g. "this depends on the auth
+refactor that just landed on master, prefer the local change", or "the
+base branch renamed `Foo::run` to `Foo::execute`, adapt the call sites".
+You can attach that hint directly to the entry in the session file via
+the optional `ai_context:` field. RelEasy passes it verbatim to the AI
+conflict resolver in a dedicated *User-supplied context* section of the
+prompt — only when this PR/group/feature actually conflicts; clean
+cherry-picks never invoke Claude in the first place.
+
+`ai_context:` is supported on:
+
+- `pr_sources.by_labels[].ai_context` — applied to every PR matched by
+  this label entry.
+- `pr_sources.groups[].ai_context` — applied to every cherry-pick step
+  in the group.
+- `pr_sources.groups[].prs[]` — per-PR override via the dict form
+  (`{url, ai_context}`); concatenated with the group-level note.
+- `pr_sources.include_prs[]` — per-PR via the same dict form.
+- `features[].ai_context` — applied when porting this feature
+  conflicts.
+
+Bare URL strings still work everywhere a dict form does — only entries
+that carry an actual note need to switch to `{url, ai_context}`.
+
+```yaml
+pr_sources:
+  include_prs:
+    - https://github.com/Altinity/ClickHouse/pull/100      # bare URL, no note
+    - url: https://github.com/Altinity/ClickHouse/pull/200 # dict form
+      ai_context: |
+        The base branch renamed `Foo::run` to `Foo::execute`.
+        Adapt the call sites accordingly.
+
+  groups:
+    - id: iceberg-rest-catalog
+      ai_context: |
+        These PRs all depend on the new IcebergCatalog interface
+        on master. If a hunk references the old `Catalog` shim,
+        port it to the new interface.
+      prs:
+        - https://github.com/Altinity/ClickHouse/pull/1500
+        - url: https://github.com/Altinity/ClickHouse/pull/1530
+          ai_context: |
+            Specifically renames `list_tables` → `list_namespaces`.
+```
+
+The note is treated as authoritative operator guidance, but the
+prompt's "the source PR's diff is the only authoritative list of what
+the port wants to add" rule still applies — `ai_context:` complements
+the diff, never replaces it.
 
 ## PR title & labels
 

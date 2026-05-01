@@ -127,6 +127,12 @@ class FeatureConfig:
     source_branch: str  # existing branch where feature commits live
     enabled: bool = True
     depends_on: list[str] = field(default_factory=list)
+    # Optional free-form note appended to the AI conflict-resolver prompt
+    # when this feature's port hits a conflict. Use it to call out gotchas
+    # the model can't infer from the diff alone (e.g. "this depends on
+    # the auth refactor — prefer reverting the local change in case of
+    # doubt").
+    ai_context: str = ""
 
 
 _VALID_IF_EXISTS = ("skip", "recreate")
@@ -142,6 +148,10 @@ class PRSourceConfig:
     # "recreate" (delete and rebuild from base). Inherits ``pr_policy.if_exists``
     # from config.yaml when not set per-source.
     if_exists: str = "skip"
+    # Optional free-form note appended to the AI conflict-resolver prompt
+    # for every PR matched by this label entry. Keep it short and
+    # high-signal: the model already gets the source PR body and diff.
+    ai_context: str = ""
 
 
 @dataclass
@@ -166,6 +176,14 @@ class PRGroupConfig:
     # "merged_at" — sort by GitHub merge timestamp ascending before
     # cherry-picking; PR number breaks ties.
     sort: str = "listed"
+    # Optional free-form note appended to the AI conflict-resolver prompt
+    # for every cherry-pick step in the group.
+    ai_context: str = ""
+    # Per-PR-URL ai_context for individual entries inside ``prs`` that
+    # used the dict form (``{url: ..., ai_context: ...}``). Keyed by URL
+    # exactly as listed in the session file. Combined with the
+    # group-level ``ai_context`` at resolve time.
+    pr_ai_contexts: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -219,6 +237,11 @@ class PRSourcesConfig:
     include_authors: list[str] = field(default_factory=list)
     exclude_authors: list[str] = field(default_factory=list)
     groups: list[PRGroupConfig] = field(default_factory=list)
+    # Per-PR-URL ai_context for individual entries inside ``include_prs``
+    # that used the dict form (``{url: ..., ai_context: ...}``). Keyed by
+    # URL exactly as listed in the session file. Surfaced to the AI
+    # conflict resolver alongside any unit-level ``ai_context``.
+    include_pr_contexts: dict[str, str] = field(default_factory=dict)
 
 
 def _default_assignee_dev_options() -> list[str]:
@@ -531,6 +554,22 @@ class AIResolveConfig:
     # --no-edit` vs `git cherry-pick --continue`), and the framing of
     # what to preserve all differ.
     merge_prompt_file: str = "prompts/resolve_merge_conflict.md"
+    # Prompt template used when ``split_conflict_commit`` is on: the
+    # cherry-pick has already been concluded by RelEasy with conflict
+    # markers committed as a stand-alone "with conflicts" commit, and
+    # Claude's job is to make a SECOND commit on top with the resolution.
+    # The flow differs from the in-progress-cherry-pick prompt enough
+    # (no `git cherry-pick --continue`, two commits to keep clearly
+    # separate) that it gets its own template.
+    split_prompt_file: str = "prompts/resolve_conflict_split.md"
+    # When True (default), a cherry-pick conflict is first concluded as a
+    # "with conflicts" commit (markers committed verbatim, original
+    # cherry-pick message preserved), and Claude is then asked to make a
+    # second commit with the resolution. The two-commit history makes the
+    # conflict and its resolution clearly visible in the port branch's
+    # `git log`. When False, falls back to the legacy single-commit flow
+    # (Claude resolves and concludes the cherry-pick directly).
+    split_conflict_commit: bool = True
     allowed_tools: list[str] = field(default_factory=_default_allowed_tools)
     max_iterations: int = 5
     timeout_seconds: int = 7200  # 2h
@@ -968,6 +1007,10 @@ def load_config(config_path: Path | None = None) -> Config:
         merge_prompt_file=ai_raw.get(
             "merge_prompt_file", "prompts/resolve_merge_conflict.md",
         ),
+        split_prompt_file=ai_raw.get(
+            "split_prompt_file", "prompts/resolve_conflict_split.md",
+        ),
+        split_conflict_commit=bool(ai_raw.get("split_conflict_commit", True)),
         allowed_tools=ai_raw.get("allowed_tools") or _default_allowed_tools(),
         max_iterations=int(ai_raw.get("max_iterations", 5)),
         timeout_seconds=int(ai_raw.get("timeout_seconds", 7200)),
@@ -1191,6 +1234,10 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         ai_data["prompt_file"] = ai.prompt_file
     if ai.merge_prompt_file != ai_defaults.merge_prompt_file:
         ai_data["merge_prompt_file"] = ai.merge_prompt_file
+    if ai.split_prompt_file != ai_defaults.split_prompt_file:
+        ai_data["split_prompt_file"] = ai.split_prompt_file
+    if ai.split_conflict_commit != ai_defaults.split_conflict_commit:
+        ai_data["split_conflict_commit"] = ai.split_conflict_commit
     if ai.allowed_tools != _default_allowed_tools():
         ai_data["allowed_tools"] = ai.allowed_tools
     if ai.max_iterations != ai_defaults.max_iterations:
@@ -1316,6 +1363,102 @@ def session_file_path(
     return (config.config_path.parent / f"{config.name}.session.yaml").resolve()
 
 
+def lookup_pr_ai_context(
+    pr_sources: PRSourcesConfig, pr_url: str,
+) -> str:
+    """Resolve the user-supplied ``ai_context`` for ``pr_url``.
+
+    Walks the session's PR sources and returns the combined ai_context
+    (joined with blank lines) found for this URL. Used by code paths that
+    don't have a ``FeatureUnit`` handy (``releasy refresh``,
+    ``releasy rebase``) to feed per-PR / per-group context into the AI
+    resolver prompt.
+
+    Combination rules:
+
+    * If ``pr_url`` is in ``include_prs`` and has a per-entry ai_context,
+      that context is included.
+    * If ``pr_url`` is in any group's ``prs``, both the group-level
+      ``ai_context`` and the per-PR ai_context (when present) are
+      included.
+
+    Empty strings are dropped; the result is ``""`` when nothing matched.
+    Label-based ai_context is not consulted here since matching requires
+    fetched PR labels.
+    """
+    parts: list[str] = []
+
+    if pr_url in pr_sources.include_pr_contexts:
+        ctx = pr_sources.include_pr_contexts[pr_url]
+        if ctx:
+            parts.append(ctx)
+
+    for group in pr_sources.groups:
+        if pr_url not in group.prs:
+            continue
+        if group.ai_context:
+            parts.append(group.ai_context)
+        per_pr = group.pr_ai_contexts.get(pr_url, "")
+        if per_pr:
+            parts.append(per_pr)
+        # A PR can only appear in one group (enforced at load time), so
+        # break here to avoid scanning the rest.
+        break
+
+    return "\n\n".join(parts)
+
+
+def _parse_pr_url_entries(
+    raw: list, *, where: str,
+) -> tuple[list[str], dict[str, str]]:
+    """Parse a YAML list whose entries are either bare URL strings or
+    ``{url: ..., ai_context: ...}`` dicts.
+
+    Returns ``(urls, contexts)`` where ``urls`` preserves input order and
+    ``contexts`` maps URL → ai_context for entries that supplied one (dict
+    entries with no ``ai_context`` and bare-string entries do not appear in
+    the contexts map).
+
+    Both forms can be mixed freely in a single list. ``where`` is the
+    user-facing path used in error messages (e.g.
+    ``"pr_sources.include_prs"``).
+    """
+    if not isinstance(raw, list):
+        raise ValueError(f"{where} must be a list, got {type(raw).__name__}")
+    urls: list[str] = []
+    contexts: dict[str, str] = {}
+    seen: set[str] = set()
+    for idx, entry in enumerate(raw):
+        if isinstance(entry, str):
+            url = entry.strip()
+            ai_context = ""
+        elif isinstance(entry, dict):
+            url = (entry.get("url") or "").strip()
+            if not url:
+                raise ValueError(
+                    f"{where}[{idx}]: dict entry must specify 'url'"
+                )
+            ai_context = (entry.get("ai_context") or "").strip()
+            extra = set(entry.keys()) - {"url", "ai_context"}
+            if extra:
+                raise ValueError(
+                    f"{where}[{idx}]: unknown keys {sorted(extra)} "
+                    "(allowed: 'url', 'ai_context')"
+                )
+        else:
+            raise ValueError(
+                f"{where}[{idx}]: must be a URL string or "
+                f"{{url, ai_context}} mapping, got {type(entry).__name__}"
+            )
+        if url in seen:
+            raise ValueError(f"{where}: duplicate URL {url!r}")
+        seen.add(url)
+        urls.append(url)
+        if ai_context:
+            contexts[url] = ai_context
+    return urls, contexts
+
+
 def load_session(
     config: Config, cli_override: Path | None = None,
 ) -> SessionConfig:
@@ -1354,6 +1497,7 @@ def load_session(
                 source_branch=feat_raw["source_branch"],
                 enabled=feat_raw.get("enabled", True),
                 depends_on=feat_raw.get("depends_on", []),
+                ai_context=(feat_raw.get("ai_context") or "").strip(),
             )
         )
 
@@ -1396,6 +1540,7 @@ def load_session(
                 description=entry.get("description", ""),
                 merged_only=entry.get("merged_only", False),
                 if_exists=entry_if_exists,
+                ai_context=(entry.get("ai_context") or "").strip(),
             )
         )
 
@@ -1409,11 +1554,14 @@ def load_session(
         if gid in seen_group_ids:
             raise ValueError(f"pr_sources.groups: duplicate id {gid!r}")
         seen_group_ids.add(gid)
-        prs_list = entry.get("prs", [])
-        if not isinstance(prs_list, list) or len(prs_list) < 1:
+        raw_prs = entry.get("prs", [])
+        if not isinstance(raw_prs, list) or len(raw_prs) < 1:
             raise ValueError(
                 f"pr_sources.groups[{gid!r}].prs must be a non-empty list of PR URLs"
             )
+        prs_list, pr_ai_contexts = _parse_pr_url_entries(
+            raw_prs, where=f"pr_sources.groups[{gid!r}].prs",
+        )
         for url in prs_list:
             if url in seen_group_prs:
                 raise ValueError(
@@ -1445,6 +1593,8 @@ def load_session(
                 description=entry.get("description", ""),
                 if_exists=group_if_exists,
                 sort=group_sort,
+                ai_context=(entry.get("ai_context") or "").strip(),
+                pr_ai_contexts=pr_ai_contexts,
             )
         )
 
@@ -1461,14 +1611,20 @@ def load_session(
             )
         return v
 
+    include_prs_list, include_pr_contexts = _parse_pr_url_entries(
+        ps_raw.get("include_prs", []) or [],
+        where="pr_sources.include_prs",
+    )
+
     pr_sources = PRSourcesConfig(
         by_labels=by_labels,
         exclude_labels=ps_raw.get("exclude_labels", []) or [],
-        include_prs=ps_raw.get("include_prs", []) or [],
+        include_prs=include_prs_list,
         exclude_prs=ps_raw.get("exclude_prs", []) or [],
         include_authors=_str_list("include_authors"),
         exclude_authors=_str_list("exclude_authors"),
         groups=groups,
+        include_pr_contexts=include_pr_contexts,
     )
 
     if config.sequential and groups:
@@ -1500,6 +1656,21 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
 
     data: dict = {}
 
+    def _dump_pr_url_list(
+        urls: list[str], contexts: dict[str, str],
+    ) -> list:
+        """Render a PR URL list: bare strings when no ai_context is
+        attached, dict form (``{url, ai_context}``) when one is.
+        """
+        out: list = []
+        for url in urls:
+            ctx = contexts.get(url, "")
+            if ctx:
+                out.append({"url": url, "ai_context": ctx})
+            else:
+                out.append(url)
+        return out
+
     data["features"] = [
         {
             k: v
@@ -1509,6 +1680,7 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
                 "source_branch": f.source_branch,
                 "enabled": f.enabled,
                 "depends_on": f.depends_on or None,
+                "ai_context": f.ai_context or None,
             }.items()
             if v is not None
         }
@@ -1526,6 +1698,7 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
                     "description": entry.description or None,
                     "merged_only": entry.merged_only or None,
                     "if_exists": entry.if_exists,
+                    "ai_context": entry.ai_context or None,
                 }.items()
                 if v is not None
             }
@@ -1534,7 +1707,9 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
     if ps.exclude_labels:
         ps_data["exclude_labels"] = ps.exclude_labels
     if ps.include_prs:
-        ps_data["include_prs"] = ps.include_prs
+        ps_data["include_prs"] = _dump_pr_url_list(
+            ps.include_prs, ps.include_pr_contexts,
+        )
     if ps.exclude_prs:
         ps_data["exclude_prs"] = ps.exclude_prs
     if ps.include_authors:
@@ -1550,7 +1725,8 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
                     "description": g.description or None,
                     "if_exists": g.if_exists,
                     "sort": g.sort if g.sort != "listed" else None,
-                    "prs": g.prs,
+                    "ai_context": g.ai_context or None,
+                    "prs": _dump_pr_url_list(g.prs, g.pr_ai_contexts),
                 }.items()
                 if v is not None
             }

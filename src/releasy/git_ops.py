@@ -589,6 +589,58 @@ def commit_conflict_markers(repo_path: Path) -> bool:
     return result.returncode == 0
 
 
+def commit_cherry_pick_conflict_as_is(
+    repo_path: Path, source_pr_url: str | None = None,
+) -> tuple[bool, str | None]:
+    """Conclude an in-progress cherry-pick with conflict markers as-is.
+
+    Stages every file in the working tree (including the unmerged ones,
+    whose textual content is the conflict markers verbatim) and creates a
+    commit. The original cherry-pick commit message that git prepared in
+    ``.git/MERGE_MSG`` is preserved as the body, with a header line that
+    flags the commit as carrying unresolved markers \u2014 so a human reading
+    the port branch's ``git log`` can immediately tell that the next
+    commit is the conflict resolution.
+
+    Returns ``(success, head_sha_or_None)``. On success ``head_sha`` is
+    the SHA of the new commit (the one with the markers).
+    """
+    run_git(["add", "--all"], repo_path, check=False)
+
+    msg_file = repo_path / ".git" / "MERGE_MSG"
+    original_msg = ""
+    if msg_file.exists():
+        try:
+            original_msg = msg_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            original_msg = ""
+
+    header = "Cherry-pick with unresolved conflict markers (resolution in next commit)"
+    if source_pr_url:
+        header = (
+            f"Cherry-pick of {source_pr_url} with unresolved conflict markers "
+            "(resolution in next commit)"
+        )
+
+    if original_msg:
+        full_msg = f"{header}\n\n---\nOriginal cherry-pick message follows:\n\n{original_msg}"
+    else:
+        full_msg = header
+
+    result = run_git(
+        ["commit", "--no-edit", "-m", full_msg],
+        repo_path,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False, None
+
+    head = run_git(["rev-parse", "--verify", "HEAD"], repo_path, check=False)
+    if head.returncode != 0:
+        return True, None
+    return True, head.stdout.strip() or None
+
+
 # ---------------------------------------------------------------------------
 # Squash
 # ---------------------------------------------------------------------------
@@ -629,3 +681,12 @@ def resolve_ref(repo_path: Path, ref: str) -> str | None:
         if result.returncode == 0:
             return result.stdout.strip()
     return None
+
+
+def is_tag_ref(repo_path: Path, ref: str) -> bool:
+    """True if ``ref`` resolves to an actual git tag in the repo."""
+    result = run_git(
+        ["rev-parse", "--verify", "--quiet", f"refs/tags/{ref}"],
+        repo_path, check=False,
+    )
+    return result.returncode == 0

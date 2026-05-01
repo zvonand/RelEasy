@@ -1,20 +1,32 @@
-# Claude skill: resolve a RelEasy port cherry-pick conflict
+# Claude skill: resolve a RelEasy port cherry-pick conflict (split-commit mode)
 
-You are an autonomous agent resolving a `git cherry-pick` conflict in
-`{repo_slug}`.
+You are an autonomous agent resolving the conflict markers left behind by
+a `git cherry-pick` in `{repo_slug}`.
 
 The repository at `{cwd}` is already prepared for you:
 
 - Current branch: `{port_branch}` (already checked out).
-- A cherry-pick is **in progress** and has hit conflict markers.
+- The cherry-pick has **already been concluded** by RelEasy as a stand-alone
+  commit at `HEAD` whose tree still contains the literal `<<<<<<<` /
+  `=======` / `>>>>>>>` conflict markers. There is **no** cherry-pick,
+  merge, or rebase in progress — `git status` is clean.
 - The target base branch is `{base_branch}` (exists on origin).
 - The port is of source PR [{source_pr_url}]({source_pr_url}) — "{source_pr_title}".
 - The exact commit being cherry-picked has SHA `{source_pr_merge_sha}` (a
-  merge commit; `git cherry-pick -m 1` is replaying its first-parent diff).
+  merge commit; `git cherry-pick -m 1` was replaying its first-parent diff).
 
-> **NOTE:** This is one step of a larger pipeline. Your job ends after the
-> conflict is resolved, the build succeeds, and the cherry-pick has been
-> committed locally. RelEasy itself owns pushing the branch, opening the
+> **Why this layout?** The "with conflicts" commit and the resolution
+> commit live side by side in the port branch's history so a reviewer
+> can read `git log -p` and see, in order: (1) what the cherry-pick
+> mechanically produced (markers and all), and (2) the exact diff that
+> turned that into compileable code. **Do not amend, squash, reorder,
+> reword, or otherwise touch the "with conflicts" commit at HEAD.** Your
+> contribution is one new commit on top of it.
+
+> **NOTE:** This is one step of a larger pipeline. Your job ends after
+> the conflict is resolved, the build succeeds, and the resolution has
+> been committed locally as a *new* commit on top of the existing "with
+> conflicts" commit. RelEasy itself owns pushing the branch, opening the
 > pull request, and applying labels. **Do not push, do not open a PR, do
 > not run `gh pr ...` to mutate anything.**
 
@@ -83,7 +95,7 @@ When resolving a cherry-pick (or any conflict) that touches this file:
 
    you have done it wrong. Delete the `//`-prefixed line; only the uncommented one should remain. The same applies if the commented and uncommented copies are not adjacent — search the hunk (and any nearby hunks the cherry-pick touched) for a `// {"<same_key>", ...}` twin and remove it.
 
-**Summary:** commented-out settings for the same keys → **uncomment the existing line in place (no duplicate copy left behind) and reconcile**, do not **append** the cherry-pick’s additions blindly.
+**Summary:** commented-out settings for the same keys → **uncomment the existing line in place (no duplicate copy left behind) and reconcile**, do not **append** the cherry-pick's additions blindly.
 
 ---
 
@@ -195,7 +207,9 @@ MISSING_PREREQS: <url1> <url2>
 REASON: <one line explaining the dependency, AND why the equivalent is not already on {base_branch}>
 ```
 
-Then output `UNRESOLVED` and exit without staging anything.
+Then output `UNRESOLVED` and exit without staging anything. (No new
+commit needs to be made — the "with conflicts" commit at HEAD stays put
+and RelEasy will reset it on its own.)
 
 If investigation turns up nothing clear, or if the conflict turns out
 to be a normal divergence after all, just proceed with the standard
@@ -235,11 +249,11 @@ The right action is a bucket-2 adaptation: rename `foo_v2(...)` to
 
 ### Step 1 — Establish ground truth (the source PR's actual diff)
 
-Before touching any file, get the exact diff the cherry-pick is trying
+Before touching any file, get the exact diff the cherry-pick was trying
 to apply. Use **both** of these so you can cross-check:
 
 1. The local first-parent diff of the merge commit (this is literally
-   what `git cherry-pick -m 1` is replaying):
+   what `git cherry-pick -m 1` was replaying):
 
    ```bash
    git show -m --first-parent --no-color {source_pr_merge_sha}
@@ -260,47 +274,55 @@ git show -m --first-parent --no-color {source_pr_merge_sha} -- <file>
 ```
 
 You may also need to inspect the current `{base_branch}` shape around a
-conflicted file to justify a bucket-2 mechanical adaptation. Use these
-only to identify the specific rename / move / signature change that
-forces the adaptation, **not** as a license to copy extra code:
+conflicted file to justify a bucket-2 mechanical adaptation. The
+"pre-cherry-pick" state of the file (what was on the branch *before* the
+conflicting commit landed — equivalent to the classic "ours") is
+`HEAD~1:<file>`:
 
 ```bash
-git diff --ours -- <file>
-git blame -- <file>
+git show HEAD~1:<file>
+git blame HEAD~1 -- <file>
 git log --no-color --follow --oneline {base_branch} -- <file>
 ```
 
 Read these diffs carefully. The source PR's diff defines what the port
-*wants* to do; the current `{base_branch}` shape in `ours` is the only
-legitimate source of bucket-2 adaptations. Anything not explainable by
-one of the two is out of scope.
+*wants* to do; the `HEAD~1` shape of the file is the only legitimate
+source of bucket-2 adaptations. Anything not explainable by one of the
+two is out of scope.
 
-### Step 2 — Inspect what git left behind
+### Step 2 — Inspect the conflict markers committed at HEAD
 
-For each conflicted file, look at exactly what you have to merge:
+The "with conflicts" commit at HEAD has the conflict markers literally
+stored in the file content. Inspect them with the working-tree files
+themselves (the markers are in there as text):
 
 ```bash
-git status
-git diff -- <file>            # shows the working-tree state with conflict markers
-git diff --base   -- <file>   # changes from the merge-base to the working tree
-git diff --ours   -- <file>   # ours vs the working tree
-git diff --theirs -- <file>   # theirs vs the working tree
+git status                       # must be clean (no in-progress operation)
+git log -1 --stat                # confirms HEAD is the "with conflicts" commit
+git log -1 --format=%B           # full message of the "with conflicts" commit
 ```
 
-In a cherry-pick:
+For each conflicted file, the commit at HEAD shows you both sides:
 
-- **"ours"** is the current `{port_branch}` (i.e. the state of
-  `{base_branch}` plus whatever earlier commits this port already
-  applied). Treat it as the truth for everything *outside* the source
-  PR's scope.
-- **"theirs"** is the commit being applied — but a merge commit's
-  first-parent diff can include code from *other* PRs that the original
-  branch had bundled in. **Lines from "theirs" that are not in the
-  source PR's diff are noise.** Drop them.
+```bash
+git diff HEAD~1 HEAD -- <file>     # what the cherry-pick produced (markers and all)
+cat <file>                          # the file as it sits in your working tree
+```
+
+Inside each `<<<<<<< ours` / `======= ` / `>>>>>>> theirs` block:
+
+- **"ours"** is the pre-cherry-pick state (i.e. `{base_branch}` plus
+  whatever earlier commits this port already applied). Treat it as the
+  truth for everything *outside* the source PR's scope.
+- **"theirs"** is the commit that was being applied — but a merge
+  commit's first-parent diff can include code from *other* PRs that the
+  original branch had bundled in. **Lines from "theirs" that are not in
+  the source PR's diff are noise.** Drop them.
 
 ### Step 3 — Resolve each conflict, hunk by hunk
 
-For every `<<<<<<< ... ======= ... >>>>>>>` block:
+For every `<<<<<<< ... ======= ... >>>>>>>` block in each conflicted
+file:
 
 1. Identify each *line* on the "theirs" side that differs from "ours".
 2. For each such line, check whether it appears as an addition (or
@@ -324,8 +346,8 @@ For every `<<<<<<< ... ======= ... >>>>>>>` block:
       type, a moved import, a struct field that was split into two,
       etc.).
    2. You can point to the specific symbol or recent commit on
-      `{base_branch}` (visible either in the current `ours` version of
-      the file or in the `git log --follow --oneline {base_branch} -- <file>`
+      `{base_branch}` (visible either in the `HEAD~1:<file>` shape from
+      Step 1 or in the `git log --follow --oneline {base_branch} -- <file>`
       output from Step 1) that forces the change.
    3. The translation does not add new behavior, new logging, new
       error handling, new tests, or new helpers. If satisfying (1)
@@ -335,7 +357,11 @@ For every `<<<<<<< ... ======= ... >>>>>>>` block:
    When you take this path, mention it briefly in your final stdout
    narration before `DONE` (e.g. *"Adapted call to `Foo::serialize` for
    the renamed-on-`{base_branch}` signature `Foo::serialize(ctx, out)`"*).
-4. If the conflict is in a comment, doc-string, or generated table of
+4. **Remove every conflict marker.** No `<<<<<<<`, `=======`, or
+   `>>>>>>>` line may survive into your resolution. The whole point of
+   the new commit is to delete them and replace each conflicted region
+   with the chosen text.
+5. If the conflict is in a comment, doc-string, or generated table of
    the kind that grows with every PR (e.g. `SettingsChangesHistory`,
    `ProfileEvents`, changelog tables): **only** keep the rows the source
    PR itself adds. The bucket-2 carve-out does **not** apply to these
@@ -360,7 +386,8 @@ For every `<<<<<<< ... ======= ... >>>>>>>` block:
 - **No copying from other refs.** Do not `git show <other-sha>`,
   `git log <other-branch>`, or read other branches/tags to figure out
   "what should be there". The only refs that matter are
-  `{source_pr_merge_sha}`, `{port_branch}`, and `{base_branch}`.
+  `{source_pr_merge_sha}`, `{port_branch}` (specifically `HEAD` and
+  `HEAD~1`), and `{base_branch}`.
   *Exception — prerequisite detection only*: `git log -S <identifier>`
   on `{origin_remote_name}/{origin_branch}` (and on the upstream remote
   if configured) is allowed **solely to identify which PR introduced a
@@ -369,15 +396,21 @@ For every `<<<<<<< ... ======= ... >>>>>>>` block:
   missing-prerequisite conflict" above). This never licenses reading or
   copying code from those refs — only extracting a commit reference to
   report back via `MISSING_PREREQS:`.
-- **No `git add -A`.** Stage only the conflicted files (and any file you
-  had to touch to make them compile after resolving the conflict).
+- **Never amend, reword, or otherwise touch the "with conflicts" commit
+  at HEAD.** It is your input, not your output. Do not run
+  `git commit --amend`, `git rebase -i`, `git reset --soft HEAD~`,
+  `git reset --hard`, or any other history rewrite. Your contribution is
+  one new commit on top of HEAD.
+- **No `git add -A`.** Stage only the files you actually edited to
+  resolve the conflicts (and any file you had to touch to make them
+  compile after resolving the conflict).
 - **No fixing unrelated lints / refactors / typos** noticed along the
   way. They are the next reviewer's problem, not this PR's.
 
 ### Step 4 — Verify scope before committing
 
 After you have edited the conflicted files but BEFORE running
-`git cherry-pick --continue`:
+`git commit`:
 
 ```bash
 git diff -- <file>            # the changes you're about to stage in <file>
@@ -399,8 +432,8 @@ allowed buckets from "The single most important rule":
   > is the minimal translation: just `<token swap | extra arg | new
   > include path | …>`."
 
-  You should be able to point to the specific symbol in the current
-  `ours` version of the file, or to a recent commit in the
+  You should be able to point to the specific symbol in the
+  `HEAD~1:<file>` shape, or to a recent commit in the
   `git log --follow --oneline {base_branch} -- <file>` output from
   Step 1. Vague answers ("the API looks different now", "to match
   surrounding style", "it seems consistent with X") do **not** count —
@@ -411,17 +444,37 @@ allowed buckets from "The single most important rule":
   evidence you misidentified bucket 2 — re-examine, find the named
   base-branch change, and try again.
 
+Also confirm that **no `<<<<<<<` / `=======` / `>>>>>>>` markers remain
+in your `git diff`** — every conflict region must be fully replaced.
+
 If after this check you genuinely cannot decide between two reasonable
 resolutions of a hunk, or a bucket-2 adaptation would require more than
 a token-level change, stop, print a single line `UNRESOLVED` and exit.
 A clean abort is much better than an over-eager guess.
 
-### Step 5 — Stage and continue the cherry-pick
+### Step 5 — Stage and commit the resolution as a NEW commit
 
 ```bash
 git add <file> <file> ...
-git cherry-pick --continue --no-edit
+git commit -m "Resolve cherry-pick conflicts for #{source_pr_number}"
 ```
+
+Do **not** use `git commit --amend`. Do **not** use `git cherry-pick
+--continue` (there is no cherry-pick in progress). The output you are
+producing is a brand-new commit whose parent is the "with conflicts"
+commit currently at HEAD.
+
+After this step the port branch's history (most-recent first) reads:
+
+```
+<your new commit>      ← the resolution
+<HEAD before you ran>  ← the cherry-pick with conflict markers
+... earlier commits ...
+```
+
+A reviewer running `git log -p` will see the conflict markers appear
+and disappear in successive commits, which is exactly the diff trail
+this layout is designed to produce.
 
 ### Step 6 — Build to verify the resolution compiles
 
@@ -466,11 +519,15 @@ How to inspect `{build_log}` efficiently:
   fix must remain inside the source PR's diff plus minimal mechanical
   adaptations forced by `{base_branch}`. Do not "fix" the build by
   pulling in code from other PRs.
-- Stage and amend the commit:
+- Stage and amend **your resolution commit only** (the one you just
+  created in Step 5 — it is the current HEAD):
   ```bash
   git add -u
   git commit --amend --no-edit
   ```
+  The "with conflicts" commit is now `HEAD~1` and must remain
+  untouched. Never run `git commit --amend` while HEAD is still pointing
+  at the "with conflicts" commit (i.e. before Step 5 has completed).
 - Rerun the EXACT same single command `bash {build_script}` (it
   overwrites the log, which is fine).
 - You may iterate at most **{max_iterations}** build attempts in total.
@@ -482,8 +539,22 @@ git status --porcelain
 ```
 
 It must produce no output. If it does, repeat Step 4's scope check on
-whatever's left, then stage and amend
+whatever's left, then stage and amend your resolution commit
 (`git add -u && git commit --amend --no-edit`).
+
+Also confirm the layout you're handing back:
+
+```bash
+git log --oneline -2
+```
+
+The first line should be your resolution commit; the second should be
+the "Cherry-pick … with unresolved conflict markers" commit RelEasy
+created. If `git log --oneline -2` shows only one commit (or your
+commit is the only one above the base branch), you must have
+inadvertently amended or reset the "with conflicts" commit — that
+violates the layout contract. Print `UNRESOLVED` and exit; RelEasy will
+reset and let a human take over.
 
 ---
 
@@ -496,9 +567,15 @@ whatever's left, then stage and amend
   the PR after you finish. (Read-only `gh` commands like
   `gh pr diff {source_pr_url}` are fine and encouraged.)
 - Never force-push to `{base_branch}` or any protected branch.
+- **Never amend, reword, or rewrite the "with conflicts" commit at
+  HEAD.** It is RelEasy's input to your work. The only commit you may
+  amend is the resolution commit you create in Step 5 (and only after
+  you've created it).
 - Never amend or rewrite commits that already exist on
   `origin/{base_branch}`.
-- Do not run `git reset --hard` against any remote ref.
+- Do not run `git reset --hard`, `git reset --soft HEAD~`, or anything
+  that rewinds past HEAD's parent. Do not run `git rebase` for any
+  reason.
 - Never write log files yourself; the only build log is `{build_log}`,
   produced by the wrapper script — you only ever read it.
 - Never invoke `cmake`, `ninja`, `make`, or `bash` directly with custom

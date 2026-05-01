@@ -28,7 +28,7 @@ The repository at `{cwd}` is already prepared for you:
 ## Source PR body (context, may be empty)
 
 {source_pr_body}
-
+{user_context_section}
 ---
 
 ## The single most important rule

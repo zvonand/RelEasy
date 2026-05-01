@@ -25,11 +25,15 @@ from __future__ import annotations
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from releasy.pipeline import OnlyFilter
 
 from releasy.termlog import console
 
 from releasy.ai_resolve import AIResolveContext, attempt_ai_resolve
-from releasy.config import Config, get_github_token
+from releasy.config import Config, get_github_token, lookup_pr_ai_context
 from releasy.git_ops import (
     abort_in_progress_op,
     fetch_commit,
@@ -257,6 +261,9 @@ def _try_cherry_pick_path(
             conflict_files=conflict_files,
             start_sha=start_sha,
             operation="cherry-pick",
+            user_context=lookup_pr_ai_context(
+                config.pr_sources, source_pr.url,
+            ),
         )
         ai_result = attempt_ai_resolve(config, repo_path, ctx)
         if ai_result.cost_usd is not None:
@@ -348,6 +355,9 @@ def _try_diff_fallback(
             conflict_files=conflict_files,
             start_sha=start_sha,
             operation="cherry-pick",
+            user_context=lookup_pr_ai_context(
+                config.pr_sources, source_pr.url,
+            ),
         )
         ai_result = attempt_ai_resolve(config, repo_path, ctx)
         if ai_result.cost_usd is not None:
@@ -645,19 +655,32 @@ def rebase_all_tracked(
     *,
     work_dir: Path | None = None,
     resolve_conflicts: bool = True,
+    only: OnlyFilter | None = None,
 ) -> RebaseSummary:
-    """Drive ``releasy rebase --target <branch>`` (every tracked rebase PR)."""
+    """Drive ``releasy rebase --target <branch>`` (every tracked rebase PR).
+
+    ``only`` (optional) restricts the walk to a single tracked PR
+    (matched by URL — source or rebase) or a single feature / group ID.
+    """
     state = load_state(config)
-    pr_urls: list[str] = []
+    candidates: list[tuple[str, str]] = []  # (feature_id, rebase_pr_url)
     for fid, fs in state.features.items():
         if fs.status == "skipped":
             continue
         if not fs.rebase_pr_url:
             continue
-        pr_urls.append(fs.rebase_pr_url)
+        if only is not None and not only.matches_state(fid, fs):
+            continue
+        candidates.append((fid, fs.rebase_pr_url))
 
     summary = RebaseSummary()
-    if not pr_urls:
+    if only is not None and not candidates:
+        console.print(
+            f"\n[red]✗[/red] --only={only.label!r} matched no tracked "
+            "rebase PRs. Check the URL / group id and re-run."
+        )
+        return summary
+    if not candidates:
         console.print(
             "[yellow]No tracked rebase PRs found in state — nothing "
             "to rebase.[/yellow]"
@@ -665,11 +688,14 @@ def rebase_all_tracked(
         return summary
 
     repo_path = _setup(config, work_dir, target_branch)
-    console.print(
-        f"\n[bold]Rebasing {len(pr_urls)} tracked PR(s) onto "
-        f"[cyan]{target_branch}[/cyan][/bold]"
+    scope = (
+        f" (--only={only.label})" if only is not None else ""
     )
-    for url in pr_urls:
+    console.print(
+        f"\n[bold]Rebasing {len(candidates)} tracked PR(s) onto "
+        f"[cyan]{target_branch}[/cyan]{scope}[/bold]"
+    )
+    for _fid, url in candidates:
         summary.outcomes.append(
             rebase_one_pr(
                 config, repo_path, url, target_branch,
