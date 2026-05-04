@@ -169,6 +169,14 @@ class FeatureUnit:
     # PRs' own entries" (singletons, ai_changelog disabled, or a
     # synthesis failure).
     synthesized_changelog: str | None = None
+    # Set of source-PR URLs already present on the existing port branch
+    # (read from ``Source-PR:`` commit trailers) when running with
+    # ``if_exists: append``. The cherry-pick loop skips PRs whose URL
+    # appears here, while ``_unit_body`` still iterates the full
+    # ``prs`` list — so the rebase PR description reflects the declared
+    # group order regardless of whether a given PR was applied on this
+    # run or a prior one.
+    applied_pr_urls: set[str] = field(default_factory=set)
 
     @property
     def sort_key(self) -> tuple[str, int]:
@@ -1816,6 +1824,133 @@ def _cherry_pick_pr(
     )
 
 
+# Pulls every URL out of the Source-PR trailers we ourselves wrote
+# (e.g. ``#42 (https://github.com/owner/repo/pull/42)``).
+_SOURCE_PR_URL_RE = re.compile(r"https?://\S+?/pull/\d+", re.IGNORECASE)
+
+
+def _read_source_pr_trailers(
+    repo_path: Path, base_ref: str, branch: str,
+) -> tuple[list[str | None], int]:
+    """Walk every commit in ``base_ref..branch`` and pull its
+    ``Source-PR:`` trailer URL.
+
+    Returns a tuple ``(per_commit_urls, total_commits)``. ``per_commit_urls``
+    has one entry per commit (oldest → newest); the entry is the URL when
+    the commit carries a ``Source-PR:`` trailer (the format
+    :func:`_tag_commit_with_source_pr` writes), or ``None`` when no trailer
+    is present (e.g. commits made before the trailer convention, or AI
+    fix-up commits that didn't get re-tagged).
+    """
+    rev_list = run_git(
+        ["rev-list", "--reverse", f"{base_ref}..{branch}"],
+        repo_path, check=False,
+    )
+    if rev_list.returncode != 0:
+        return [], 0
+    shas = [s for s in rev_list.stdout.split() if s]
+
+    urls: list[str | None] = []
+    for sha in shas:
+        # ``%(trailers:key=...,unfold=true,valueonly=true)`` only emits the
+        # value half of the matching trailer lines (one per line) — won't
+        # false-positive on a URL that happens to appear in the body.
+        out = run_git(
+            [
+                "log", "-1",
+                "--format=%(trailers:key=Source-PR,unfold=true,valueonly=true)",
+                sha,
+            ],
+            repo_path, check=False,
+        )
+        url: str | None = None
+        if out.returncode == 0:
+            for line in out.stdout.splitlines():
+                m = _SOURCE_PR_URL_RE.search(line)
+                if m:
+                    url = m.group(0)
+                    break
+        urls.append(url)
+    return urls, len(shas)
+
+
+@dataclass
+class _AppendDecision:
+    """Result of ``_decide_append`` — whether we can append to an existing
+    port branch and which declared PRs are still missing.
+    """
+    feasible: bool
+    reason: str                            # human-readable explanation
+    applied_urls: set[str] = field(default_factory=set)  # PRs already present
+    missing_count: int = 0                 # declared PRs not yet on branch
+
+
+def _decide_append(
+    repo_path: Path, base_ref: str, branch: str, unit: FeatureUnit,
+) -> _AppendDecision:
+    """Decide whether ``if_exists: append`` can proceed for this unit.
+
+    The contract: the existing port branch must look like a prefix of the
+    declared ``unit.prs`` list. Specifically, every commit either:
+
+      1. carries a ``Source-PR:`` trailer pointing at one of the declared
+         PRs, or
+      2. is untagged but accompanies a stretch of declared PRs that are
+         missing from the trailer set, in which case we assume the leading
+         declared PRs (in order) correspond to the untagged commits.
+
+    Anything else — extra commits we can't account for, or trailers
+    pointing at PRs that aren't in the declared list — fails the check
+    and the caller falls back to ``skip`` behaviour.
+    """
+    per_commit, total = _read_source_pr_trailers(repo_path, base_ref, branch)
+    declared_urls = [pr.url for pr in unit.prs]
+    declared_set = set(declared_urls)
+
+    # 1) Tagged commits: every URL in trailers must be declared.
+    tagged_urls = [u for u in per_commit if u is not None]
+    foreign = [u for u in tagged_urls if u not in declared_set]
+    if foreign:
+        return _AppendDecision(
+            feasible=False,
+            reason=(
+                f"branch carries commits whose Source-PR trailer points at "
+                f"PR(s) not in the declared group: {', '.join(foreign)}"
+            ),
+        )
+
+    untagged_count = total - len(tagged_urls)
+    declared_not_in_trailers = [
+        url for url in declared_urls if url not in tagged_urls
+    ]
+
+    # 2) Untagged commits must not exceed declared PRs missing from trailers.
+    if untagged_count > len(declared_not_in_trailers):
+        return _AppendDecision(
+            feasible=False,
+            reason=(
+                f"branch has {untagged_count} commit(s) without a "
+                f"Source-PR trailer but only {len(declared_not_in_trailers)} "
+                "declared PR(s) are unaccounted for"
+            ),
+        )
+
+    # 3) Treat the leading ``untagged_count`` of those declared-but-untagged
+    # PRs as already applied (best-effort match by position). The rest is
+    # what needs cherry-picking.
+    applied = set(tagged_urls)
+    for url in declared_not_in_trailers[:untagged_count]:
+        applied.add(url)
+
+    missing_count = sum(1 for url in declared_urls if url not in applied)
+    return _AppendDecision(
+        feasible=True,
+        reason="ok",
+        applied_urls=applied,
+        missing_count=missing_count,
+    )
+
+
 def _next_free_renumbered_port_branch(
     repo_path: Path,
     remote: str,
@@ -1923,7 +2058,69 @@ def _process_feature_unit(
     on_remote = remote_branch_exists(repo_path, new_branch, remote)
     on_local = local_branch_exists(repo_path, new_branch)
 
-    if on_remote and not force_retry:
+    # --- if_exists: append ---
+    # Honoured only when force_retry is False (a previous-failure retry
+    # takes precedence and rebuilds from base) and there's actually a
+    # branch to append to. ``cherry_pick_base`` defaults to ``base_ref``
+    # for the from-scratch path; in append mode it's the existing branch
+    # tip so each loop iteration resets to the prefix we want to keep.
+    append_active = False
+    cherry_pick_base = base_ref
+    if (
+        unit.if_exists == "append"
+        and (on_remote or on_local)
+        and not force_retry
+    ):
+        if not unit.is_group:
+            console.print(
+                f"\n    [yellow]![/yellow] [cyan]{new_branch}[/cyan] "
+                f"({label}) — if_exists: append is meaningful only for "
+                "groups; treating as 'skip' for this singleton"
+            )
+            _ensure_pr_for_existing_remote_branch(
+                config, state, unit, new_branch, base_branch,
+            )
+            return "continue"
+        else:
+            # Need a local branch to inspect commits on.
+            if not on_local:
+                run_git(
+                    ["branch", "-f", new_branch, f"{remote}/{new_branch}"],
+                    repo_path,
+                )
+                on_local = True
+            decision = _decide_append(repo_path, base_ref, new_branch, unit)
+            if not decision.feasible:
+                console.print(
+                    f"\n    [yellow]![/yellow] [cyan]{new_branch}[/cyan] "
+                    f"({label}) — append not feasible: {decision.reason}; "
+                    "skipping (set if_exists: recreate to rebuild)"
+                )
+                _ensure_pr_for_existing_remote_branch(
+                    config, state, unit, new_branch, base_branch,
+                )
+                return "continue"
+            if decision.missing_count == 0:
+                console.print(
+                    f"\n    [cyan]{new_branch}[/cyan] ({label}) — every "
+                    "declared PR is already on the branch; nothing to append"
+                )
+                _ensure_pr_for_existing_remote_branch(
+                    config, state, unit, new_branch, base_branch,
+                )
+                return "continue"
+            unit.applied_pr_urls = decision.applied_urls
+            append_active = True
+            cherry_pick_base = run_git(
+                ["rev-parse", "--verify", new_branch], repo_path,
+            ).stdout.strip()
+            console.print(
+                f"\n    [yellow]+[/yellow] [cyan]{new_branch}[/cyan] "
+                f"({label}) — appending {decision.missing_count} new PR(s) "
+                f"on top of {len(decision.applied_urls)} already applied"
+            )
+
+    if on_remote and not force_retry and not append_active:
         console.print(
             f"\n    [cyan]{new_branch}[/cyan] ({label}) — already exists on "
             f"[cyan]{remote}[/cyan], skipping cherry-pick "
@@ -1941,7 +2138,7 @@ def _process_feature_unit(
         )
         return "continue"
 
-    if on_local and not force_retry:
+    if on_local and not force_retry and not append_active:
         console.print(
             f"\n    [yellow]↻[/yellow] [cyan]{new_branch}[/cyan] exists "
             "locally, recreating from base"
@@ -1982,7 +2179,11 @@ def _process_feature_unit(
 
         pr_meta = _unit_pr_meta(unit)
         stash_and_clean(repo_path)
-        create_branch_from_ref(repo_path, new_branch, base_ref)
+        # In append mode ``cherry_pick_base`` is the existing branch tip
+        # (the commits we keep); otherwise it's the rebase base. Each
+        # iteration of the auto-prereq loop resets to the same point so
+        # we never duplicate or lose the kept-prefix.
+        create_branch_from_ref(repo_path, new_branch, cherry_pick_base)
 
         outcome = _attempt_cherry_picks(
             config, repo_path, unit, new_branch, base_branch, ai_active,
@@ -2130,9 +2331,19 @@ def _attempt_cherry_picks(
     Stops on the first conflict and returns the appropriate outcome
     (``unresolved`` or ``missing_prereqs``). Returns ``success`` only
     when every PR landed cleanly.
+
+    PRs whose URL is in ``unit.applied_pr_urls`` are skipped — this is
+    the ``if_exists: append`` path, where the existing port branch
+    already has those commits applied from a prior run.
     """
     for idx, pr in enumerate(unit.prs):
         ref = pr_ref_label(pr.repo_slug, pr.number, origin_slug)
+        if pr.url in unit.applied_pr_urls:
+            console.print(
+                f"    [dim]→ {ref} ({idx + 1}/{len(unit.prs)}) "
+                "already on branch (append mode), skipping[/dim]"
+            )
+            continue
         if len(unit.prs) > 1:
             console.print(
                 f"    [dim]→ cherry-picking {ref} "
@@ -2445,6 +2656,12 @@ def _finish_clean_unit(
         fs.prereq_discovery_depth = prereq_discovery_depth
     state.features[unit.feature_id] = fs
 
+    # In append mode (PRs were added to an already-ported group) the body
+    # is stale by definition — it lists fewer PRs than the unit now
+    # carries. Force the rewrite even when ``update_existing_prs: false``
+    # so reviewers see the full declared group, not the prior subset.
+    appended_to_existing = bool(unit.applied_pr_urls)
+
     if config.push and config.pr_policy.auto_pr:
         # Title format is identical regardless of AI involvement; the
         # `ai-resolved` label (applied below) is what marks it.
@@ -2456,7 +2673,7 @@ def _finish_clean_unit(
                 auto_prereq_urls=dynamic_prereq_urls,
                 auto_prereq_trail=prereq_trail,
             ),
-            force_update=was_failed_prev or has_auto_prereqs,
+            force_update=was_failed_prev or has_auto_prereqs or appended_to_existing,
         )
         _log_pr_action(outcome, rebase_pr_url)
         if rebase_pr_url:

@@ -68,8 +68,12 @@ features:
 #   must carry ALL listed labels). Multiple entries are unioned.
 #   Per-entry options:
 #     merged_only: true — skip open PRs, only cherry-pick merged ones.
-#     if_exists: skip|recreate — overrides pr_policy.if_exists (in
-#                                config.yaml) for this entry.
+#     if_exists: skip|recreate|append — overrides pr_policy.if_exists
+#                                (in config.yaml) for this entry. See
+#                                config.yaml.example for the full
+#                                description of each value; "append"
+#                                tops up an existing branch with newly
+#                                added PRs instead of rebuilding it.
 #     description: prefix prepended to the PR title for the feature name.
 #     ai_context: free-form note appended to the AI conflict-resolver
 #                 prompt for every PR matched by this entry. Keep it
@@ -174,5 +178,7 @@ features:
 #           ai_context: |
 #             This one specifically renames `IcebergCatalog::list_tables`
 #             to `list_namespaces`. Update call sites added by #1500.
-#       # if_exists: skip       # override pr_policy.if_exists
+#       # if_exists: skip       # override pr_policy.if_exists.
+#       #                       # "append" adds newly-listed PRs onto the
+#       #                       # existing branch tip without rebuilding.
 #       # sort: merged_at       # default "listed"

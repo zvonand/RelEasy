@@ -135,7 +135,7 @@ class FeatureConfig:
     ai_context: str = ""
 
 
-_VALID_IF_EXISTS = ("skip", "recreate")
+_VALID_IF_EXISTS = ("skip", "recreate", "append")
 _VALID_GROUP_SORT = ("listed", "merged_at")
 
 
@@ -144,8 +144,10 @@ class PRSourceConfig:
     labels: list[str]
     description: str = ""
     merged_only: bool = False
-    # When the port branch already exists: "skip" (leave it alone) or
-    # "recreate" (delete and rebuild from base). Inherits ``pr_policy.if_exists``
+    # When the port branch already exists: "skip" (leave it alone),
+    # "recreate" (delete and rebuild from base), or "append" (cherry-pick
+    # any PRs that aren't already on the existing branch onto its tip,
+    # leaving prior commits untouched). Inherits ``pr_policy.if_exists``
     # from config.yaml when not set per-source.
     if_exists: str = "skip"
     # Optional free-form note appended to the AI conflict-resolver prompt
@@ -167,7 +169,10 @@ class PRGroupConfig:
     id: str
     prs: list[str]
     description: str = ""
-    # When the port branch already exists locally: "skip" or "recreate".
+    # When the port branch already exists: "skip", "recreate", or
+    # "append" (cherry-pick PRs that haven't been applied yet on top of
+    # the existing branch tip — useful when a PR is added to the group
+    # after a prior ``releasy run`` already produced the combined branch).
     # Inherits from ``pr_policy.if_exists`` in config.yaml when not set
     # per-group.
     if_exists: str = "skip"

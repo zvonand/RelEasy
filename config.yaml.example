@@ -142,8 +142,23 @@ target_branch: antalya-26.3
 #     # "recreate"           — delete the local branch and rebuild from base.
 #     #                        Also: if a cherry-pick / merge / rebase is in
 #     #                        progress at startup, abort it and start fresh.
-#     # Note: if the branch already exists on the REMOTE it is ALWAYS skipped,
-#     # regardless of this setting (resolve those manually so you don't
+#     # "append"             — cherry-pick any declared PRs that aren't on the
+#     #                        existing branch onto its tip and update the
+#     #                        rebase PR body to match the declared group
+#     #                        order. Use when you've added a PR to a group
+#     #                        that already shipped through a prior run and
+#     #                        you want to top up the existing branch / PR
+#     #                        rather than rebuild from scratch.
+#     #                        Detection uses the ``Source-PR:`` commit
+#     #                        trailers releasy writes; falls back to ``skip``
+#     #                        with a warning if the existing commits don't
+#     #                        match a prefix of the declared group.
+#     #                        Mostly for groups (singletons have one PR, so
+#     #                        there's nothing to top up). The remote-already-
+#     #                        exists safety lock is bypassed in this mode
+#     #                        since appending is the explicit user opt-in.
+#     # Note: if the branch already exists on the REMOTE it is ALWAYS skipped
+#     # in "skip"/"recreate" modes (resolve those manually so you don't
 #     # clobber someone else's work). Individual session entries
 #     # (pr_sources.by_labels[] / pr_sources.groups[]) can override this
 #     # default per-entry with their own if_exists.
