@@ -168,9 +168,14 @@ target_branch: antalya-26.3
 #     # manually. Requires push: true to have any effect.
 #   retry_failed: true
 #     # When a PR unit has a `conflict` entry in state from a previous run:
-#     #   true (default) — discard the existing local/remote port branch and
-#     #                    re-run the cherry-pick from base. Handy after
-#     #                    fixing a bug, topping up Anthropic credits, etc.
+#     #   true (default) — process the unit again on this run, per the
+#     #                    unit's `if_exists` value (see above). The retry
+#     #                    does NOT override if_exists — it only decides
+#     #                    whether to revisit the unit at all. To force a
+#     #                    rebuild from base (the only thing that can blow
+#     #                    away existing port commits), the user must set
+#     #                    `if_exists: recreate` explicitly. Append-mode
+#     #                    units retry on top of the existing branch.
 #     #   false          — leave the conflicted entry exactly as-is; no
 #     #                    cherry-pick, no PR side-effects.
 #     # CLI flag `--retry-failed / --no-retry-failed` overrides per-invocation.

@@ -304,6 +304,11 @@ def _render_prompt(config: Config, repo_path: Path, ctx: AIResolveContext) -> st
         # Either an empty string (no note ⇒ section skipped) or a fully
         # rendered "## User-supplied context" markdown block.
         "user_context_section": user_context_section,
+        # Split-mode only: the SHA of the "with conflicts" commit that
+        # holds the conflict markers verbatim. Claude must NOT amend it;
+        # the resolution lives in a new commit on top. Empty for non-split
+        # invocations so the placeholder collapses cleanly.
+        "pre_resolve_sha": ctx.pre_resolve_sha or "",
     }
 
     def _replace(match: re.Match[str]) -> str:

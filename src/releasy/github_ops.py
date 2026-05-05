@@ -1586,7 +1586,7 @@ def _list_project_items(project_id: str) -> list[dict]:
                 __typename
                 ... on DraftIssue { id title }
                 ... on Issue { id number url }
-                ... on PullRequest { id number url }
+                ... on PullRequest { id number url state merged }
               }
             }
           }
@@ -1611,6 +1611,47 @@ def _list_project_items(project_id: str) -> list[dict]:
         cursor = info.get("endCursor")
         if not cursor:
             return items
+
+
+def _is_closed_unmerged_pr(content: dict) -> bool:
+    """True iff ``content`` is a PullRequest closed without merge.
+
+    Merged PRs intentionally stay on the board — they're the record of
+    work that landed. Only closed-without-merge cards are pollution.
+    """
+    if content.get("__typename") != "PullRequest":
+        return False
+    return content.get("state") == "CLOSED" and not content.get("merged")
+
+
+def _prune_closed_pr_items(
+    project_id: str, items: list[dict],
+) -> int:
+    """Delete project items whose PR was closed without merging.
+
+    Mutates ``items`` in place so subsequent lookups (e.g. via
+    :func:`_find_item_by_pr_url`) don't see the removed entries.
+    Returns the count actually deleted.
+    """
+    removed = 0
+    survivors: list[dict] = []
+    for item in items:
+        content = item.get("content") or {}
+        if _is_closed_unmerged_pr(content):
+            if _delete_item(project_id, item["id"]):
+                removed += 1
+                log.info(
+                    "Removed closed PR %s from project board",
+                    content.get("url"),
+                )
+                continue
+            log.warning(
+                "Failed to remove closed PR %s from project board",
+                content.get("url"),
+            )
+        survivors.append(item)
+    items[:] = survivors
+    return removed
 
 
 def _find_draft_item_by_title(
@@ -1657,13 +1698,19 @@ def _add_draft_issue(project_id: str, title: str, body: str) -> str | None:
         return None
 
 
-def _get_pr_node_id(slug: str, number: int) -> str | None:
-    """Return the GraphQL node id of a PR. Required to add it to a project."""
+def _get_pr_node_id(slug: str, number: int) -> tuple[str, str, bool] | None:
+    """Return ``(node_id, state, merged)`` for a PR.
+
+    ``state`` is GitHub's PR state (``OPEN`` / ``CLOSED`` / ``MERGED``),
+    ``merged`` is the explicit boolean — together they let callers
+    distinguish *closed without merge* (pollution) from *merged*
+    (kept on the board as a record).
+    """
     owner, name = slug.split("/", 1)
     query = """
     query($owner: String!, $name: String!, $number: Int!) {
       repository(owner: $owner, name: $name) {
-        pullRequest(number: $number) { id }
+        pullRequest(number: $number) { id state merged }
       }
     }
     """
@@ -1671,7 +1718,8 @@ def _get_pr_node_id(slug: str, number: int) -> str | None:
     if not data:
         return None
     try:
-        return data["repository"]["pullRequest"]["id"]
+        pr = data["repository"]["pullRequest"]
+        return pr["id"], pr["state"], bool(pr["merged"])
     except (KeyError, TypeError):
         return None
 
@@ -2272,13 +2320,14 @@ class ProjectSyncSummary:
     """
     added: int = 0
     updated: int = 0
+    removed: int = 0
     errors: int = 0
     skipped: bool = False
     skipped_reason: str | None = None
 
     @property
     def changed(self) -> int:
-        return self.added + self.updated
+        return self.added + self.updated + self.removed
 
     def summary_line(self) -> str:
         if self.skipped:
@@ -2288,6 +2337,8 @@ class ProjectSyncSummary:
             parts.append(f"{self.added} added")
         if self.updated:
             parts.append(f"{self.updated} updated")
+        if self.removed:
+            parts.append(f"{self.removed} removed")
         if self.errors:
             parts.append(f"{self.errors} error(s)")
         if not parts:
@@ -2415,6 +2466,7 @@ def sync_project(config: Config, state: PipelineState) -> ProjectSyncSummary:
         return summary
 
     existing_items = _list_project_items(project_id)
+    summary.removed = _prune_closed_pr_items(project_id, existing_items)
 
     for feat_id, title, status, conflict_files, fs in rows:
         body = _project_item_body(
@@ -2439,8 +2491,15 @@ def sync_project(config: Config, state: PipelineState) -> ProjectSyncSummary:
                 )
                 pr_number = pr_ref[2] if pr_ref else None
                 if pr_slug and pr_number is not None:
-                    pr_node_id = _get_pr_node_id(pr_slug, pr_number)
-                    if pr_node_id:
+                    pr_meta = _get_pr_node_id(pr_slug, pr_number)
+                    if pr_meta:
+                        pr_node_id, pr_state, pr_merged = pr_meta
+                        if pr_state == "CLOSED" and not pr_merged:
+                            log.info(
+                                "Skipping closed PR %s — not adding to "
+                                "project board", pr_url,
+                            )
+                            continue
                         item_id = _add_item_by_content_id(
                             project_id, pr_node_id,
                         )
@@ -2536,9 +2595,10 @@ def sync_project(config: Config, state: PipelineState) -> ProjectSyncSummary:
             summary.added += 1
 
     log.info(
-        "Synced %d items to GitHub Project (%d added, %d updated, %d errors)",
-        summary.added + summary.updated,
-        summary.added, summary.updated, summary.errors,
+        "Synced %d items to GitHub Project "
+        "(%d added, %d updated, %d removed, %d errors)",
+        summary.added + summary.updated + summary.removed,
+        summary.added, summary.updated, summary.removed, summary.errors,
     )
     return summary
 

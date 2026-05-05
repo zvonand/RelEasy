@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(ruff --version)",
+      "Bash(python3 -m ruff --version)",
+      "Bash(python3 -m pyflakes --version)",
+      "Bash(python3 -m releasy run --help)",
+      "Bash(python3 -m releasy status --help)",
+      "Bash(python3 -c \"import sys; sys.path.insert\\(0, 'src'\\); from releasy import cli, pipeline, dag_discovery, state, config, ai_resolve; print\\('imports OK'\\)\")",
+      "Bash(python3)"
+    ]
+  }
+}
