@@ -177,6 +177,12 @@ class FeatureUnit:
     # group order regardless of whether a given PR was applied on this
     # run or a prior one.
     applied_pr_urls: set[str] = field(default_factory=set)
+    # Other unit IDs this unit depends on. Populated from
+    # :class:`PRGroupConfig.depends_on` for group units (singletons can
+    # only carry deps via single-PR groups in the auto-deps overlay).
+    # Processing order is topologically sorted on this field; processing
+    # gates on every entry having ``status: merged`` in target.
+    depends_on: list[str] = field(default_factory=list)
 
     @property
     def sort_key(self) -> tuple[str, int]:
@@ -404,6 +410,7 @@ def _build_group_units(
             group_id=group.id,
             ai_context=group.ai_context,
             per_pr_ai_context=dict(group.pr_ai_contexts),
+            depends_on=list(group.depends_on),
         ))
     return units, claimed
 
@@ -611,8 +618,109 @@ def discover_feature_units(config: Config) -> list["FeatureUnit"]:
     units: list[FeatureUnit] = (
         _build_singleton_units(config, collected) + group_units
     )
-    units.sort(key=lambda u: u.sort_key)
-    return units
+    return _topo_sort_units(units)
+
+
+def _topo_sort_units(units: list[FeatureUnit]) -> list[FeatureUnit]:
+    """Order units so every ``depends_on`` reference is processed before its
+    dependent, with merge-time as the tie-breaker.
+
+    Kahn's algorithm: at each step, pick the ready unit (no unprocessed deps
+    pointing into the ``units`` set) with the smallest ``sort_key``. Deps
+    pointing OUTSIDE the ``units`` set are ignored here — the runtime gate
+    in ``_deps_satisfied`` is what enforces "must be merged in target". The
+    sort only ensures that *within this run*, a parent unit gets a chance
+    before its dependents.
+
+    Cycles raise ValueError listing the offending feature_ids.
+    """
+    by_id = {u.feature_id: u for u in units}
+    indeg: dict[str, int] = {u.feature_id: 0 for u in units}
+    children: dict[str, list[str]] = {u.feature_id: [] for u in units}
+    for u in units:
+        for dep in u.depends_on:
+            if dep in by_id:
+                indeg[u.feature_id] += 1
+                children[dep].append(u.feature_id)
+
+    ready = sorted(
+        (fid for fid, n in indeg.items() if n == 0),
+        key=lambda fid: by_id[fid].sort_key,
+    )
+    out: list[FeatureUnit] = []
+    while ready:
+        fid = ready.pop(0)
+        out.append(by_id[fid])
+        for child in children[fid]:
+            indeg[child] -= 1
+            if indeg[child] == 0:
+                # Insertion-sorted to keep deterministic merge-time order.
+                key = by_id[child].sort_key
+                lo, hi = 0, len(ready)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if by_id[ready[mid]].sort_key < key:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                ready.insert(lo, child)
+
+    if len(out) != len(units):
+        unresolved = [fid for fid, n in indeg.items() if n > 0]
+        raise ValueError(
+            "depends_on cycle (or unresolved deps) among units: "
+            + ", ".join(sorted(unresolved))
+        )
+    return out
+
+
+def _unmet_deps(unit: FeatureUnit, state: PipelineState) -> list[str]:
+    """Return the list of unit IDs in ``unit.depends_on`` whose state is not
+    yet ``merged``. Empty list means every dep is satisfied.
+
+    Pure lookup — does not touch the network. Call
+    :func:`_refresh_dep_states_from_github` once before the iteration
+    loop to promote ``branch_created`` deps that have merged upstream.
+    """
+    unmet: list[str] = []
+    for dep_id in unit.depends_on:
+        dep_fs = state.features.get(dep_id)
+        if dep_fs is None or dep_fs.status != "merged":
+            unmet.append(dep_id)
+    return unmet
+
+
+def _refresh_dep_states_from_github(
+    config: Config, state: PipelineState, units: list[FeatureUnit],
+) -> None:
+    """Promote ``branch_created`` deps to ``merged`` if their rebase PR
+    has merged on GitHub since the state file was written.
+
+    Called once before the unit-iteration loop so ``_unmet_deps`` can run
+    purely off the state dict. Touches at most one GitHub call per unique
+    dep ID with an outstanding rebase PR.
+    """
+    referenced: set[str] = set()
+    for u in units:
+        referenced.update(u.depends_on)
+    if not referenced:
+        return
+    # Any dep that has an open rebase PR could have merged upstream since
+    # the last run — including ones that previously hit a conflict and
+    # were later fixed by hand. Don't over-narrow to ``branch_created``.
+    refreshable = {"branch_created", "conflict", "needs_review"}
+    for dep_id in referenced:
+        dep_fs = state.features.get(dep_id)
+        if dep_fs is None or dep_fs.status not in refreshable:
+            continue
+        if not dep_fs.rebase_pr_url:
+            continue
+        merged = is_pr_merged(config, dep_fs.rebase_pr_url)
+        if merged:
+            dep_fs.status = "merged"
+            dep_fs.conflict_files = []
+            dep_fs.failed_step_index = None
+            dep_fs.partial_pr_count = None
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +853,16 @@ def run_pipeline(
 
     if not units:
         console.print("\n  [dim]No PRs or groups to process after filtering[/dim]")
+
+    # Refresh dep state once so any depends_on entry that has merged
+    # upstream since the last run gets promoted before the per-unit gate.
+    # Persist immediately: the promotion is the result of a real GitHub
+    # call, and if the iteration below crashes (Ctrl-C, OOM, exception in
+    # an early unit) the merge status would otherwise be re-fetched on
+    # the next run — wasting tokens and risking a transient False that
+    # leaves a now-mergeable dep stuck blocked.
+    _refresh_dep_states_from_github(config, state, units)
+    _persist_state(config, state)
 
     existing_ids = {f.id for f in config.features}
     for unit in units:
@@ -1829,6 +1947,21 @@ def _cherry_pick_pr(
 _SOURCE_PR_URL_RE = re.compile(r"https?://\S+?/pull/\d+", re.IGNORECASE)
 
 
+def _read_commit_subjects(
+    repo_path: Path, base_ref: str, branch: str,
+) -> list[str]:
+    """Return the subject (first line) of every commit in
+    ``base_ref..branch``, oldest → newest. Empty list on error.
+    """
+    out = run_git(
+        ["log", "--reverse", "--format=%s", f"{base_ref}..{branch}"],
+        repo_path, check=False,
+    )
+    if out.returncode != 0:
+        return []
+    return [line for line in out.stdout.splitlines()]
+
+
 def _read_source_pr_trailers(
     repo_path: Path, base_ref: str, branch: str,
 ) -> tuple[list[str | None], int]:
@@ -1886,30 +2019,41 @@ class _AppendDecision:
 
 
 def _decide_append(
-    repo_path: Path, base_ref: str, branch: str, unit: FeatureUnit,
+    repo_path: Path,
+    base_ref: str,
+    branch: str,
+    unit: FeatureUnit,
+    origin_slug: str | None,
 ) -> _AppendDecision:
     """Decide whether ``if_exists: append`` can proceed for this unit.
 
-    The contract: the existing port branch must look like a prefix of the
-    declared ``unit.prs`` list. Specifically, every commit either:
+    Trailers are the primary signal: every URL in a ``Source-PR:`` trailer
+    must point at a declared PR (foreign trailers fail the check). For
+    declared PRs that don't appear in any trailer we scan the branch's
+    commit *subjects* for the merge subject line — when releasy cherry-
+    picks a merge commit (``-m 1 --no-edit``), the original
+    ``Merge pull request #<N> from …`` subject is preserved verbatim, so
+    a declared origin PR whose merge was cherry-picked but whose tagging
+    step was skipped (e.g. an older releasy version) still shows up.
 
-      1. carries a ``Source-PR:`` trailer pointing at one of the declared
-         PRs, or
-      2. is untagged but accompanies a stretch of declared PRs that are
-         missing from the trailer set, in which case we assume the leading
-         declared PRs (in order) correspond to the untagged commits.
+    Cross-repo PRs (declared with a non-origin URL) can collide on PR
+    number with origin PRs, so subject matching is gated on the PR's
+    repo_slug equalling ``origin_slug``. Cross-repo PRs without trailers
+    fall through to "missing" — the cherry-pick step will then either
+    succeed (creating a duplicate commit, harmless) or surface a no-op
+    empty cherry-pick which is easy to debug.
 
-    Anything else — extra commits we can't account for, or trailers
-    pointing at PRs that aren't in the declared list — fails the check
-    and the caller falls back to ``skip`` behaviour.
+    AI conflict-resolution fix-up commits and base-merged-in commits sit
+    on the branch with no trailers and no matching subject; they're
+    correctly ignored.
     """
-    per_commit, total = _read_source_pr_trailers(repo_path, base_ref, branch)
+    per_commit, _total = _read_source_pr_trailers(repo_path, base_ref, branch)
     declared_urls = [pr.url for pr in unit.prs]
     declared_set = set(declared_urls)
 
-    # 1) Tagged commits: every URL in trailers must be declared.
+    # 1) Trailers: every URL we wrote must point at a declared PR.
     tagged_urls = [u for u in per_commit if u is not None]
-    foreign = [u for u in tagged_urls if u not in declared_set]
+    foreign = sorted({u for u in tagged_urls if u not in declared_set})
     if foreign:
         return _AppendDecision(
             feasible=False,
@@ -1919,28 +2063,21 @@ def _decide_append(
             ),
         )
 
-    untagged_count = total - len(tagged_urls)
-    declared_not_in_trailers = [
-        url for url in declared_urls if url not in tagged_urls
+    applied: set[str] = set(tagged_urls)
+
+    # 2) Subject scan for declared PRs not yet matched.
+    unmatched_origin = [
+        pr for pr in unit.prs
+        if pr.url not in applied
+        and origin_slug is not None
+        and pr.repo_slug == origin_slug
     ]
-
-    # 2) Untagged commits must not exceed declared PRs missing from trailers.
-    if untagged_count > len(declared_not_in_trailers):
-        return _AppendDecision(
-            feasible=False,
-            reason=(
-                f"branch has {untagged_count} commit(s) without a "
-                f"Source-PR trailer but only {len(declared_not_in_trailers)} "
-                "declared PR(s) are unaccounted for"
-            ),
-        )
-
-    # 3) Treat the leading ``untagged_count`` of those declared-but-untagged
-    # PRs as already applied (best-effort match by position). The rest is
-    # what needs cherry-picking.
-    applied = set(tagged_urls)
-    for url in declared_not_in_trailers[:untagged_count]:
-        applied.add(url)
+    if unmatched_origin:
+        subjects = _read_commit_subjects(repo_path, base_ref, branch)
+        for pr in unmatched_origin:
+            needle = f"Merge pull request #{pr.number} from"
+            if any(needle in s for s in subjects):
+                applied.add(pr.url)
 
     missing_count = sum(1 for url in declared_urls if url not in applied)
     return _AppendDecision(
@@ -2013,6 +2150,45 @@ def _process_feature_unit(
     is_failed_prev = prev_state is not None and prev_state.status == "conflict"
     force_retry = is_failed_prev and retry_failed
 
+    # --- Sequential gate: every depends_on must be merged in target ---
+    if unit.depends_on:
+        unmet = _unmet_deps(unit, state)
+        if unmet:
+            console.print(
+                f"\n    [yellow]⏸[/yellow] [cyan]{canonical_branch}[/cyan] "
+                f"({label}) — blocked by: {', '.join(unmet)}\n"
+                f"      [dim]re-run after merging the upstream cherry-pick "
+                f"PRs into {base_branch}[/dim]"
+            )
+            blocked_state = prev_state or FeatureState()
+            blocked_state.status = "blocked"
+            blocked_state.blocked_by = list(unmet)
+            # Preserve branch_name / pr_url / etc. from prior state if present
+            # — a unit can be temporarily blocked between runs without
+            # discarding the work it produced earlier. Conflict / partial-pick
+            # bookkeeping is no longer accurate (we never re-attempted the
+            # pick this run), so clear it so `releasy status` and the YAML
+            # dump don't show stale conflict files under a Blocked entry.
+            #
+            # ``ai_resolved`` / ``ai_iterations`` / ``ai_cost_usd`` are
+            # *intentionally* preserved here: they're historical facts
+            # about a previous successful (or partially-successful) AI
+            # run on this unit. A future re-attempt may add to them, but
+            # we don't want to lose audit / cost-accounting info just
+            # because the unit was temporarily blocked between runs.
+            blocked_state.conflict_files = []
+            blocked_state.failed_step_index = None
+            blocked_state.partial_pr_count = None
+            blocked_state.prereq_recovery_exhausted = False
+            state.features[unit.feature_id] = blocked_state
+            _persist_state(config, state)
+            return "continue"
+        # Deps were just satisfied — clear stale blocked state so the
+        # unit re-enters the normal flow below.
+        if prev_state and prev_state.status == "blocked":
+            prev_state.status = "needs_review"
+            prev_state.blocked_by = []
+
     if is_failed_prev and not retry_failed:
         # User opted out of retries — leave the conflicted entry exactly
         # as it is so manual fix-ups (or a later --retry-failed run) can
@@ -2029,11 +2205,14 @@ def _process_feature_unit(
     )
     on_local_canon = local_branch_exists(repo_path, canonical_branch)
 
-    if force_retry and (on_remote_canon or on_local_canon):
+    if (
+        force_retry and (on_remote_canon or on_local_canon)
+        and unit.if_exists == "recreate"
+    ):
         console.print(
             f"\n    [yellow]↻[/yellow] [cyan]{canonical_branch}[/cyan] ({label}) — "
-            "previously conflicted, force-recreating from base "
-            "(pr_policy.retry_failed: true)"
+            "previously conflicted, rebuilding from base "
+            "([cyan]if_exists: recreate[/cyan] + [cyan]retry_failed: true[/cyan])"
         )
 
     new_branch = canonical_branch
@@ -2059,17 +2238,24 @@ def _process_feature_unit(
     on_local = local_branch_exists(repo_path, new_branch)
 
     # --- if_exists: append ---
-    # Honoured only when force_retry is False (a previous-failure retry
-    # takes precedence and rebuilds from base) and there's actually a
-    # branch to append to. ``cherry_pick_base`` defaults to ``base_ref``
-    # for the from-scratch path; in append mode it's the existing branch
-    # tip so each loop iteration resets to the prefix we want to keep.
+    # ``cherry_pick_base`` defaults to ``base_ref`` for the from-scratch
+    # path; in append mode it's the existing branch tip so each loop
+    # iteration resets to the prefix we want to keep.
+    #
+    # Branch preservation is the default. ``if_exists`` is the only
+    # signal that can drive a from-base rebuild — explicit user intent.
+    # ``force_retry`` (from prev-state == ``conflict`` + ``retry_failed:
+    # true``) does NOT override ``if_exists``: it only controls whether
+    # the unit is processed at all this run, not how. A user who set
+    # ``if_exists: append`` keeps the existing branch even when a prior
+    # run left a stale ``conflict`` state (common when the prior failure
+    # was unrelated to the cherry-pick itself — e.g. a missing prompt
+    # file, an OOM, an aborted run).
     append_active = False
     cherry_pick_base = base_ref
     if (
         unit.if_exists == "append"
         and (on_remote or on_local)
-        and not force_retry
     ):
         if not unit.is_group:
             console.print(
@@ -2089,7 +2275,9 @@ def _process_feature_unit(
                     repo_path,
                 )
                 on_local = True
-            decision = _decide_append(repo_path, base_ref, new_branch, unit)
+            decision = _decide_append(
+                repo_path, base_ref, new_branch, unit, origin_slug,
+            )
             if not decision.feasible:
                 console.print(
                     f"\n    [yellow]![/yellow] [cyan]{new_branch}[/cyan] "
@@ -2120,28 +2308,48 @@ def _process_feature_unit(
                 f"on top of {len(decision.applied_urls)} already applied"
             )
 
-    if on_remote and not force_retry and not append_active:
+    # ---------------------------------------------------------------
+    # Branch-disposition decision matrix (no longer gated on force_retry):
+    #
+    #   if_exists == "skip"     → existing branch is left alone, period.
+    #                             retry_failed/force_retry do NOT override
+    #                             this. To retry a previously-conflicted
+    #                             unit, the user must explicitly switch to
+    #                             "recreate" or "append".
+    #   if_exists == "append"   → handled in the block above; either set
+    #                             append_active and proceed, or skip with
+    #                             a warning.
+    #   if_exists == "recreate" → rebuild from base. This is the only
+    #                             explicit "I want to re-do existing work"
+    #                             signal; it bypasses the on-remote-branch
+    #                             safety lock too (the user owns it).
+    # ---------------------------------------------------------------
+
+    if on_remote and unit.if_exists != "recreate" and not append_active:
         console.print(
             f"\n    [cyan]{new_branch}[/cyan] ({label}) — already exists on "
             f"[cyan]{remote}[/cyan], skipping cherry-pick "
-            "(resolve manually if you want to rebuild it)"
+            "(set [cyan]if_exists: recreate[/cyan] to rebuild from base, "
+            "or [cyan]if_exists: append[/cyan] to add new PRs on top)"
         )
         _ensure_pr_for_existing_remote_branch(
             config, state, unit, new_branch, base_branch,
         )
         return "continue"
 
-    if on_local and unit.if_exists == "skip" and not force_retry:
+    if on_local and unit.if_exists == "skip":
         console.print(
             f"\n    [cyan]{new_branch}[/cyan] ({label}) — local branch "
-            "exists, skipping (set pr_policy.if_exists: recreate to rebuild)"
+            "exists, skipping ([cyan]if_exists: skip[/cyan]; "
+            "set [cyan]if_exists: recreate[/cyan] to rebuild from base, "
+            "or [cyan]if_exists: append[/cyan] to add new PRs on top)"
         )
         return "continue"
 
-    if on_local and not force_retry and not append_active:
+    if on_local and unit.if_exists == "recreate" and not append_active:
         console.print(
             f"\n    [yellow]↻[/yellow] [cyan]{new_branch}[/cyan] exists "
-            "locally, recreating from base"
+            "locally, rebuilding from base ([cyan]if_exists: recreate[/cyan])"
         )
 
     desc = (
@@ -4137,6 +4345,7 @@ def print_status(config: Config) -> None:
     section_styles = {
         "needs_review": "blue", "branch_created": "yellow",
         "conflict": "red", "skipped": "yellow",
+        "blocked": "yellow",
     }
 
     origin_slug = get_origin_repo_slug(config)
@@ -4194,6 +4403,8 @@ def print_status(config: Config) -> None:
         table.add_column("Rebase PR")
         if status == "conflict":
             table.add_column("Conflict Files", style="red")
+        if status == "blocked":
+            table.add_column("Blocked By", style="yellow")
         for fid, fs in rows:
             feat = next((f for f in config.features if f.id == fid), None)
             label = fs.branch_name or (feat.source_branch if feat else None) or fid
@@ -4218,6 +4429,13 @@ def print_status(config: Config) -> None:
             ]
             if status == "conflict":
                 row.append(", ".join(fs.conflict_files))
+            if status == "blocked":
+                blockers: list[str] = []
+                for dep_id in fs.blocked_by:
+                    dep_fs = state.features.get(dep_id)
+                    dep_status = dep_fs.status if dep_fs else "unknown"
+                    blockers.append(f"{dep_id} ({dep_status})")
+                row.append(", ".join(blockers))
             table.add_row(*row)
         console.print()
         console.print(table)

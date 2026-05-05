@@ -247,15 +247,28 @@ pr_sources:
   # commit locally); push and combined PR happen once after the last step.
   # `sort:` controls cherry-pick order — "listed" (default) walks the
   # `prs:` list, "merged_at" sorts by GitHub merge timestamp ascending.
+  # `depends_on:` references other unit IDs (group IDs or pr-<N>
+  # singletons) that must be `merged` in target before this group is
+  # processed. `releasy run` skips dependent units and marks them
+  # `blocked` until the parent merges upstream.
   groups:
     - id: iceberg-rest
       description: "Iceberg REST catalog support"
       # sort: merged_at
+      # depends_on: [pr-100, some-other-group-id]
       prs:
         - https://github.com/Altinity/ClickHouse/pull/1500
         - https://github.com/Altinity/ClickHouse/pull/1512
         - https://github.com/Altinity/ClickHouse/pull/1530
 ```
+
+**Redundant configuration warnings.** RelEasy emits a one-line stderr
+warning at session-load time when a PR URL appears in two of
+`include_prs` / `exclude_prs` / a group's `prs`. The pipeline still
+resolves it deterministically (group claim wins over `include_prs`,
+`exclude_prs` is the final override), but the warning surfaces dead
+weight and contradictions so they don't hide. Warnings are deduplicated
+per process: a CLI run that re-loads the session won't re-spam.
 
 ### Key options
 
@@ -300,7 +313,7 @@ Options in the table below live in **config.yaml** unless marked
 | `analyze_fails.post_comment_to_pr` | Post a top-level summary comment on each processed PR (per-shard outcomes, AI narration, commit + push status). | `true` |
 | `pr_policy.auto_pr` | Open a PR for every pushed port branch (singletons, by_labels, include_prs, groups). Requires `push: true`. | `true` |
 | `pr_policy.if_exists` | Default for session-file source entries that don't set their own: `skip`, `recreate`, or `append`. `skip` leaves an existing local branch alone (and halts on an in-progress cherry-pick / merge / rebase at startup); `recreate` deletes the branch and rebuilds from base (auto-aborting any in-progress op). `append` cherry-picks declared PRs that aren't already on the existing branch onto its tip — useful when a PR was added to a group after a prior `releasy run` already produced the combined branch — and updates the rebase PR body to reflect the full declared group order. The remote-branch lock that protects `skip`/`recreate` is bypassed under `append` since it's the explicit user opt-in. Append falls back to `skip` (with a warning) when existing commits don't match a prefix of the declared group; for singletons append is a no-op. | `skip` |
-| `pr_policy.retry_failed` | When a PR unit has a `conflict` entry in state from a previous run: `true` discards the existing local / remote port branch and re-runs the cherry-pick from base; `false` leaves the entry exactly as-is. Overridable per-invocation with `--retry-failed` / `--no-retry-failed` on `releasy run`. | `true` |
+| `pr_policy.retry_failed` | When a PR unit has a `conflict` entry in state from a previous run: `true` revisits the unit per its `if_exists` value (rebuild only if `recreate`, append onto the existing branch if `append`, leave alone if `skip`); `false` leaves the entry exactly as-is. Retry never overrides `if_exists` — only `if_exists: recreate` (set explicitly by the user) authorizes blowing away existing port commits. Overridable per-invocation with `--retry-failed` / `--no-retry-failed` on `releasy run`. | `true` |
 | `pr_policy.recreate_closed_prs` | When `true`, if state has a `rebase_pr_url` and that GitHub PR is closed (not merged), allocate `<canonical>-1`, `-2`, … for the port branch and cherry-pick + open a fresh PR. Off by default. | `false` |
 | `pr_sources.by_labels[].labels` *(session)* | Labels a PR must have (AND logic) | — |
 | `pr_sources.by_labels[].merged_only` *(session)* | Only include merged PRs | `false` |
@@ -413,6 +426,13 @@ The remaining commands — `skip`, `abort`, `status`, `setup-project`,
 `sync-project`, `release`, `feature *` — never touch git history; they're
 state-only / project-board / config helpers (detailed below).
 
+`discover-deps` is a *diagnostic* sibling of `run`: read-only with respect
+to state and the main worktree, it trial-cherry-picks every candidate unit
+in a scratch git worktree to map out which PRs depend on which, and emits
+a recommended grouping. The output round-trips back into the session via
+a sidecar overlay so the next `releasy run` can honour `depends_on:` and
+gate dependents until their parents merge upstream.
+
 ### Pipeline lifecycle
 
 The five commands you'll touch on a regular release cycle.
@@ -482,6 +502,49 @@ releasy refresh [--work-dir <path>]
 | `--only <url-or-id>` | Restrict the multi-PR walk to a single tracked PR (URL — source or rebase) or a single feature / group id. Mutually exclusive with `--pr` and `--stateless`. Exits non-zero if nothing matches. | — |
 
 Exit code: `1` if any PR ended up in `conflict` status, `0` otherwise.
+
+#### `releasy discover-deps` — auto-discover a PR dependency DAG
+
+Trial-cherry-picks every candidate `pr_sources` unit onto the target
+branch tip in a scratch worktree, traces conflicts back to older
+un-ported PRs that touched the same files, and emits a recommended
+grouping as a YAML report. With `--write-session`, additionally writes
+a sidecar `<session-stem>.auto-deps.yaml` that the session loader merges
+into `pr_sources.groups[]` on the next `releasy run` — so the discovered
+dependencies drive sequential gating without you hand-editing the main
+session file.
+
+User-declared `pr_sources.groups[]` are treated as **single super-nodes**:
+discovery never subdivides them. If any PR inside a group depends on PR
+X, the *whole group* is flagged as depending on X. Conversely, anything
+that depends on a single member of a group depends on the *whole group*.
+
+```bash
+releasy discover-deps [--onto <ver>] [--work-dir <path>]
+                      [-o <path>] [--write-session]
+                      [--no-ai] [--max-depth <N>] [--limit <N>]
+                      [--include-already-merged]
+```
+
+Round-trip behaviour to know about:
+
+- The sidecar overlay carries every auto-discovered unit as a `groups[]`
+  entry with `auto_discovered: true`. A singleton (one PR with one or
+  more deps) becomes a **1-PR group** in the overlay so it can carry
+  `depends_on:` — there's no per-singleton dependency channel in the
+  schema. Subsequent `releasy run`s therefore process this PR as
+  `is_group=True`, which slightly changes branch naming and AI-context
+  semantics. Move the entry into the main session file (and drop the
+  `auto_discovered` flag) if you want to make the conversion permanent.
+- Re-running `discover-deps --write-session` always rewrites the sidecar
+  from scratch — never edits the main session. Hand-edits inside the
+  sidecar will be lost on next discovery.
+- Cycles in `depends_on` (introduced by hand-editing the sidecar) are
+  rejected at session load time with a clear error listing the offending
+  group ids.
+
+Exit code: `0` on success regardless of how many conflicts were found —
+this is a read-only diagnostic, not a porting attempt.
 
 #### `releasy analyze-fails` — investigate red CI on a PR (or every tracked PR)
 

@@ -34,6 +34,7 @@ BranchStatus = Literal[
     "conflict",
     "skipped",
     "merged",
+    "blocked",
 ]
 PipelinePhase = Literal["init", "ports_done"]
 
@@ -42,6 +43,7 @@ PipelinePhase = Literal["init", "ports_done"]
 # sub-tables, ``releasy list`` summary). Highest-attention first.
 STATUS_DISPLAY_ORDER: tuple[str, ...] = (
     "conflict",
+    "blocked",
     "branch_created",
     "needs_review",
     "skipped",
@@ -159,6 +161,12 @@ class FeatureState:
     # comments posted after the last pass. Opportunistic: stateless
     # runs (PR not tracked here) simply don't read or write this field.
     last_review_addressed_at: str | None = None
+    # ----- Sequential-gating state (depends_on) -----
+    # When ``status == "blocked"``, the unit IDs this entry is waiting on.
+    # Each entry is the ``feature_id`` of another tracked unit (group ID
+    # for groups, ``pr-<N>`` / ``<owner>-<repo>-pr-<N>`` for singletons).
+    # Cleared once the unit unblocks and starts processing.
+    blocked_by: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -214,6 +222,7 @@ def _parse_features(raw_features: dict) -> dict[str, FeatureState]:
             ),
             queued_prereq_units=list(fraw.get("queued_prereq_units", []) or []),
             last_review_addressed_at=fraw.get("last_review_addressed_at"),
+            blocked_by=list(fraw.get("blocked_by", []) or []),
         )
     return features
 
@@ -326,6 +335,8 @@ def save_state(state: PipelineState, config: Config) -> None:
             entry["queued_prereq_units"] = fs.queued_prereq_units
         if fs.last_review_addressed_at:
             entry["last_review_addressed_at"] = fs.last_review_addressed_at
+        if fs.blocked_by:
+            entry["blocked_by"] = list(fs.blocked_by)
         features_data[fid] = entry
 
     data: dict = {

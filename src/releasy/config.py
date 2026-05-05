@@ -189,6 +189,17 @@ class PRGroupConfig:
     # exactly as listed in the session file. Combined with the
     # group-level ``ai_context`` at resolve time.
     pr_ai_contexts: dict[str, str] = field(default_factory=dict)
+    # Other unit IDs this group depends on. A unit ID is either another
+    # group's ``id`` or a singleton feature_id (``pr-<N>`` for origin PRs,
+    # ``<owner>-<repo>-pr-<N>`` for cross-repo singletons). Validated at
+    # session load time. The pipeline gates processing on these: a unit
+    # only runs once every entry in ``depends_on`` has reached
+    # ``status: merged`` in target.
+    depends_on: list[str] = field(default_factory=list)
+    # Marker set by ``releasy discover-deps --write-session``. The CLI uses
+    # it to identify entries it owns and may rewrite. Hand-written groups
+    # have ``auto_discovered: false`` and are never touched.
+    auto_discovered: bool = False
 
 
 @dataclass
@@ -626,6 +637,10 @@ class SessionConfig:
     features: list[FeatureConfig] = field(default_factory=list)
     pr_sources: PRSourcesConfig = field(default_factory=PRSourcesConfig)
     session_path: Path | None = None
+    # Non-fatal issues encountered while loading, e.g. an auto-deps overlay
+    # entry whose id collided with the main session. Surfaced once at CLI
+    # startup; never causes load to fail.
+    load_warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1464,6 +1479,21 @@ def _parse_pr_url_entries(
     return urls, contexts
 
 
+def _auto_deps_overlay_path(session_path: Path) -> Path:
+    """Path to the auto-deps sidecar overlay, derived from the session file.
+
+    For ``foo.session.yaml`` (or any path) we write to ``foo.session.auto-deps.yaml``:
+    we strip the trailing ``.yaml``/``.yml`` once and append ``.auto-deps.yaml``.
+    Same directory as the session file.
+    """
+    name = session_path.name
+    for suffix in (".yaml", ".yml"):
+        if name.endswith(suffix):
+            stem = name[: -len(suffix)]
+            return session_path.with_name(f"{stem}.auto-deps.yaml")
+    return session_path.with_name(f"{name}.auto-deps.yaml")
+
+
 def load_session(
     config: Config, cli_override: Path | None = None,
 ) -> SessionConfig:
@@ -1552,20 +1582,23 @@ def load_session(
     groups: list[PRGroupConfig] = []
     seen_group_ids: set[str] = set()
     seen_group_prs: dict[str, str] = {}  # url -> group id
-    for entry in ps_raw.get("groups", []) or []:
+
+    def _parse_group_entry(
+        entry: dict, *, source_label: str, allow_auto_discovered: bool,
+    ) -> PRGroupConfig:
         gid = entry.get("id")
         if not gid:
-            raise ValueError("pr_sources.groups[] entries must specify 'id'")
+            raise ValueError(f"{source_label}: groups[] entries must specify 'id'")
         if gid in seen_group_ids:
-            raise ValueError(f"pr_sources.groups: duplicate id {gid!r}")
+            raise ValueError(f"{source_label}: duplicate group id {gid!r}")
         seen_group_ids.add(gid)
         raw_prs = entry.get("prs", [])
         if not isinstance(raw_prs, list) or len(raw_prs) < 1:
             raise ValueError(
-                f"pr_sources.groups[{gid!r}].prs must be a non-empty list of PR URLs"
+                f"{source_label}: groups[{gid!r}].prs must be a non-empty list of PR URLs"
             )
         prs_list, pr_ai_contexts = _parse_pr_url_entries(
-            raw_prs, where=f"pr_sources.groups[{gid!r}].prs",
+            raw_prs, where=f"{source_label}: groups[{gid!r}].prs",
         )
         for url in prs_list:
             if url in seen_group_prs:
@@ -1577,31 +1610,85 @@ def load_session(
         group_if_exists = entry.get("if_exists", policy_if_exists)
         if group_if_exists not in _VALID_IF_EXISTS:
             raise ValueError(
-                f"pr_sources.groups[{gid!r}].if_exists must be one of "
+                f"{source_label}: groups[{gid!r}].if_exists must be one of "
                 f"{_VALID_IF_EXISTS}, got {group_if_exists!r}"
             )
         if "auto_pr" in entry:
             raise ValueError(
-                f"pr_sources.groups[id={gid!r}].auto_pr is no longer "
+                f"{source_label}: groups[id={gid!r}].auto_pr is no longer "
                 "supported. Use pr_policy.auto_pr in config.yaml."
             )
         group_sort = entry.get("sort", "listed")
         if group_sort not in _VALID_GROUP_SORT:
             raise ValueError(
-                f"pr_sources.groups[{gid!r}].sort must be one of "
+                f"{source_label}: groups[{gid!r}].sort must be one of "
                 f"{_VALID_GROUP_SORT}, got {group_sort!r}"
             )
-        groups.append(
-            PRGroupConfig(
-                id=gid,
-                prs=prs_list,
-                description=entry.get("description", ""),
-                if_exists=group_if_exists,
-                sort=group_sort,
-                ai_context=(entry.get("ai_context") or "").strip(),
-                pr_ai_contexts=pr_ai_contexts,
+        depends_on = entry.get("depends_on", []) or []
+        if not isinstance(depends_on, list) or not all(
+            isinstance(x, str) for x in depends_on
+        ):
+            raise ValueError(
+                f"{source_label}: groups[{gid!r}].depends_on must be a list of unit IDs (strings)"
             )
+        auto_flag = bool(entry.get("auto_discovered", False))
+        if auto_flag and not allow_auto_discovered:
+            raise ValueError(
+                f"{source_label}: groups[{gid!r}].auto_discovered=true is "
+                f"reserved for the sidecar overlay file. Remove the flag, or "
+                f"move the entry into the auto-deps sidecar."
+            )
+        return PRGroupConfig(
+            id=gid,
+            prs=prs_list,
+            description=entry.get("description", ""),
+            if_exists=group_if_exists,
+            sort=group_sort,
+            ai_context=(entry.get("ai_context") or "").strip(),
+            pr_ai_contexts=pr_ai_contexts,
+            depends_on=depends_on,
+            auto_discovered=auto_flag,
         )
+
+    for entry in ps_raw.get("groups", []) or []:
+        groups.append(_parse_group_entry(
+            entry, source_label="pr_sources", allow_auto_discovered=False,
+        ))
+
+    # Sidecar overlay: <session-stem>.auto-deps.yaml alongside the session
+    # file. Always reloaded fresh; main session entries win on id conflict.
+    overlay_path = _auto_deps_overlay_path(path)
+    overlay_warnings: list[str] = []
+    if overlay_path.exists():
+        try:
+            with open(overlay_path) as f:
+                overlay_raw = yaml.safe_load(f) or {}
+        except Exception as e:
+            overlay_warnings.append(
+                f"failed to read auto-deps overlay {overlay_path.name}: {e} — ignoring"
+            )
+            overlay_raw = {}
+        if not isinstance(overlay_raw, dict):
+            overlay_warnings.append(
+                f"auto-deps overlay {overlay_path.name} must be a YAML mapping — ignoring"
+            )
+            overlay_raw = {}
+        for entry in overlay_raw.get("groups", []) or []:
+            entry_gid = entry.get("id") if isinstance(entry, dict) else None
+            if entry_gid in seen_group_ids:
+                overlay_warnings.append(
+                    f"auto-deps overlay group {entry_gid!r} clashes with main "
+                    f"session id; main session wins"
+                )
+                continue
+            try:
+                groups.append(_parse_group_entry(
+                    entry,
+                    source_label=f"auto-deps overlay {overlay_path.name}",
+                    allow_auto_discovered=True,
+                ))
+            except ValueError as e:
+                overlay_warnings.append(str(e))
 
     def _str_list(key: str) -> list[str]:
         """Read a list-of-strings field, tolerating a bare string."""
@@ -1639,11 +1726,166 @@ def load_session(
             "or set sequential: false."
         )
 
+    _validate_depends_on(groups, include_prs_list, overlay_warnings)
+    _warn_on_redundant_pr_listings(
+        groups, include_prs_list,
+        ps_raw.get("exclude_prs", []) or [],
+        overlay_warnings,
+    )
+
     return SessionConfig(
         features=features,
         pr_sources=pr_sources,
         session_path=path,
+        load_warnings=overlay_warnings,
     )
+
+
+# Recognise feature_id forms emitted by ``_singleton_feature_id`` in
+# pipeline.py. Origin singletons → ``pr-<N>``; cross-repo singletons →
+# ``<owner>-<repo>-pr-<N>``. We can't reach pipeline.py from config.py
+# without a circular import, so the regex is duplicated (kept in sync by
+# the load-time validation tests).
+_SINGLETON_FEATURE_ID_RE = re.compile(
+    r"^(?:[A-Za-z0-9._-]+-[A-Za-z0-9._-]+-)?pr-\d+$"
+)
+_PR_URL_PREFIX_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def _warn_on_redundant_pr_listings(
+    groups: list[PRGroupConfig],
+    include_prs: list[str],
+    exclude_prs: list[str],
+    overlay_warnings: list[str],
+) -> None:
+    """Surface configurations where the same PR URL appears in two places
+    that resolve to a single, deterministic outcome at runtime.
+
+    The pipeline already DOES the right thing in every case below — these
+    are warnings, not errors. The point is to catch dead-weight or
+    contradictory entries early so the user doesn't wonder why their
+    explicit ``include_prs`` line had no effect.
+
+    Cases:
+
+    * URL in ``include_prs`` AND in a ``groups[].prs`` list — the group
+      claim wins, the ``include_prs`` entry is dead weight.
+    * URL in ``include_prs`` AND in ``exclude_prs`` — exclude wins
+      (``exclude_prs`` is the documented final override), so the include
+      entry is contradictory.
+    * URL in some ``groups[].prs`` AND in ``exclude_prs`` — the PR is
+      dropped from the group, possibly emptying it.
+    """
+    group_pr_to_id: dict[str, str] = {}
+    for g in groups:
+        for url in g.prs:
+            group_pr_to_id[url] = g.id
+
+    include_set = set(include_prs)
+    exclude_set = set(exclude_prs)
+
+    for url in include_set & set(group_pr_to_id):
+        overlay_warnings.append(
+            f"PR {url} appears in both pr_sources.include_prs and group "
+            f"{group_pr_to_id[url]!r}; the group claim wins, the "
+            "include_prs entry is redundant"
+        )
+    for url in include_set & exclude_set:
+        overlay_warnings.append(
+            f"PR {url} appears in both pr_sources.include_prs and "
+            "pr_sources.exclude_prs; exclude_prs is the final override, "
+            "so the PR will NOT be ported despite being explicitly included"
+        )
+    for url in set(group_pr_to_id) & exclude_set:
+        overlay_warnings.append(
+            f"PR {url} appears in group {group_pr_to_id[url]!r} and in "
+            "pr_sources.exclude_prs; the PR will be dropped from the "
+            "group at runtime, leaving the group smaller (or empty)"
+        )
+
+
+def _validate_depends_on(
+    groups: list[PRGroupConfig],
+    include_prs: list[str],
+    overlay_warnings: list[str],
+) -> None:
+    """Catch typos in ``depends_on`` at session-load time.
+
+    A reference is accepted when it resolves to one of:
+
+    * the ``id`` of another group in the merged set (main + overlay),
+    * a PR URL listed in any group's ``prs`` or in ``include_prs``,
+    * a singleton feature_id pattern (``pr-<N>`` or
+      ``<owner>-<repo>-pr-<N>``) — these are forward-references to PRs
+      discovered from ``by_labels`` at run time, which the loader can't
+      resolve fully but pattern-checks instead.
+
+    Cycles among ``depends_on`` edges (within the merged group set) are
+    rejected with a clear error listing the offending IDs.
+
+    Anything else raises :class:`ValueError` so a typo doesn't silently
+    block a unit forever (``_unmet_deps`` would treat a typo as
+    permanently unmet).
+    """
+    group_ids = {g.id for g in groups}
+    known_urls = set(include_prs)
+    for g in groups:
+        known_urls.update(g.prs)
+
+    for g in groups:
+        for dep in g.depends_on:
+            if dep in group_ids:
+                continue
+            if dep in known_urls:
+                continue
+            if _PR_URL_PREFIX_RE.match(dep):
+                # PR URL form, but not in the known-URL set — likely a typo
+                # or a forward-ref to a not-yet-fetched PR. Warn rather
+                # than fail: the user may have removed it from include_prs
+                # without removing the dep yet.
+                overlay_warnings.append(
+                    f"group {g.id!r}.depends_on references PR URL "
+                    f"{dep!r} which is not in include_prs / any group; "
+                    "the dependent will stay blocked until a unit with "
+                    "that URL appears in state"
+                )
+                continue
+            if _SINGLETON_FEATURE_ID_RE.match(dep):
+                # ``pr-<N>`` style — defer resolution to runtime
+                # (the actual PR comes from by_labels discovery).
+                continue
+            raise ValueError(
+                f"group {g.id!r}.depends_on references unknown unit "
+                f"{dep!r}: must be a group id, a PR URL listed in "
+                "include_prs / any group's prs, or a feature_id of the "
+                "form 'pr-<N>' / '<owner>-<repo>-pr-<N>'."
+            )
+
+    # Cycle detection on the (group_id-only) sub-graph. URL / pr-<N>
+    # forward refs are skipped since we can't yet know which group they
+    # would land in — the runtime gate will refuse to advance on cycles
+    # via ``_topo_sort_units``.
+    indeg: dict[str, int] = {gid: 0 for gid in group_ids}
+    succ: dict[str, list[str]] = {gid: [] for gid in group_ids}
+    for g in groups:
+        for dep in g.depends_on:
+            if dep in group_ids:
+                indeg[g.id] += 1
+                succ[dep].append(g.id)
+    ready = [gid for gid, n in indeg.items() if n == 0]
+    visited = 0
+    while ready:
+        gid = ready.pop()
+        visited += 1
+        for child in succ[gid]:
+            indeg[child] -= 1
+            if indeg[child] == 0:
+                ready.append(child)
+    if visited != len(group_ids):
+        leftover = sorted(gid for gid, n in indeg.items() if n > 0)
+        raise ValueError(
+            "depends_on cycle among groups: " + ", ".join(leftover)
+        )
 
 
 def save_session(session: SessionConfig, path: Path | None = None) -> None:
@@ -1721,7 +1963,11 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
         ps_data["include_authors"] = ps.include_authors
     if ps.exclude_authors:
         ps_data["exclude_authors"] = ps.exclude_authors
-    if ps.groups:
+    # Auto-discovered entries belong to the sidecar overlay file, not the
+    # main session — skip them here so a save_session() round-trip never
+    # leaks overlay state into the user's hand-curated config.
+    main_groups = [g for g in ps.groups if not g.auto_discovered]
+    if main_groups:
         ps_data["groups"] = [
             {
                 k: v
@@ -1732,10 +1978,11 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
                     "sort": g.sort if g.sort != "listed" else None,
                     "ai_context": g.ai_context or None,
                     "prs": _dump_pr_url_list(g.prs, g.pr_ai_contexts),
+                    "depends_on": g.depends_on or None,
                 }.items()
                 if v is not None
             }
-            for g in ps.groups
+            for g in main_groups
         ]
     if ps_data:
         data["pr_sources"] = ps_data

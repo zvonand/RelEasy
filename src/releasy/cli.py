@@ -23,6 +23,16 @@ from releasy.config import (
 # ---------------------------------------------------------------------------
 
 
+# Per-process dedupe set for session-load warnings. ``_attach_session``
+# may run multiple times in one CLI process (test harnesses, internal
+# helpers that re-load), and the warnings produced by ``load_session``
+# are deterministic functions of file contents — so re-printing them on
+# every load just creates stderr noise. Keyed on the warning text plus
+# the session path so simultaneous projects in one process still get
+# their own first-emission.
+_PRINTED_LOAD_WARNINGS: set[tuple[str, str]] = set()
+
+
 def _load_config_or_exit(config_path: str | None = None) -> Config:
     from releasy.config import load_config
 
@@ -65,6 +75,24 @@ def _attach_session(
         config.session = None
     except Exception as e:
         raise click.ClickException(f"Failed to load session: {e}")
+
+    # Surface non-fatal load issues (auto-deps overlay collisions,
+    # redundant include_prs / exclude_prs / group entries, etc.) to the
+    # user. They aren't fatal — the run can still proceed — but silently
+    # accumulating them in the SessionConfig defeats the point.
+    # Dedupe per process so a CLI run that re-loads the session doesn't
+    # spam stderr with the same warnings on every load.
+    if config.session is not None:
+        session_key = (
+            str(config.session.session_path)
+            if config.session.session_path else ""
+        )
+        for w in config.session.load_warnings:
+            key = (session_key, w)
+            if key in _PRINTED_LOAD_WARNINGS:
+                continue
+            _PRINTED_LOAD_WARNINGS.add(key)
+            click.echo(f"warning: {w}", err=True)
 
 
 def _load_and_verify(
@@ -490,6 +518,116 @@ def status(ctx: click.Context) -> None:
 
     config = _load_and_verify(ctx, session="skip")
     print_status(config)
+
+
+@cli.command(
+    name="discover-deps",
+    short_help="Auto-discover a PR dependency DAG from trial cherry-picks.",
+)
+@click.option(
+    "--onto", default=None,
+    help="Base branch (defaults to config.target_branch).",
+)
+@click.option(
+    "--work-dir", default=None,
+    help="Working directory for git operations.",
+)
+@click.option(
+    "--output", "-o", "output_path", default=None, type=click.Path(),
+    help="Diagnostic report path. Default: <config-dir>/discover-deps.<base>.yaml.",
+)
+@click.option(
+    "--write-session", is_flag=True, default=False,
+    help="Also write the session overlay sidecar (<session-stem>.auto-deps.yaml).",
+)
+@click.option(
+    "--no-ai", is_flag=True, default=False,
+    help="Skip Claude refinement; use deterministic git-graph deps as-is.",
+)
+@click.option(
+    "--max-depth", default=4, type=int, show_default=True,
+    help="Max recursion depth for transitive dep discovery.",
+)
+@click.option(
+    "--limit", "pr_limit", default=None, type=int,
+    help="Cap units scanned (most-recent N). Default: unlimited.",
+)
+@click.option(
+    "--include-already-merged", is_flag=True, default=False,
+    help="Include units already in target as zero-edge nodes in the report.",
+)
+@click.pass_context
+def discover_deps_cmd(
+    ctx: click.Context,
+    onto: str | None,
+    work_dir: str | None,
+    output_path: str | None,
+    write_session: bool,
+    no_ai: bool,
+    max_depth: int,
+    pr_limit: int | None,
+    include_already_merged: bool,
+) -> None:
+    """Auto-discover a PR dependency DAG from trial cherry-picks.
+
+    Walks the candidate PR set defined by ``pr_sources``, trial-cherry-picks
+    each unit (singleton or user-declared group) onto the target branch tip
+    in a scratch git worktree, and on conflict, traces the conflicting
+    files back to older un-ported units that touched them. Produces a
+    diagnostic YAML report and (with ``--write-session``) a sidecar overlay
+    that the next ``releasy run`` honors via ``depends_on``.
+
+    Read-only with respect to ``state.yaml`` and the main worktree. Acquires
+    the project lock so it doesn't race with concurrent ``run`` invocations.
+    """
+    from releasy.dag_discovery import run_discover_deps
+
+    with _locked_config(ctx, session="required") as config:
+        try:
+            report = run_discover_deps(
+                config,
+                onto=onto,
+                work_dir=Path(work_dir) if work_dir else None,
+                output_path=Path(output_path) if output_path else None,
+                write_session=write_session,
+                use_ai=not no_ai,
+                max_depth=max_depth,
+                pr_limit=pr_limit,
+                include_already_merged=include_already_merged,
+            )
+        except (ValueError, RuntimeError) as e:
+            raise click.ClickException(str(e))
+
+    _print_discovery_summary(report)
+
+
+def _print_discovery_summary(report) -> None:  # noqa: ANN001 — DiscoveryReport
+    """Render a compact human-readable summary of a DiscoveryReport."""
+    click.echo("")
+    click.echo(
+        f"discover-deps · base={report.base_branch} · "
+        f"{report.candidate_unit_count} candidate unit(s) · "
+        f"{len(report.skipped_already_in_target)} already in target"
+    )
+    if report.components:
+        click.echo(f"  components: {len(report.components)}")
+        for comp in report.components:
+            arrows = " → ".join(comp.unit_ids)
+            click.echo(f"    {comp.component_id}: {arrows}")
+            if comp.recommend_first:
+                click.echo(
+                    f"      recommend_first: {', '.join(comp.recommend_first)}"
+                )
+    if report.singletons:
+        click.echo(f"  singletons ({len(report.singletons)}): "
+                   f"{', '.join(report.singletons[:8])}"
+                   f"{' …' if len(report.singletons) > 8 else ''}")
+    if report.warnings:
+        click.echo(f"  warnings ({len(report.warnings)}):")
+        for w in report.warnings[:10]:
+            click.echo(f"    • {w}")
+        if len(report.warnings) > 10:
+            click.echo(f"    … and {len(report.warnings) - 10} more")
 
 
 @cli.command(

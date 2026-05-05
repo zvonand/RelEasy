@@ -16,6 +16,7 @@ STATUS_ICONS: dict[str, str] = {
     "conflict": "\U0001f534 conflict",
     "skipped": "\u23ed skipped",
     "merged": "\u2705 merged",
+    "blocked": "\u23f8 blocked",
 }
 
 STATUS_HEADINGS: dict[str, str] = {
@@ -24,4 +25,5 @@ STATUS_HEADINGS: dict[str, str] = {
     "conflict": "Conflict \u2014 unresolved (manual fix required)",
     "skipped": "Skipped",
     "merged": "Merged \u2014 landed on target branch",
+    "blocked": "Blocked \u2014 waiting on depends_on units",
 }
