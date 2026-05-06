@@ -664,12 +664,68 @@ def discover_deps_cmd(
 
 def _print_discovery_summary(report) -> None:  # noqa: ANN001 — DiscoveryReport
     """Render a compact human-readable summary of a DiscoveryReport."""
+    # Breakdown: how the candidate units split between user-declared
+    # groups and singletons, and what the trial-pick loop did with them.
+    group_units = sum(1 for n in report.nodes if n.is_user_group)
+    # Note: ``report.nodes`` excludes already-in-target units (unless
+    # ``--include-already-merged`` was passed). We re-derive group/single
+    # counts conservatively from what's recorded.
+    method_counts: dict[str, int] = {}
+    for n in report.nodes:
+        method_counts[n.discovery_method] = method_counts.get(n.discovery_method, 0) + 1
+    in_target = len(report.skipped_already_in_target)
+    to_pick = report.candidate_unit_count - in_target
+
     click.echo("")
+    click.echo(f"discover-deps · base={report.base_branch}")
     click.echo(
-        f"discover-deps · base={report.base_branch} · "
-        f"{report.candidate_unit_count} candidate unit(s) · "
-        f"{len(report.skipped_already_in_target)} already in target"
+        f"  candidates: {report.candidate_unit_count} unit(s) "
+        f"covering {report.candidate_pr_count} PR(s)"
+        + (
+            f" — including {group_units} user-declared group(s)"
+            if group_units else ""
+        )
     )
+    click.echo(
+        f"  status: {in_target} already in target · {to_pick} to trial-pick"
+    )
+    if method_counts:
+        # Show what came out of the trial-pick loop. ``trial-clean`` =
+        # standalone unit; ``git-graph`` / ``git-graph+claude`` = had
+        # conflicts that got mapped to deps; ``depth-cutoff`` = recursion
+        # bound hit (deps incomplete).
+        ordered_keys = ["trial-clean", "git-graph", "git-graph+claude", "depth-cutoff"]
+        bits = []
+        for k in ordered_keys:
+            if method_counts.get(k):
+                bits.append(f"{method_counts[k]} {k}")
+        # Surface unrecognised methods if any (defensive).
+        for k, v in method_counts.items():
+            if k not in ordered_keys:
+                bits.append(f"{v} {k}")
+        click.echo(f"  trial-picked: {' · '.join(bits)}")
+    if to_pick == 0 and report.candidate_unit_count > 0:
+        click.echo(
+            "  (every candidate is already in target — deps overlay "
+            "carries no new entries)"
+        )
+
+    if report.refresh_removed or report.refresh_added:
+        bits: list[str] = []
+        if report.refresh_removed:
+            sample = ", ".join(report.refresh_removed[:5])
+            extra = f" (+{len(report.refresh_removed) - 5} more)" if len(report.refresh_removed) > 5 else ""
+            bits.append(
+                f"{len(report.refresh_removed)} removed since last run "
+                f"[{sample}{extra}]"
+            )
+        if report.refresh_added:
+            sample = ", ".join(report.refresh_added[:5])
+            extra = f" (+{len(report.refresh_added) - 5} more)" if len(report.refresh_added) > 5 else ""
+            bits.append(
+                f"{len(report.refresh_added)} added [{sample}{extra}]"
+            )
+        click.echo(f"  refresh: {' · '.join(bits)}")
     if report.components:
         click.echo(f"  components: {len(report.components)}")
         for comp in report.components:

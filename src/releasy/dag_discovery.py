@@ -117,11 +117,26 @@ class DiscoveryReport:
     target_sha: str
     generated_at: str
     candidate_unit_count: int
+    # Total PRs across all candidate units, after group-claim dedup.
+    # ``candidate_unit_count`` is the unit count (where a user-declared
+    # group is one super-node); this is the underlying PR count so the
+    # summary can show e.g. "26 PRs across 15 units" — answering the
+    # question "where did the 26 PRs from `by_labels` go?" without the
+    # reader having to re-do the arithmetic.
+    candidate_pr_count: int
     skipped_already_in_target: list[str]
     nodes: list[DAGNode]
     components: list[DAGComponent]
     singletons: list[str]
     warnings: list[str] = field(default_factory=list)
+    # Diff of auto-discovered unit IDs between this run and the existing
+    # deps overlay file (if one was found at ``deps_overlay_path``).
+    # Populated only when there's an existing file to compare against
+    # AND the diff is non-empty. ``removed_since_last_run`` typically
+    # means "landed in target since last run"; ``added_since_last_run``
+    # means "newly discovered candidates / dependencies".
+    refresh_removed: list[str] = field(default_factory=list)
+    refresh_added: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -174,9 +189,44 @@ def run_discover_deps(
     scratch_parent.mkdir(parents=True, exist_ok=True)
 
     remote = config.origin.remote_name
+    # Broad fetch first — pulls history needed to classify conflict
+    # commits (origin/master, PR merge SHAs, etc.).
+    console.print(f"  [dim]Fetching {remote}...[/dim]")
     fetch_remote(repo_path, remote)
+    # Then an explicit targeted fetch of the target branch. Two
+    # benefits over relying on the broad fetch alone: (1) fails fast
+    # with a clear message if ``base_branch`` doesn't exist on origin
+    # — the alternative is silently resolving an empty SHA later;
+    # (2) guarantees freshness even if origin's refspec is unusual.
+    console.print(
+        f"  [dim]Fetching latest [cyan]{base_branch}[/cyan] from {remote}...[/dim]"
+    )
+    target_fetch = run_git(
+        ["fetch", remote, base_branch], repo_path, check=False,
+    )
+    if target_fetch.returncode != 0:
+        err = (target_fetch.stderr or "").strip() or "fetch failed"
+        raise RuntimeError(
+            f"target branch {base_branch!r} not found on remote "
+            f"{remote!r}: {err}. Verify the branch exists on the "
+            "configured origin and re-run."
+        )
     target_ref = f"{remote}/{base_branch}"
     target_sha = _resolve_sha(repo_path, target_ref)
+    if not target_sha:
+        raise RuntimeError(
+            f"could not resolve {target_ref!r} after fetch — the local "
+            "object database is in an unexpected state."
+        )
+
+    # Capture the auto-discovered unit IDs from the existing overlay (if
+    # any) so we can show a refresh diff after the new overlay is built.
+    # ``deps_overlay_path`` is None in --no-write mode; in that case we
+    # skip the diff (nothing's being rewritten anyway).
+    previous_auto_unit_ids: set[str] = (
+        _read_previous_overlay_auto_ids(deps_overlay_path)
+        if deps_overlay_path is not None else set()
+    )
 
     # --- Build candidate units ---
     units = discover_feature_units(config)
@@ -392,16 +442,33 @@ def run_discover_deps(
                     conflict_files=[],
                 )
 
+    # --- Refresh diff: what changed since the previous overlay file? ---
+    # Compares the auto-discovered unit IDs the new run would write to
+    # the ones that were in the existing deps overlay (if any).
+    # ``removed`` = present in old, absent in new — typically "landed in
+    # target since last run" or "no longer needs porting because a
+    # dependency was satisfied by something else".
+    # ``added``   = present in new, absent in old — "newly discovered
+    # candidate / dependency since last run".
+    new_auto_unit_ids: set[str] = {
+        nid for nid, n in nodes.items() if not n.is_user_group
+    }
+    refresh_removed = sorted(previous_auto_unit_ids - new_auto_unit_ids)
+    refresh_added = sorted(new_auto_unit_ids - previous_auto_unit_ids)
+
     report = DiscoveryReport(
         base_branch=base_branch,
         target_sha=target_sha,
         generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         candidate_unit_count=len(candidates),
+        candidate_pr_count=sum(len(cu.prs) for cu in candidates),
         skipped_already_in_target=skipped,
         nodes=sorted(nodes.values(), key=_node_sort_key),
         components=components,
         singletons=singletons,
         warnings=warnings_acc,
+        refresh_removed=refresh_removed,
+        refresh_added=refresh_added,
     )
 
     # --- Write outputs ---
@@ -1189,15 +1256,53 @@ def _default_report_path(config: Config, base_branch: str) -> Path:
     return config.config_path.parent / f"discover-deps.{base_branch}.yaml"
 
 
+def _read_previous_overlay_auto_ids(overlay_path: Path) -> set[str]:
+    """Extract auto-discovered unit IDs from an existing deps overlay file.
+
+    Used to compute the refresh diff (which units disappeared / were
+    added since the last run). Best-effort: any read / parse error
+    returns an empty set so a malformed previous file doesn't block
+    the new run.
+    """
+    if not overlay_path.exists():
+        return set()
+    try:
+        with open(overlay_path) as f:
+            raw = yaml.safe_load(f) or {}
+    except Exception:
+        return set()
+    if not isinstance(raw, dict):
+        return set()
+    out: set[str] = set()
+    for entry in raw.get("groups", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        if not entry.get("auto_discovered"):
+            continue
+        gid = entry.get("id")
+        if isinstance(gid, str):
+            out.add(gid)
+    return out
+
+
 def _write_report(report: DiscoveryReport, path: Path) -> None:
     data: dict = {
         "base_branch": report.base_branch,
         "target_sha": report.target_sha,
         "generated_at": report.generated_at,
         "candidate_unit_count": report.candidate_unit_count,
+        "candidate_pr_count": report.candidate_pr_count,
     }
     if report.skipped_already_in_target:
         data["skipped_already_in_target"] = list(report.skipped_already_in_target)
+    if report.refresh_removed or report.refresh_added:
+        data["refresh"] = {
+            k: v for k, v in {
+                "removed_since_last_run": list(report.refresh_removed) or None,
+                "added_since_last_run": list(report.refresh_added) or None,
+            }.items()
+            if v is not None
+        }
     if report.warnings:
         data["warnings"] = list(report.warnings)
     if report.components:

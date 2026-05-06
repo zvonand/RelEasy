@@ -570,6 +570,23 @@ Round-trip behaviour to know about:
   are rejected at session load time with a clear error listing the
   offending group ids.
 
+**Refreshing after the target branch moves.** Just re-run
+`discover-deps`. Each invocation does a fresh `git fetch` of the target
+branch and re-runs the "already in target" detection (state.yaml +
+`Source-PR:` trailers + `git cherry` patch-id), so PRs that landed
+upstream since the last run drop out automatically — they appear under
+`skipped_already_in_target` in the report and disappear from the deps
+overlay. The summary line surfaces the diff:
+
+```
+discover-deps · base=antalya-26.3 · 24 candidates · 8 already in target
+  refresh: 3 removed since last run [auto-pr-100, auto-pr-105, auto-pr-110] · 1 added [auto-pr-300]
+```
+
+The YAML report carries the same diff under a `refresh:` key with
+`removed_since_last_run` / `added_since_last_run` lists, so an external
+reader (CI, dashboard, …) can pick it up without parsing the console.
+
 Exit code: `0` on success regardless of how many conflicts were found —
 this is a read-only diagnostic, not a porting attempt.
 
