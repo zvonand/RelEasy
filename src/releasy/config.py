@@ -196,7 +196,7 @@ class PRGroupConfig:
     # only runs once every entry in ``depends_on`` has reached
     # ``status: merged`` in target.
     depends_on: list[str] = field(default_factory=list)
-    # Marker set by ``releasy discover-deps --write-session``. The CLI uses
+    # Marker set by ``releasy discover-deps``. The CLI uses
     # it to identify entries it owns and may rewrite. Hand-written groups
     # have ``auto_discovered: false`` and are never touched.
     auto_discovered: bool = False
@@ -253,6 +253,14 @@ class PRSourcesConfig:
     include_authors: list[str] = field(default_factory=list)
     exclude_authors: list[str] = field(default_factory=list)
     groups: list[PRGroupConfig] = field(default_factory=list)
+    # Optional path to a sidecar YAML that carries auto-discovered (or
+    # hand-curated) ``groups[]`` entries with ``depends_on:`` edges.
+    # Loaded by :func:`load_session` and merged into ``groups[]`` in
+    # memory; never mutates the main session file. ``releasy
+    # discover-deps`` writes to this path by default (unless
+    # ``--no-write`` / ``--deps-file <override>`` says otherwise). Relative paths
+    # resolve against the session file's directory.
+    deps_file: str | None = None
     # Per-PR-URL ai_context for individual entries inside ``include_prs``
     # that used the dict form (``{url: ..., ai_context: ...}``). Keyed by
     # URL exactly as listed in the session file. Surfaced to the AI
@@ -637,7 +645,7 @@ class SessionConfig:
     features: list[FeatureConfig] = field(default_factory=list)
     pr_sources: PRSourcesConfig = field(default_factory=PRSourcesConfig)
     session_path: Path | None = None
-    # Non-fatal issues encountered while loading, e.g. an auto-deps overlay
+    # Non-fatal issues encountered while loading, e.g. a deps_file overlay
     # entry whose id collided with the main session. Surfaced once at CLI
     # startup; never causes load to fail.
     load_warnings: list[str] = field(default_factory=list)
@@ -1479,19 +1487,36 @@ def _parse_pr_url_entries(
     return urls, contexts
 
 
-def _auto_deps_overlay_path(session_path: Path) -> Path:
-    """Path to the auto-deps sidecar overlay, derived from the session file.
+def resolve_deps_file_path(
+    session_path: Path, deps_file: str | None,
+) -> Path:
+    """Resolve the effective deps overlay path for a session.
 
-    For ``foo.session.yaml`` (or any path) we write to ``foo.session.auto-deps.yaml``:
-    we strip the trailing ``.yaml``/``.yml`` once and append ``.auto-deps.yaml``.
-    Same directory as the session file.
+    * When ``pr_sources.deps_file`` is set, return that (relative paths
+      resolve against the session file's directory; absolute paths stay
+      absolute).
+    * Otherwise fall back to the convention default
+      ``<session-stem>.deps.yaml`` next to the session file. This makes
+      ``releasy discover-deps`` work zero-config: just run it and a
+      deps file appears alongside the session for the loader to pick
+      up on the next ``releasy run``.
+
+    Always returns a path. Whether the file *exists* is a separate
+    question the caller checks when relevant.
     """
+    if deps_file:
+        p = Path(deps_file)
+        if not p.is_absolute():
+            p = (session_path.parent / p).resolve()
+        return p
+    # Convention default: strip the trailing .yaml/.yml from the session
+    # file's name once and append .deps.yaml in the same directory.
     name = session_path.name
     for suffix in (".yaml", ".yml"):
         if name.endswith(suffix):
             stem = name[: -len(suffix)]
-            return session_path.with_name(f"{stem}.auto-deps.yaml")
-    return session_path.with_name(f"{name}.auto-deps.yaml")
+            return session_path.with_name(f"{stem}.deps.yaml")
+    return session_path.with_name(f"{name}.deps.yaml")
 
 
 def load_session(
@@ -1636,7 +1661,7 @@ def load_session(
             raise ValueError(
                 f"{source_label}: groups[{gid!r}].auto_discovered=true is "
                 f"reserved for the sidecar overlay file. Remove the flag, or "
-                f"move the entry into the auto-deps sidecar."
+                f"move the entry into the deps_file sidecar."
             )
         return PRGroupConfig(
             id=gid,
@@ -1655,40 +1680,64 @@ def load_session(
             entry, source_label="pr_sources", allow_auto_discovered=False,
         ))
 
-    # Sidecar overlay: <session-stem>.auto-deps.yaml alongside the session
-    # file. Always reloaded fresh; main session entries win on id conflict.
-    overlay_path = _auto_deps_overlay_path(path)
     overlay_warnings: list[str] = []
+
+    # Optional deps-file overlay: an explicit reference from session.yaml
+    # (``pr_sources.deps_file: <path>``) to a sidecar YAML carrying
+    # auto-discovered or hand-curated ``groups[]`` entries with
+    # ``depends_on:`` edges. Relative paths resolve against the session
+    # file's directory; absolute paths stay absolute. Main session
+    # entries always win on id conflict — the sidecar is purely
+    # additive.
+    deps_file_raw = ps_raw.get("deps_file")
+    if deps_file_raw is not None and not isinstance(deps_file_raw, str):
+        raise ValueError(
+            f"pr_sources.deps_file must be a string path, got "
+            f"{type(deps_file_raw).__name__}"
+        )
+    deps_file_value: str | None = deps_file_raw or None
+
+    overlay_path = resolve_deps_file_path(path, deps_file_value)
     if overlay_path.exists():
         try:
             with open(overlay_path) as f:
                 overlay_raw = yaml.safe_load(f) or {}
         except Exception as e:
             overlay_warnings.append(
-                f"failed to read auto-deps overlay {overlay_path.name}: {e} — ignoring"
+                f"failed to read deps_file {overlay_path}: {e} — ignoring"
             )
             overlay_raw = {}
         if not isinstance(overlay_raw, dict):
             overlay_warnings.append(
-                f"auto-deps overlay {overlay_path.name} must be a YAML mapping — ignoring"
+                f"deps_file {overlay_path} must be a YAML mapping — ignoring"
             )
             overlay_raw = {}
         for entry in overlay_raw.get("groups", []) or []:
             entry_gid = entry.get("id") if isinstance(entry, dict) else None
             if entry_gid in seen_group_ids:
                 overlay_warnings.append(
-                    f"auto-deps overlay group {entry_gid!r} clashes with main "
+                    f"deps_file group {entry_gid!r} clashes with main "
                     f"session id; main session wins"
                 )
                 continue
             try:
                 groups.append(_parse_group_entry(
                     entry,
-                    source_label=f"auto-deps overlay {overlay_path.name}",
+                    source_label=f"deps_file {overlay_path.name}",
                     allow_auto_discovered=True,
                 ))
             except ValueError as e:
                 overlay_warnings.append(str(e))
+    elif deps_file_value:
+        # Explicit override pointed at a missing file — surface that.
+        # When ``deps_file`` is unset and the convention default doesn't
+        # exist yet, stay silent: the user just hasn't run discover-deps
+        # yet, that's the normal "first run" state.
+        overlay_warnings.append(
+            f"pr_sources.deps_file={deps_file_value!r} → {overlay_path} "
+            "does not exist — no overlay loaded (run "
+            "`releasy discover-deps` to create it)"
+        )
 
     def _str_list(key: str) -> list[str]:
         """Read a list-of-strings field, tolerating a bare string."""
@@ -1717,6 +1766,7 @@ def load_session(
         exclude_authors=_str_list("exclude_authors"),
         groups=groups,
         include_pr_contexts=include_pr_contexts,
+        deps_file=deps_file_value,
     )
 
     if config.sequential and groups:
@@ -1963,7 +2013,9 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
         ps_data["include_authors"] = ps.include_authors
     if ps.exclude_authors:
         ps_data["exclude_authors"] = ps.exclude_authors
-    # Auto-discovered entries belong to the sidecar overlay file, not the
+    if ps.deps_file:
+        ps_data["deps_file"] = ps.deps_file
+    # Auto-discovered entries belong to the deps_file sidecar, not the
     # main session — skip them here so a save_session() round-trip never
     # leaks overlay state into the user's hand-curated config.
     main_groups = [g for g in ps.groups if not g.auto_discovered]

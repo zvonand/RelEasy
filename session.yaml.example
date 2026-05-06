@@ -182,3 +182,16 @@ features:
 #       #                       # "append" adds newly-listed PRs onto the
 #       #                       # existing branch tip without rebuilding.
 #       # sort: merged_at       # default "listed"
+#       # depends_on:           # other unit IDs (group ids, pr-<N>) that
+#       #   - pr-100            # must be `merged` in target before this
+#       #   - prereq-group      # group is processed. `releasy run` skips
+#       #                       # the dependent and marks it `blocked`
+#       #                       # until the parent merges upstream.
+#
+#   # Optional: override the deps overlay path. The default is
+#   # `<session-stem>.deps.yaml` (e.g. `antalya-26.3.session.deps.yaml`)
+#   # next to this session file — `releasy discover-deps` writes there
+#   # by default and the loader picks it up automatically. Set this
+#   # field only if you want the deps file somewhere else. Relative
+#   # paths resolve against this session file's directory.
+#   # deps_file: deps/26.3.yaml

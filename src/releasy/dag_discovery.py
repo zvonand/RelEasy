@@ -18,9 +18,13 @@ The ``releasy discover-deps`` command:
    ``recommend_first``.
 
 The command is read-only: it never writes ``state.yaml`` and never
-touches the main worktree. The optional ``--write-session`` flag writes
-a sidecar overlay at ``<session-stem>.auto-deps.yaml`` that the session
-loader merges into ``pr_sources.groups`` on the next ``releasy run``.
+touches the main worktree. By default it also writes a deps overlay
+to ``<session-stem>.deps.yaml`` next to the session file (override via
+``pr_sources.deps_file:`` in the session) — the session loader merges
+that file's ``groups[]`` into ``pr_sources.groups`` on the next
+``releasy run``. Pass ``--no-write`` to skip the overlay write
+(preview mode), or ``--deps-file <path>`` to redirect it to a one-off
+path. The main session file is never modified.
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ from releasy.ai_resolve import (
     _parse_missing_prereqs,
     synthesize_text,
 )
-from releasy.config import Config, _auto_deps_overlay_path
+from releasy.config import Config
 from releasy.git_ops import (
     abort_in_progress_op,
     cherry_pick_merge_commit,
@@ -131,7 +135,7 @@ def run_discover_deps(
     work_dir: Path | None,
     *,
     output_path: Path | None,
-    write_session: bool,
+    deps_overlay_path: Path | None,
     use_ai: bool,
     max_depth: int,
     pr_limit: int | None,
@@ -401,35 +405,35 @@ def run_discover_deps(
     )
 
     # --- Write outputs ---
-    # Session overlay first so any "session_path is unknown" warning it
-    # appends lands in the diagnostic report's on-disk YAML (the
-    # ``warnings`` list is the same object). Any failure writing the
-    # overlay is captured as a warning rather than propagated, so the
-    # diagnostic report — the durable artifact — always lands.
-    if write_session:
-        session_path = (
-            config.session.session_path
-            if config.session and config.session.session_path
-            else None
-        )
-        if session_path is None:
+    # Deps-file overlay first so any failure-to-write warning lands in
+    # the diagnostic report's on-disk YAML (``report.warnings`` and
+    # ``warnings_acc`` are the same list object). Any failure writing
+    # the overlay is captured as a warning rather than propagated, so
+    # the diagnostic report — the durable artifact — always lands.
+    if deps_overlay_path is not None:
+        try:
+            _write_session_overlay(report, deps_overlay_path)
+        except OSError as e:
             warnings_acc.append(
-                "--write-session: session_path is unknown; skipping overlay write"
+                f"failed to write deps overlay {deps_overlay_path}: {e}"
             )
         else:
-            overlay_path = _auto_deps_overlay_path(session_path)
-            try:
-                _write_session_overlay(report, overlay_path)
-            except OSError as e:
-                warnings_acc.append(
-                    f"--write-session: failed to write overlay "
-                    f"{overlay_path}: {e}"
-                )
-            else:
-                console.print(
-                    f"  [green]✓[/green] wrote auto-deps overlay → "
-                    f"[cyan]{overlay_path}[/cyan]"
-                )
+            console.print(
+                f"  [green]✓[/green] wrote deps overlay → "
+                f"[cyan]{deps_overlay_path}[/cyan]"
+            )
+    elif config.session and config.session.session_path:
+        # We're skipping (--no-write). Note where the overlay *would*
+        # have gone so the user knows we noticed and chose to skip.
+        from releasy.config import resolve_deps_file_path
+        target = resolve_deps_file_path(
+            config.session.session_path,
+            config.session.pr_sources.deps_file,
+        )
+        console.print(
+            f"  [dim]--no-write: skipping deps overlay "
+            f"(would have written to {target})[/dim]"
+        )
 
     output_path = output_path or _default_report_path(config, base_branch)
     _write_report(report, output_path)
@@ -560,6 +564,15 @@ def _git_cherry_already(
 # ---------------------------------------------------------------------------
 
 
+# Module-level registry of cleanup flags keyed on scratch worktree path.
+# Stored separately from the ``Path`` object because 3.12+ slots out
+# arbitrary attribute assignment on ``pathlib.Path``. Each entry is
+# ``[bool]`` (single-element list, used as a mutable cell) so the
+# atexit closure and the explicit close path can both flip it from True
+# to indicate "already cleaned, skip the redundant `worktree remove`".
+_SCRATCH_CLEANUP_FLAGS: dict[str, list[bool]] = {}
+
+
 def _open_scratch_worktree(
     repo_path: Path, scratch_parent: Path, target_ref: str,
 ) -> Path:
@@ -582,6 +595,7 @@ def _open_scratch_worktree(
     )
 
     cleaned = [False]
+    _SCRATCH_CLEANUP_FLAGS[str(scratch)] = cleaned
 
     def _cleanup() -> None:
         if cleaned[0]:
@@ -595,14 +609,11 @@ def _open_scratch_worktree(
         except Exception:  # pragma: no cover — best-effort cleanup
             pass
     atexit.register(_cleanup)
-    # Stash the cleaned flag on the path object so the explicit close
-    # path can mark it done and avoid a duplicate call at process exit.
-    scratch._releasy_cleanup_flag = cleaned  # type: ignore[attr-defined]
     return scratch
 
 
 def _close_scratch_worktree(repo_path: Path, scratch: Path) -> None:
-    flag = getattr(scratch, "_releasy_cleanup_flag", None)
+    flag = _SCRATCH_CLEANUP_FLAGS.pop(str(scratch), None)
     if flag is not None:
         flag[0] = True
     run_git(
@@ -1228,7 +1239,8 @@ def _write_report(report: DiscoveryReport, path: Path) -> None:
 def _write_session_overlay(
     report: DiscoveryReport, overlay_path: Path,
 ) -> None:
-    """Emit the auto-deps sidecar overlay.
+    """Emit the deps overlay file at the path declared in
+    ``pr_sources.deps_file``.
 
     Only writes entries for units that participate in the DAG (≥ 1 edge
     in or out). Pure singletons are omitted — the loader doesn't need
@@ -1269,7 +1281,7 @@ def _write_session_overlay(
     overlay_path.parent.mkdir(parents=True, exist_ok=True)
     with open(overlay_path, "w") as f:
         f.write(
-            "# AUTO-GENERATED by `releasy discover-deps --write-session`.\n"
+            "# AUTO-GENERATED by `releasy discover-deps`.\n"
             "# Hand-edits will be overwritten on next run; remove this file\n"
             "# (or move entries into the main session file) to make them permanent.\n\n"
         )

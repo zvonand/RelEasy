@@ -260,6 +260,15 @@ pr_sources:
         - https://github.com/Altinity/ClickHouse/pull/1500
         - https://github.com/Altinity/ClickHouse/pull/1512
         - https://github.com/Altinity/ClickHouse/pull/1530
+
+  # Optional: override the deps overlay path. The default is
+  # `<session-stem>.deps.yaml` (e.g. `antalya-26.3.session.deps.yaml`)
+  # next to this session file — `releasy discover-deps` writes there
+  # by default and the loader picks it up automatically. Set this
+  # field only if you want the deps file somewhere else (e.g. tucked
+  # into a `deps/` subdir for cleaner repo layout). Relative paths
+  # resolve against this session file's directory.
+  # deps_file: deps/26.3.yaml
 ```
 
 **Redundant configuration warnings.** RelEasy emits a one-line stderr
@@ -508,11 +517,13 @@ Exit code: `1` if any PR ended up in `conflict` status, `0` otherwise.
 Trial-cherry-picks every candidate `pr_sources` unit onto the target
 branch tip in a scratch worktree, traces conflicts back to older
 un-ported PRs that touched the same files, and emits a recommended
-grouping as a YAML report. With `--write-session`, additionally writes
-a sidecar `<session-stem>.auto-deps.yaml` that the session loader merges
-into `pr_sources.groups[]` on the next `releasy run` — so the discovered
-dependencies drive sequential gating without you hand-editing the main
-session file.
+grouping as a YAML report. By default also writes a deps overlay
+right next to the session file at `<session-stem>.deps.yaml` (e.g.
+`antalya-26.3.session.deps.yaml`) — the session loader picks it up
+automatically on the next `releasy run`, merging its `groups[]` into
+`pr_sources.groups[]` so the discovered dependencies drive sequential
+gating. The main session file is never modified. Set
+`pr_sources.deps_file: <path>` to override the default location.
 
 User-declared `pr_sources.groups[]` are treated as **single super-nodes**:
 discovery never subdivides them. If any PR inside a group depends on PR
@@ -521,14 +532,28 @@ that depends on a single member of a group depends on the *whole group*.
 
 ```bash
 releasy discover-deps [--onto <ver>] [--work-dir <path>]
-                      [-o <path>] [--write-session]
+                      [-o <path>] [--deps-file <path> | --no-write]
                       [--no-ai] [--max-depth <N>] [--limit <N>]
                       [--include-already-merged]
 ```
 
+Output behaviour:
+
+- The diagnostic YAML report is **always** written, regardless of any
+  flag. Default path: `<config-dir>/discover-deps.<base>.yaml`. Override
+  with `-o`. `releasy run` does not consume this file — it's a human
+  artifact.
+- The deps overlay is written **by default** to
+  `<session-stem>.deps.yaml` (or the `pr_sources.deps_file:` override).
+  Pass `--no-write` to skip the overlay write entirely (preview mode),
+  or `--deps-file <path>` to redirect to a one-off path (preview / A-B
+  comparison) without touching the configured location.
+- `--no-write` and `--deps-file <path>` are mutually exclusive: one
+  skips the overlay, the other redirects it. Pick one.
+
 Round-trip behaviour to know about:
 
-- The sidecar overlay carries every auto-discovered unit as a `groups[]`
+- The deps file carries every auto-discovered unit as a `groups[]`
   entry with `auto_discovered: true`. A singleton (one PR with one or
   more deps) becomes a **1-PR group** in the overlay so it can carry
   `depends_on:` — there's no per-singleton dependency channel in the
@@ -536,12 +561,14 @@ Round-trip behaviour to know about:
   `is_group=True`, which slightly changes branch naming and AI-context
   semantics. Move the entry into the main session file (and drop the
   `auto_discovered` flag) if you want to make the conversion permanent.
-- Re-running `discover-deps --write-session` always rewrites the sidecar
-  from scratch — never edits the main session. Hand-edits inside the
-  sidecar will be lost on next discovery.
-- Cycles in `depends_on` (introduced by hand-editing the sidecar) are
-  rejected at session load time with a clear error listing the offending
-  group ids.
+- Re-running `discover-deps` always rewrites the deps file from
+  scratch — never edits the main session. Hand-edits inside the deps
+  file will be lost on next discovery; if you want stable hand-curated
+  deps, run with `--no-write` or use `--deps-file <preview-path>` to
+  redirect.
+- Cycles in `depends_on` (introduced by hand-editing the deps file)
+  are rejected at session load time with a clear error listing the
+  offending group ids.
 
 Exit code: `0` on success regardless of how many conflicts were found —
 this is a read-only diagnostic, not a porting attempt.

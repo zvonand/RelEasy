@@ -8,7 +8,13 @@
       "Bash(python3 -m releasy run --help)",
       "Bash(python3 -m releasy status --help)",
       "Bash(python3 -c \"import sys; sys.path.insert\\(0, 'src'\\); from releasy import cli, pipeline, dag_discovery, state, config, ai_resolve; print\\('imports OK'\\)\")",
-      "Bash(python3)"
+      "Bash(python3)",
+      "Bash(python3 -c \"import sys; sys.path.insert\\(0, 'src'\\); from releasy import cli, pipeline, dag_discovery, state, config; print\\('imports OK'\\)\")",
+      "Read(//tmp/**)",
+      "Bash(python3 -m releasy --config /nonexistent.yaml discover-deps --no-write --deps-file foo.yaml)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(grep -rn \"\\\\-\\\\-write\\\\b\" /home/zvonand/releasy/src/ /home/zvonand/releasy/prompts/ /home/zvonand/releasy/README.md /home/zvonand/releasy/session.yaml.example /home/zvonand/.claude/plans/ 2>&1 | grep -v \"\\\\-\\\\-write-\" | head -10)",
+      "Read(//home/zvonand/.claude/plans/**)"
     ]
   }
 }

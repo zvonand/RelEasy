@@ -76,7 +76,7 @@ def _attach_session(
     except Exception as e:
         raise click.ClickException(f"Failed to load session: {e}")
 
-    # Surface non-fatal load issues (auto-deps overlay collisions,
+    # Surface non-fatal load issues (deps_file overlay collisions,
     # redundant include_prs / exclude_prs / group entries, etc.) to the
     # user. They aren't fatal — the run can still proceed — but silently
     # accumulating them in the SessionConfig defeats the point.
@@ -537,8 +537,15 @@ def status(ctx: click.Context) -> None:
     help="Diagnostic report path. Default: <config-dir>/discover-deps.<base>.yaml.",
 )
 @click.option(
-    "--write-session", is_flag=True, default=False,
-    help="Also write the session overlay sidecar (<session-stem>.auto-deps.yaml).",
+    "--deps-file", "deps_file_override", default=None, type=click.Path(),
+    help="Override `pr_sources.deps_file` for this run — write the deps "
+         "overlay here instead of the configured path. Useful for "
+         "previews / A-B comparisons (e.g. /tmp/preview.yaml).",
+)
+@click.option(
+    "--no-write", is_flag=True, default=False,
+    help="Skip writing the deps overlay even when `pr_sources.deps_file` "
+         "is set. Diagnostic report still lands.",
 )
 @click.option(
     "--no-ai", is_flag=True, default=False,
@@ -562,7 +569,8 @@ def discover_deps_cmd(
     onto: str | None,
     work_dir: str | None,
     output_path: str | None,
-    write_session: bool,
+    deps_file_override: str | None,
+    no_write: bool,
     no_ai: bool,
     max_depth: int,
     pr_limit: int | None,
@@ -573,23 +581,76 @@ def discover_deps_cmd(
     Walks the candidate PR set defined by ``pr_sources``, trial-cherry-picks
     each unit (singleton or user-declared group) onto the target branch tip
     in a scratch git worktree, and on conflict, traces the conflicting
-    files back to older un-ported units that touched them. Produces a
-    diagnostic YAML report and (with ``--write-session``) a sidecar overlay
-    that the next ``releasy run`` honors via ``depends_on``.
+    files back to older un-ported units that touched them. Always emits a
+    diagnostic YAML report.
+
+    By default, also writes a deps overlay to the path declared in
+    ``pr_sources.deps_file`` of the session file (so the next
+    ``releasy run`` honors the discovered ``depends_on:``). Pass
+    ``--no-write`` to skip the overlay write, or ``--deps-file <path>``
+    to redirect it to a different file (without touching the configured
+    location).
 
     Read-only with respect to ``state.yaml`` and the main worktree. Acquires
     the project lock so it doesn't race with concurrent ``run`` invocations.
     """
+    if no_write and deps_file_override:
+        raise click.UsageError(
+            "--no-write and --deps-file are mutually exclusive: --no-write "
+            "skips the overlay entirely, --deps-file requests one at a "
+            "specific path. Pick one."
+        )
+
     from releasy.dag_discovery import run_discover_deps
+    from releasy.config import resolve_deps_file_path
 
     with _locked_config(ctx, session="required") as config:
+        # Resolve the deps overlay output path (or None to skip):
+        #   --no-write              → None
+        #   --deps-file <path>      → that path (CLI override; relative to cwd)
+        #   else                    → resolve_deps_file_path(...) which
+        #                             returns the configured pr_sources
+        #                             .deps_file or the convention
+        #                             default <session-stem>.deps.yaml.
+        deps_overlay_path: Path | None
+        if no_write:
+            deps_overlay_path = None
+        elif deps_file_override:
+            override = Path(deps_file_override)
+            if not override.is_absolute():
+                # Resolve relative to cwd (NOT session dir) so a one-off
+                # `--deps-file /tmp/preview.yaml` or relative path on the
+                # command line does what the user typed.
+                override = override.resolve()
+            deps_overlay_path = override
+        else:
+            session_path = (
+                config.session.session_path
+                if config.session and config.session.session_path
+                else None
+            )
+            if session_path is None:
+                # No session file on disk — nothing to derive a default
+                # path from. Skip silently (only the diagnostic report
+                # lands). Pretty rare in practice; the in-memory
+                # stateless config flow is the only producer.
+                deps_overlay_path = None
+            else:
+                deps_file_value = (
+                    config.session.pr_sources.deps_file
+                    if config.session else None
+                )
+                deps_overlay_path = resolve_deps_file_path(
+                    session_path, deps_file_value,
+                )
+
         try:
             report = run_discover_deps(
                 config,
                 onto=onto,
                 work_dir=Path(work_dir) if work_dir else None,
                 output_path=Path(output_path) if output_path else None,
-                write_session=write_session,
+                deps_overlay_path=deps_overlay_path,
                 use_ai=not no_ai,
                 max_depth=max_depth,
                 pr_limit=pr_limit,

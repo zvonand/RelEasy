@@ -179,7 +179,7 @@ class FeatureUnit:
     applied_pr_urls: set[str] = field(default_factory=set)
     # Other unit IDs this unit depends on. Populated from
     # :class:`PRGroupConfig.depends_on` for group units (singletons can
-    # only carry deps via single-PR groups in the auto-deps overlay).
+    # only carry deps via single-PR groups in the deps_file overlay).
     # Processing order is topologically sorted on this field; processing
     # gates on every entry having ``status: merged`` in target.
     depends_on: list[str] = field(default_factory=list)
