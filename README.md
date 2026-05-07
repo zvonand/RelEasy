@@ -194,6 +194,17 @@ project: antalya
 # When set, --onto becomes optional on the CLI.
 target_branch: antalya-26.3
 
+# Optional: tag merged ports with a single label that doubles as a
+# "ported into this release" marker. Once a port (rebase) PR lands in
+# target_branch, releasy applies this label to it on origin and strips
+# the same label from every source PR the port was cherry-picked from.
+# Source PRs on a different repo than origin are skipped (releasy never
+# writes outside origin). Each unit is processed exactly once. Unset to
+# disable.
+# merged_label: port-antalya
+# merged_label_color: "8B5CF6"   # used only when releasy creates the
+#                                #   label on origin
+
 # Policy knobs applied to every discovered PR / group.
 # All fields optional; shown below are the defaults.
 # pr_policy:
@@ -321,8 +332,8 @@ Options in the table below live in **config.yaml** unless marked
 | `analyze_fails.flaky_check_prs` | Cap on PRs scanned to build the flaky-elsewhere map. | `12` |
 | `analyze_fails.post_comment_to_pr` | Post a top-level summary comment on each processed PR (per-shard outcomes, AI narration, commit + push status). | `true` |
 | `pr_policy.auto_pr` | Open a PR for every pushed port branch (singletons, by_labels, include_prs, groups). Requires `push: true`. | `true` |
-| `pr_policy.if_exists` | Default for session-file source entries that don't set their own: `skip`, `recreate`, or `append`. `skip` leaves an existing local branch alone (and halts on an in-progress cherry-pick / merge / rebase at startup); `recreate` deletes the branch and rebuilds from base (auto-aborting any in-progress op). `append` cherry-picks declared PRs that aren't already on the existing branch onto its tip — useful when a PR was added to a group after a prior `releasy run` already produced the combined branch — and updates the rebase PR body to reflect the full declared group order. The remote-branch lock that protects `skip`/`recreate` is bypassed under `append` since it's the explicit user opt-in. Append falls back to `skip` (with a warning) when existing commits don't match a prefix of the declared group; for singletons append is a no-op. | `skip` |
-| `pr_policy.retry_failed` | When a PR unit has a `conflict` entry in state from a previous run: `true` revisits the unit per its `if_exists` value (rebuild only if `recreate`, append onto the existing branch if `append`, leave alone if `skip`); `false` leaves the entry exactly as-is. Retry never overrides `if_exists` — only `if_exists: recreate` (set explicitly by the user) authorizes blowing away existing port commits. Overridable per-invocation with `--retry-failed` / `--no-retry-failed` on `releasy run`. | `true` |
+| `pr_policy.if_exists` | Default for session-file source entries that don't set their own: `skip`, `recreate`, or `append`. `skip` leaves an existing local branch alone (and halts on an in-progress cherry-pick / merge / rebase at startup); `recreate` rebuilds the branch from base **only when no rebase PR is open yet** (auto-aborting any in-progress op) — once a PR exists, `run` switches to merging target into the existing branch instead, never force-pushing. `append` cherry-picks declared PRs that aren't already on the existing branch onto its tip — useful when a PR was added to a group after a prior `releasy run` already produced the combined branch — and updates the rebase PR body to reflect the full declared group order. The remote-branch lock that protects `skip`/`recreate` is bypassed under `append` since it's the explicit user opt-in. Append falls back to `skip` (with a warning) when existing commits don't match a prefix of the declared group; for singletons append is a no-op. | `skip` |
+| `pr_policy.retry_failed` | When a PR unit has a `conflict` entry in state from a previous run: `true` revisits the unit per its `if_exists` value (rebuild from base only if `recreate` *and* no rebase PR is open yet, append onto the existing branch if `append`, otherwise route through merge-target — never force-push); `false` leaves the entry exactly as-is. Retry never overrides `if_exists`, and never blows away an open PR's history. Overridable per-invocation with `--retry-failed` / `--no-retry-failed` on `releasy run`. | `true` |
 | `pr_policy.recreate_closed_prs` | When `true`, if state has a `rebase_pr_url` and that GitHub PR is closed (not merged), allocate `<canonical>-1`, `-2`, … for the port branch and cherry-pick + open a fresh PR. Off by default. | `false` |
 | `pr_sources.by_labels[].labels` *(session)* | Labels a PR must have (AND logic) | — |
 | `pr_sources.by_labels[].merged_only` *(session)* | Only include merged PRs | `false` |
@@ -426,10 +437,12 @@ In one-line summaries:
 
 > **Why both `run` and `continue`?** `run` only acts on entries it's
 > cherry-picking *right now*. If you fix a conflict by hand later in the
-> work-dir, `run` either skips your branch (`if_exists: skip`) or
-> **deletes your manual fix** and rebuilds from base (`if_exists:
-> recreate`). `continue` is the safe "preserve my work, just push + open
-> the PR" command.
+> work-dir on a branch with **no rebase PR yet**, `run` either skips your
+> branch (`if_exists: skip`) or **deletes your manual fix** and rebuilds
+> from base (`if_exists: recreate`). Once a rebase PR is open, `run`
+> switches to merge-target mode and never force-pushes — your fix is
+> safe — but `continue` is still the cleaner "preserve my work, just
+> push + open the PR" command for the no-PR-yet case.
 
 The remaining commands — `skip`, `abort`, `status`, `setup-project`,
 `sync-project`, `release`, `feature *` — never touch git history; they're
@@ -456,16 +469,21 @@ into the base. AI-resolves **cherry-pick** conflicts inline when
 / first-of-group) or opened as draft PRs labelled `ai-needs-attention`
 (partial groups), and the pipeline keeps moving.
 
-For entries that already produced a branch on origin, `run` skips the
-cherry-pick and just makes sure a PR exists — it does **not** re-port,
-re-AI-resolve, or merge any moved-on target branch into them. Use
-[`refresh`](#releasy-refresh--keep-tracked-prs-current-with-the-target-branch)
-for the latter.
+For entries that already produced a rebase PR on origin, `run` never
+rebuilds the branch from base — `if_exists: recreate` only applies
+before a PR is opened. Once a PR exists, the unit is routed through
+the same merge-target-into-branch flow `releasy refresh` uses:
+clean merge → leave the PR alone, conflict → AI-resolve and plain
+push (never force). Pass `--merge-target` to push a fresh merge
+commit even on clean merges. `if_exists: append` is the one setting
+that still touches an existing PR's branch — the user explicitly
+asked to cherry-pick new PRs on top.
 
 ```bash
 releasy run [--onto <tag-or-sha>] [--work-dir <path>]
             [--resolve-conflicts | --no-resolve-conflicts]
             [--retry-failed | --no-retry-failed]
+            [--merge-target | --no-merge-target]
 ```
 
 | Option | Description | Default |
@@ -473,7 +491,8 @@ releasy run [--onto <tag-or-sha>] [--work-dir <path>]
 | `--onto <ver>` | Version label used to derive `<project>-<version>` if `target_branch` is unset. Just a string — never resolved as a git ref. | from `target_branch` |
 | `--work-dir <path>` | Working directory for git operations (overrides config `work_dir`). | from config / cwd |
 | `--resolve-conflicts` / `--no-resolve-conflicts` | Toggle the AI resolver. The flag is a kill-switch: AI runs only if both this *and* `ai_resolve.enabled` are true. | on |
-| `--retry-failed` / `--no-retry-failed` | Re-attempt PR units whose previous run ended in `conflict` status: discard the existing local / remote port branch and re-run the cherry-pick from base. With `--no-retry-failed`, those entries are left exactly as-is. | from `pr_policy.retry_failed` (true) |
+| `--retry-failed` / `--no-retry-failed` | Re-attempt PR units whose previous run ended in `conflict` status. For units **without** an open rebase PR, this discards the existing local / remote port branch and re-runs the cherry-pick from base (only when `if_exists: recreate`). For units **with** an open rebase PR, it instead retries via the merge-target flow (the open PR is always preserved). With `--no-retry-failed`, those entries are left exactly as-is. | from `pr_policy.retry_failed` (true) |
+| `--merge-target` / `--no-merge-target` | For units whose rebase PR is already open: push a merge commit of the latest target tip into the PR branch even when there are no conflicts. Without this, RelEasy only touches an existing PR's branch when target conflicts with it (and AI resolves them). Never force-pushes. | off |
 | `--only <url-or-id>` | Restrict this run to a single PR (full GitHub PR URL) **or** a `pr_sources.groups[].id` / singleton feature id (`pr-<N>`, `<owner>-<repo>-pr-N`). All other discovered units are dropped before any side-effects. Exits non-zero if nothing matches. | — |
 
 Exit code: `1` if any port ended up in `conflict` status, `0` otherwise.
@@ -486,8 +505,9 @@ Only operates on entries already in the project state file. For each tracked PR
 with a branch + rebase PR URL, fetches latest tips, attempts
 `git merge --no-ff origin/<base_branch>` into the PR branch, and:
 
-- **clean merge** — leaves the PR alone (resets local back; if you want
-  a fresh merge commit pushed, use GitHub's *Update branch* button),
+- **clean merge** — leaves the PR alone (resets local back; pass
+  `--merge-target` if you want a fresh merge commit pushed even
+  without conflicts),
 - **conflict + AI resolves it** — pushes the resolved merge commit,
   preserves status (and promotes any prior `conflict` back to
   `needs_review`), sets `ai_resolved`,
@@ -497,17 +517,22 @@ with a branch + rebase PR URL, fetches latest tips, attempts
 
 Uses a separate prompt template (`ai_resolve.merge_prompt_file`) but the
 same Claude invocation machinery as `run`. Suitable for a cron / CI
-loop.
+loop. Note: `releasy run` now applies the same merge-target flow to
+units whose PR is already open, so explicit `refresh` invocations are
+mainly useful for cron / CI cadence or for picking up PRs that aren't
+in the current run's discovery scope.
 
 ```bash
 releasy refresh [--work-dir <path>]
                 [--resolve-conflicts | --no-resolve-conflicts]
+                [--merge-target | --no-merge-target]
 ```
 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--work-dir <path>` | Working directory for git operations. | from config / cwd |
 | `--resolve-conflicts` / `--no-resolve-conflicts` | Toggle the AI resolver. With `--no-resolve-conflicts`, conflicting PRs are flagged in state without an automatic fix attempt. | on |
+| `--merge-target` / `--no-merge-target` | Push a merge commit of the latest target tip into every tracked PR branch even when there are no conflicts. Without this, only conflicting PRs are touched. Never force-pushes. | off |
 | `--only <url-or-id>` | Restrict the multi-PR walk to a single tracked PR (URL — source or rebase) or a single feature / group id. Mutually exclusive with `--pr` and `--stateless`. Exits non-zero if nothing matches. | — |
 
 Exit code: `1` if any PR ended up in `conflict` status, `0` otherwise.
@@ -550,6 +575,61 @@ Output behaviour:
   comparison) without touching the configured location.
 - `--no-write` and `--deps-file <path>` are mutually exclusive: one
   skips the overlay, the other redirects it. Pick one.
+
+How conflicts get classified into deps (the **hybrid AI flow**):
+
+1. **Deterministic mapping**: for each conflict file, `git log
+   target..source -- <file>` enumerates older un-ported commits that
+   touched it; classify each via `Source-PR:` trailer / merge-
+   containment / direct merge SHA → set of candidate unit IDs.
+2. **If deterministic gave candidates**: ask Claude (lightweight,
+   text-only, no tools) to confirm/refine the list — `discovery_method:
+   "git-graph+claude"` in the report, fast, cheap.
+3. **If deterministic gave nothing**: invoke the **full AI resolver**
+   (same machinery `releasy run` uses — Claude with tools, runs
+   builds) to actually attempt the conflict resolution. Three outcomes:
+   - **Resolver reports `MISSING_PREREQS:`** → use those URLs as the
+     deps. `discovery_method: "ai-resolve"`.
+   - **Resolver succeeds** → conflict was textual drift, no deps
+     needed. `discovery_method: "ai-resolve-clean"`.
+   - **Resolver fails uncertainly** → empty deps + warning.
+     `discovery_method: "git-graph"` (unchanged).
+4. **Always reset** the scratch worktree afterwards regardless of
+   outcome — discover-deps is dry-run, so any commit the resolver made
+   is intentionally discarded.
+
+Pass `--no-ai` to skip BOTH the lightweight refinement AND the
+heavyweight resolver fallback. The deterministic git-graph deps are
+used as-is. Trade-off: faster + free, but the deterministic mapping
+can miss conflicts whose root cause is semantic (e.g. drift in a file
+nobody else in the candidate set touched), or false-positive on
+file-overlap that isn't actually a dependency.
+
+**Port-branch caching.** When the deps overlay write is enabled (the
+default — i.e. NOT `--no-write`), `discover-deps` preserves the
+trial-pick result as a local branch at `feature/<base>/<unit_id>` —
+the same path `releasy run` would create. Two reasons:
+
+1. **Trial-clean** units leave a branch carrying the cherry-picked
+   commits. The next `releasy run` finds the branch via its existing
+   `if_exists: skip` policy and just pushes + opens a PR — no
+   re-cherry-pick.
+2. **AI-resolved** conflicts (the resolver succeeded with or without
+   missing-prereqs) leave a branch carrying the resolution commits.
+   `releasy run` reuses it the same way, **avoiding a second AI
+   resolve** of the same conflict. This is the bulk of the time/$
+   savings.
+
+Cache branches that *aren't* useful (conflicts the AI couldn't
+resolve, refinement-only paths) are deleted. The report's `cached`
+field per node tells you which branches were kept; the summary's
+`cached: N port branch(es) preserved` line shows the total.
+
+`--no-write` disables caching too (skips deps-file write AND skips
+branch creation) — true dry-run mode for previewing without persistent
+side-effects. Re-running `discover-deps` always rewrites cache
+branches from scratch (target may have moved, AI resolutions may
+differ), so stale caches are not a concern.
 
 Round-trip behaviour to know about:
 

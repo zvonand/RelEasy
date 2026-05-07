@@ -690,6 +690,116 @@ def _unmet_deps(unit: FeatureUnit, state: PipelineState) -> list[str]:
     return unmet
 
 
+def _refresh_all_merge_status_from_github(
+    config: Config, state: PipelineState,
+) -> int:
+    """Promote any feature with an outstanding rebase PR to ``merged``
+    when GitHub now reports it as merged.
+
+    Broader than :func:`_refresh_dep_states_from_github`: that one only
+    refreshes deps referenced by units in the current run; this one
+    refreshes every tracked feature, so post-merge bookkeeping (the
+    ``merged_label`` sweep) doesn't miss merges that landed on PRs
+    nobody depends on.
+
+    Returns the number of features promoted in this pass.
+    """
+    refreshable = {"branch_created", "conflict", "needs_review"}
+    promoted = 0
+    for fid, fs in state.features.items():
+        if fs.status not in refreshable or not fs.rebase_pr_url:
+            continue
+        merged = is_pr_merged(config, fs.rebase_pr_url)
+        if not merged:
+            continue
+        fs.status = "merged"
+        fs.conflict_files = []
+        fs.failed_step_index = None
+        fs.partial_pr_count = None
+        promoted += 1
+    return promoted
+
+
+def _source_pr_urls(fs: FeatureState) -> list[str]:
+    """Source PR URLs the port was cherry-picked from.
+
+    Prefers ``pr_urls`` (populated for multi-PR groups) and falls back to
+    ``pr_url`` for singletons. Returns an empty list when neither is set.
+    """
+    if fs.pr_urls:
+        return list(fs.pr_urls)
+    if fs.pr_url:
+        return [fs.pr_url]
+    return []
+
+
+def _apply_merged_labels(config: Config, state: PipelineState) -> None:
+    """Apply ``config.merged_label`` to merged port PRs, strip from sources.
+
+    Idempotent across runs via the per-feature ``merged_label_applied``
+    flag: each merged unit is processed exactly once. No-op when
+    ``config.merged_label`` is unset, when ``push`` is off (we never write
+    to GitHub then), or when there are no newly-merged units to process.
+
+    Source-PR cleanup is best-effort and only touches PRs hosted on the
+    configured origin — source PRs on a different repo are skipped (we
+    never write outside origin).
+    """
+    label = config.merged_label
+    if not label or not config.push:
+        return
+
+    pending = [
+        (fid, fs) for fid, fs in state.features.items()
+        if fs.status == "merged"
+        and not fs.merged_label_applied
+        and fs.rebase_pr_url
+    ]
+    if not pending:
+        return
+
+    if not ensure_label(
+        config, label, config.merged_label_color,
+        f"Port merged into {state.base_branch or 'target'}",
+    ):
+        return
+
+    origin_slug = get_origin_repo_slug(config)
+
+    for fid, fs in pending:
+        rebase_number = _pr_number_from_url(fs.rebase_pr_url or "")
+        if rebase_number is None:
+            continue
+        if not add_label_to_pr(config, rebase_number, label):
+            # Logged inside add_label_to_pr; skip the source-side work
+            # so we retry the whole unit on the next run.
+            continue
+        console.print(
+            f"  [green]✓[/green] Labelled merged port "
+            f"[cyan]{fid}[/cyan] (#{rebase_number}) with [cyan]{label}[/cyan]"
+        )
+
+        for src_url in _source_pr_urls(fs):
+            parsed = parse_pr_url(src_url)
+            if parsed is None:
+                continue
+            owner, repo, src_number = parsed
+            src_slug = f"{owner}/{repo}"
+            if origin_slug and src_slug != origin_slug:
+                console.print(
+                    f"    [dim]source #{src_number} on {src_slug}: "
+                    f"skipped — not on origin[/dim]"
+                )
+                continue
+            if remove_label_from_pr(config, src_number, label):
+                console.print(
+                    f"    [dim]stripped [cyan]{label}[/cyan] from "
+                    f"source #{src_number}[/dim]"
+                )
+
+        fs.merged_label_applied = True
+
+
 def _refresh_dep_states_from_github(
     config: Config, state: PipelineState, units: list[FeatureUnit],
 ) -> None:
@@ -735,6 +845,7 @@ def run_pipeline(
     resolve_conflicts: bool = True,
     retry_failed: bool = True,
     only: OnlyFilter | None = None,
+    force_merge: bool = False,
 ) -> PipelineState:
     """Port PRs onto ``origin/<base_branch>``.
 
@@ -862,6 +973,12 @@ def run_pipeline(
     # the next run — wasting tokens and risking a transient False that
     # leaves a now-mergeable dep stuck blocked.
     _refresh_dep_states_from_github(config, state, units)
+    # Catch ports merged externally since the previous run so the
+    # ``merged_label`` sweep below can apply / strip the configured label.
+    # Cheap when ``merged_label`` is unset (the call is still useful to
+    # keep the state file's ``status`` accurate for ``releasy status``).
+    _refresh_all_merge_status_from_github(config, state)
+    _apply_merged_labels(config, state)
     _persist_state(config, state)
 
     existing_ids = {f.id for f in config.features}
@@ -869,6 +986,20 @@ def run_pipeline(
         if unit.feature_id in existing_ids:
             continue
         existing_ids.add(unit.feature_id)
+        # Skip units already in a terminal state on the local state file —
+        # ``merged`` (port already shipped, no work left to do) or ``skipped``
+        # (user opted out). Without this, a re-run after `releasy import`
+        # or after the merged-status sweep promoted a unit would re-cherry-
+        # pick source PRs whose port is already merged.
+        prev_fs = state.features.get(unit.feature_id)
+        if prev_fs is not None and prev_fs.status in ("merged", "skipped"):
+            primary = unit.primary_pr()
+            origin_slug = get_origin_repo_slug(config)
+            ref = pr_ref_label(primary.repo_slug, primary.number, origin_slug)
+            console.print(
+                f"  [dim]{unit.feature_id} ({ref}) — {prev_fs.status}, skipping[/dim]"
+            )
+            continue
         # _process_feature_unit always returns "continue" — unresolved
         # conflicts are now handled in-place (drop the branch or open a
         # draft PR), and the pipeline keeps moving so a single bad PR
@@ -876,6 +1007,7 @@ def run_pipeline(
         _process_feature_unit(
             config, repo_path, state, unit, base_branch, base_ref, onto,
             remote, ai_active, retry_failed=retry_failed,
+            force_merge=force_merge,
         )
 
     state.phase = "ports_done"
@@ -919,6 +1051,7 @@ def run_sequential(
     resolve_conflicts: bool = True,
     retry_failed: bool = True,
     only: OnlyFilter | None = None,
+    force_merge: bool = False,
 ) -> PipelineState:
     """Process the merged-time-sorted PR queue one PR per invocation.
 
@@ -1050,6 +1183,12 @@ def run_sequential(
             )
             raise SystemExit(2)
 
+    # Pick up ports that merged externally since the last run so the
+    # ``merged_label`` sweep below has accurate state to work from.
+    _refresh_all_merge_status_from_github(config, state)
+    _apply_merged_labels(config, state)
+    _persist_state(config, state)
+
     if not units:
         console.print("\n  [dim]No PRs to process after filtering[/dim]")
         state.phase = "ports_done"
@@ -1137,6 +1276,7 @@ def run_sequential(
             console.print(
                 f"    [green]✓[/green] PR merged — advancing the queue"
             )
+            _apply_merged_labels(config, state)
             _persist_state(config, state)
             continue
 
@@ -1166,6 +1306,7 @@ def run_sequential(
         _process_feature_unit(
             config, repo_path, state, unit, base_branch, base_ref, onto,
             remote, ai_active, retry_failed=retry_failed,
+            force_merge=force_merge,
         )
 
         # _process_feature_unit may have ended in either a clean port or
@@ -2106,6 +2247,123 @@ def _next_free_renumbered_port_branch(
         n += 1
 
 
+def _refresh_existing_pr_unit(
+    config: Config,
+    repo_path: Path,
+    state: PipelineState,
+    unit: FeatureUnit,
+    prev_state: FeatureState,
+    new_branch: str,
+    base_branch: str,
+    remote: str,
+    ai_active: bool,
+    force_merge: bool,
+) -> None:
+    """Update an existing rebase PR's branch by merging target — never rebuild.
+
+    Once a unit has an open rebase PR on origin, ``releasy run`` stops
+    treating ``if_exists: recreate`` as "rebuild the branch from base"
+    and instead runs the same merge-target-into-PR-branch flow that
+    ``releasy refresh`` uses: leave the PR alone when the merge is
+    clean, AI-resolve and (non-force) push when it conflicts. Force
+    pushes that would clobber the PR's history are off the table here.
+
+    ``force_merge=True`` (the ``--merge-target`` flag) flips the
+    no-conflict path to "push the merge commit anyway", so a single
+    invocation can ingest the latest target tip into every PR branch.
+    """
+    from releasy.refresh import (
+        _record_conflict,
+        _synthesise_source_pr,
+        run_merge_resolve,
+    )
+
+    label = (
+        f"group {unit.group_id} ({len(unit.prs)} PRs)"
+        if unit.is_group
+        else (
+            f"PR #{unit.primary_pr().number}: "
+            f"{unit.primary_pr().title}"
+        )
+    )
+    rebase_label = (
+        prev_state.rebase_pr_url.rsplit("/", 1)[-1]
+        if prev_state.rebase_pr_url else "?"
+    )
+    note = " [dim](--merge-target)[/dim]" if force_merge else ""
+    console.print(
+        f"\n  [cyan]{new_branch}[/cyan]  "
+        f"[dim](rebase PR #{rebase_label} exists — merging "
+        f"{remote}/{base_branch} into branch{note}; "
+        "skipping cherry-pick rebuild)[/dim]"
+    )
+
+    source_pr = _synthesise_source_pr(prev_state)
+    if source_pr is None:
+        # We have a rebase_pr_url but the FeatureState has no source PR
+        # context (pr_url unset). Without it the AI resolver prompt has
+        # nothing to ground on; flag conflict if AI resolution would
+        # have been needed, but for a clean merge we can still proceed
+        # without a source_pr — fall through to a synthetic placeholder
+        # PRInfo so run_merge_resolve doesn't crash.
+        primary = unit.primary_pr()
+        source_pr = PRInfo(
+            number=primary.number,
+            title=primary.title,
+            body=primary.body,
+            state="merged",
+            merge_commit_sha=primary.merge_commit_sha,
+            head_sha=primary.head_sha,
+            url=primary.url,
+            repo_slug=primary.repo_slug,
+        )
+
+    outcome = run_merge_resolve(
+        config, repo_path,
+        head_branch=new_branch,
+        base_branch=base_branch,
+        source_pr=source_pr,
+        rebase_pr_url=prev_state.rebase_pr_url,
+        ai_active=ai_active,
+        remote=remote,
+        force_merge=force_merge,
+    )
+
+    fs = prev_state
+
+    if outcome.ai_cost_usd is not None:
+        prior = fs.ai_cost_usd or 0.0
+        fs.ai_cost_usd = prior + outcome.ai_cost_usd
+
+    if outcome.status == "clean":
+        if fs.status == "conflict" and fs.conflict_files:
+            fs.conflict_files = []
+            _persist_state(config, state)
+        return
+
+    if outcome.status == "skipped":
+        if outcome.ai_cost_usd is not None:
+            _persist_state(config, state)
+        return
+
+    if outcome.status == "conflict":
+        _record_conflict(config, state, fs, outcome.conflict_files)
+        return
+
+    # outcome.status == "resolved"
+    fs.conflict_files = []
+    if fs.status == "conflict":
+        fs.status = "needs_review"
+        fs.failed_step_index = None
+        fs.partial_pr_count = None
+    if outcome.ai_used:
+        fs.ai_resolved = True
+        if outcome.ai_iterations:
+            prior = fs.ai_iterations or 0
+            fs.ai_iterations = prior + outcome.ai_iterations
+    _persist_state(config, state)
+
+
 def _process_feature_unit(
     config: Config,
     repo_path: Path,
@@ -2117,6 +2375,7 @@ def _process_feature_unit(
     remote: str,
     ai_active: bool,
     retry_failed: bool = True,
+    force_merge: bool = False,
 ) -> str:
     """Process one feature unit (single PR or sequential group).
 
@@ -2236,6 +2495,28 @@ def _process_feature_unit(
 
     on_remote = remote_branch_exists(repo_path, new_branch, remote)
     on_local = local_branch_exists(repo_path, new_branch)
+
+    # --- Existing rebase PR → never rebuild from base ---
+    # Once a unit has an open rebase PR on origin, ``if_exists: recreate``
+    # stops meaning "rebuild from base"; we instead run the same
+    # merge-target-into-branch flow ``releasy refresh`` uses, preserving
+    # the PR's history. ``if_exists: append`` is the only setting that
+    # still touches the existing branch — the user explicitly asked to
+    # cherry-pick new PRs on top, which append handles below.
+    if (
+        on_remote
+        and prev_state is not None
+        and prev_state.rebase_pr_url
+        and unit.if_exists != "append"
+        and not rebase_pr_was_closed_without_merge(
+            config, prev_state.rebase_pr_url,
+        )
+    ):
+        _refresh_existing_pr_unit(
+            config, repo_path, state, unit, prev_state, new_branch,
+            base_branch, remote, ai_active, force_merge,
+        )
+        return "continue"
 
     # --- if_exists: append ---
     # ``cherry_pick_base`` defaults to ``base_ref`` for the from-scratch
@@ -2416,6 +2697,16 @@ def _process_feature_unit(
             )
             return "continue"
 
+        if outcome.kind == "already_applied":
+            # Every PR in the unit was already in target — port branch
+            # ended up empty. Mark feature ``skipped`` with reason and
+            # drop the empty branch instead of pushing / opening a PR.
+            _handle_already_in_target(
+                config, repo_path, state, unit, new_branch, base_ref,
+                outcome.already_in_target_urls, onto, pr_meta,
+            )
+            return "continue"
+
         if outcome.kind == "missing_prereqs":
             # Either label-and-stop (detection-only) or dive deeper.
             should_dive, exit_reason = _decide_prereq_dive(
@@ -2508,7 +2799,13 @@ class _CherryPickOutcome:
 
     ``kind`` is one of:
       * ``"success"`` — every PR in ``unit.prs`` was cherry-picked cleanly
-        (possibly via AI). No other fields are populated.
+        (possibly via AI). ``already_in_target_urls`` lists any PRs that
+        git reported as "now empty" mid-loop (already in target, ``--skip``'d
+        and not part of the resulting commit count) — informational only.
+      * ``"already_applied"`` — every PR in the unit was already in target,
+        the port branch ended up empty. ``already_in_target_urls`` lists
+        all of them. The caller drops the empty branch and marks the
+        feature ``skipped`` with a reason rather than opening a PR.
       * ``"unresolved"`` — a conflict on PR ``failed_idx`` could not be
         resolved by the AI (or AI is disabled). ``failed_pr`` and
         ``conflict_files`` are populated.
@@ -2523,6 +2820,7 @@ class _CherryPickOutcome:
     conflict_files: list[str] = field(default_factory=list)
     missing_prereq_prs: list[str] = field(default_factory=list)
     missing_prereq_note: str | None = None
+    already_in_target_urls: list[str] = field(default_factory=list)
 
 
 def _attempt_cherry_picks(
@@ -2544,6 +2842,9 @@ def _attempt_cherry_picks(
     the ``if_exists: append`` path, where the existing port branch
     already has those commits applied from a prior run.
     """
+    already_in_target: list[str] = []
+    real_pick_count = 0
+
     for idx, pr in enumerate(unit.prs):
         ref = pr_ref_label(pr.repo_slug, pr.number, origin_slug)
         if pr.url in unit.applied_pr_urls:
@@ -2571,6 +2872,20 @@ def _attempt_cherry_picks(
 
         if cp_result.success:
             _tag_commit_with_source_pr(repo_path, unit, pr, origin_slug)
+            real_pick_count += 1
+            continue
+
+        # Already-in-target: git reported "previous cherry-pick is now
+        # empty" — the patch is reachable from target via some other path
+        # (sibling backport, prior port, squash). cherry_pick_sha already
+        # ran ``--skip`` to drop it, so the working tree is clean and we
+        # can move on. No AI call, no conflict markers.
+        if cp_result.already_applied:
+            console.print(
+                f"    [dim]↳ {ref} already in target — skipped "
+                "(empty cherry-pick)[/dim]"
+            )
+            already_in_target.append(pr.url)
             continue
 
         # --- Conflict path on this PR ---
@@ -2621,6 +2936,7 @@ def _attempt_cherry_picks(
 
         if ai_outcome is not None and ai_outcome.handled:
             _tag_commit_with_source_pr(repo_path, unit, pr, origin_slug)
+            real_pick_count += 1
             continue
 
         if ai_outcome is not None and ai_outcome.missing_prereq_prs:
@@ -2640,7 +2956,18 @@ def _attempt_cherry_picks(
             conflict_files=cp_result.conflict_files,
         )
 
-    return _CherryPickOutcome(kind="success")
+    # Loop completed without hitting a real conflict. If every PR landed
+    # as a no-op (empty cherry-pick → ``--skip``'d), the port branch is
+    # empty: signal this so the caller can mark the feature ``skipped``
+    # with reason rather than push and open a PR with zero commits.
+    if real_pick_count == 0 and already_in_target:
+        return _CherryPickOutcome(
+            kind="already_applied",
+            already_in_target_urls=already_in_target,
+        )
+    return _CherryPickOutcome(
+        kind="success", already_in_target_urls=already_in_target,
+    )
 
 
 def _decide_prereq_dive(
@@ -3494,6 +3821,60 @@ def _handle_missing_prereqs_no_dive(
     # not the auto-recovery roll-back path.
 
 
+def _handle_already_in_target(
+    config: Config,
+    repo_path: Path,
+    state: PipelineState,
+    unit: FeatureUnit,
+    new_branch: str,
+    base_ref: str,
+    already_in_target_urls: list[str],
+    onto: str,
+    pr_meta: dict,
+) -> None:
+    """Cleanup for a unit whose every PR was already in target.
+
+    The port branch was created off ``base_ref`` and ended up empty after
+    every cherry-pick was ``--skip``'d as "now empty". Drop the empty
+    branch and record the feature as ``skipped`` with a reason — so
+    ``releasy status`` makes clear no port was needed and ``releasy
+    continue`` won't try to re-pick it.
+    """
+    origin_slug = get_origin_repo_slug(config)
+
+    # Defensive: if anything is somehow still in-progress (shouldn't be,
+    # since cherry_pick_sha already --skip'd), wind it down.
+    if is_operation_in_progress(repo_path):
+        run_git(["cherry-pick", "--abort"], repo_path, check=False)
+        run_git(["merge", "--abort"], repo_path, check=False)
+        run_git(["rebase", "--abort"], repo_path, check=False)
+
+    if local_branch_exists(repo_path, new_branch):
+        run_git(["checkout", "--detach", base_ref], repo_path, check=False)
+        run_git(["branch", "-D", new_branch], repo_path, check=False)
+
+    refs = ", ".join(
+        pr_ref_label(pr.repo_slug, pr.number, origin_slug)
+        for pr in unit.prs if pr.url in set(already_in_target_urls)
+    ) or "(none)"
+    reason = f"already in target — empty cherry-pick ({refs})"
+
+    console.print(
+        f"    [green]✓[/green] Skipped [cyan]{unit.feature_id}[/cyan]: "
+        f"{reason}"
+    )
+
+    state.features[unit.feature_id] = FeatureState(
+        status="skipped",
+        branch_name=None,
+        base_commit=onto,
+        ai_cost_usd=unit.ai_cost_usd_total,
+        skip_reason=reason,
+        **pr_meta,
+    )
+    _persist_state(config, state)
+
+
 def _handle_unresolved_conflict(
     config: Config,
     repo_path: Path,
@@ -4088,6 +4469,13 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
         f"\n[bold]Continuing[/bold] — base [cyan]{base_branch}[/cyan]"
     )
 
+    # Pick up ports merged externally since the last run; ``continue``
+    # is the natural place to reconcile, so apply the merged_label sweep
+    # here as well.
+    _refresh_all_merge_status_from_github(config, state)
+    _apply_merged_labels(config, state)
+    _persist_state(config, state)
+
     any_unresolved = False
     for feat_id, fs in state.features.items():
         branch = fs.branch_name or feat_id
@@ -4321,6 +4709,207 @@ def abort_run(config: Config) -> None:
     _persist_state(config, state)
 
 
+# Statuses that represent purely-local damage (no rebase PR, never merged).
+# `clear` only touches features in these states.
+_CLEARABLE_STATUSES: tuple[str, ...] = ("conflict", "branch_created")
+
+
+def _resolve_clear_target(
+    config: Config, state: PipelineState, ident: str,
+) -> tuple[str, FeatureState] | None:
+    """Resolve any of: feature ID, branch name, source-PR number, source-PR URL.
+
+    Returns ``(feature_id, FeatureState)`` for an entry that exists in
+    state, or ``None`` if nothing matches. Unlike :func:`_resolve_branch_target`,
+    this only succeeds when state actually tracks the feature — `clear`
+    has nothing to do for features releasy has never touched.
+    """
+    feat = _resolve_branch_target(config, state, ident)
+    if feat is not None and feat.id in state.features:
+        return feat.id, state.features[feat.id]
+
+    if ident.isdigit():
+        n = int(ident)
+        for fid, fs in state.features.items():
+            if fs.pr_number == n or n in fs.pr_numbers:
+                return fid, fs
+
+    if parse_pr_url(ident) is not None:
+        norm = ident.rstrip("/")
+        for fid, fs in state.features.items():
+            if fs.pr_url and fs.pr_url.rstrip("/") == norm:
+                return fid, fs
+            if any(u.rstrip("/") == norm for u in fs.pr_urls):
+                return fid, fs
+
+    return None
+
+
+def _clear_one_feature(
+    config: Config,
+    state: PipelineState,
+    feat_id: str,
+    fs: FeatureState,
+    work_dir: Path | None,
+    dry_run: bool,
+) -> bool:
+    """Wipe one feature's local artifacts and drop its state entry.
+
+    Caller must have already vetted ``fs.rebase_pr_url`` is empty.
+    Mutates ``state.features`` (pops the entry) but does NOT persist —
+    callers persist once at the end (so multi-clear is one save).
+    """
+    branch = fs.branch_name
+    work = config.resolve_work_dir(work_dir)
+    repo_path = work if (work / ".git").exists() else work / "repo"
+    repo_ok = (repo_path / ".git").exists()
+
+    plan: list[str] = []
+    op_in_progress = repo_ok and is_operation_in_progress(repo_path)
+    if op_in_progress:
+        plan.append("abort in-progress git operation")
+    if branch and repo_ok and local_branch_exists(repo_path, branch):
+        plan.append(f"delete local branch {branch}")
+    plan.append(f"drop state entry for {feat_id}")
+
+    label = f"[cyan]{feat_id}[/cyan]" + (
+        f" (branch [cyan]{branch}[/cyan])" if branch else ""
+    )
+    prefix = "[yellow]Would clear[/yellow]" if dry_run else "[yellow]Clearing[/yellow]"
+    console.print(f"{prefix} {label}")
+    for step in plan:
+        console.print(f"  • {step}")
+
+    if dry_run:
+        return True
+
+    if repo_ok:
+        if op_in_progress:
+            kind = abort_in_progress_op(repo_path)
+            if kind:
+                console.print(f"  [green]✓[/green] aborted {kind}")
+
+        if branch and local_branch_exists(repo_path, branch):
+            head = run_git(
+                ["rev-parse", "--abbrev-ref", "HEAD"], repo_path, check=False,
+            )
+            on_branch = head.returncode == 0 and head.stdout.strip() == branch
+            if on_branch:
+                # Detach so we can delete the branch we're sitting on.
+                base = state.base_branch or config.target_branch or "HEAD"
+                run_git(["checkout", "--detach", base], repo_path, check=False)
+
+            del_res = run_git(["branch", "-D", branch], repo_path, check=False)
+            if del_res.returncode == 0:
+                console.print(
+                    f"  [green]✓[/green] deleted local branch [cyan]{branch}[/cyan]"
+                )
+            else:
+                console.print(
+                    f"  [red]✗[/red] could not delete branch {branch}: "
+                    f"{del_res.stderr.strip() or 'unknown error'}"
+                )
+                return False
+
+    state.features.pop(feat_id, None)
+    console.print(f"  [green]✓[/green] state entry removed")
+    return True
+
+
+def clear_branch(
+    config: Config,
+    identifier: str,
+    work_dir: Path | None = None,
+    dry_run: bool = False,
+) -> bool:
+    """Clean up local artifacts for one feature that never made it to a PR.
+
+    Refuses to touch a feature whose ``rebase_pr_url`` is set — those are
+    user-visible on GitHub and outside the scope of `clear`.
+    """
+    state = load_state(config)
+    resolved = _resolve_clear_target(config, state, identifier)
+    if resolved is None:
+        console.print(
+            f"[red]Unknown feature / branch / PR: {identifier}[/red]\n"
+            f"  Run `releasy status` to see tracked feature IDs."
+        )
+        return False
+    feat_id, fs = resolved
+
+    if fs.rebase_pr_url:
+        console.print(
+            f"[yellow]Feature [cyan]{feat_id}[/cyan] has an open rebase PR — "
+            f"refusing to clear.[/yellow]\n"
+            f"  PR: {fs.rebase_pr_url}\n"
+            f"  `clear` only removes never-merged local artifacts. "
+            f"Close the PR on GitHub first if you really want it gone."
+        )
+        return False
+
+    ok = _clear_one_feature(config, state, feat_id, fs, work_dir, dry_run)
+    if not dry_run and ok:
+        _persist_state(config, state)
+    return ok
+
+
+def clear_all_dirty(
+    config: Config,
+    work_dir: Path | None = None,
+    dry_run: bool = False,
+    assume_yes: bool = False,
+) -> bool:
+    """Clean every feature in a local-only damaged state.
+
+    Selects features where ``rebase_pr_url`` is empty and status is in
+    :data:`_CLEARABLE_STATUSES`. Confirms interactively unless
+    ``assume_yes`` or ``dry_run``.
+    """
+    import click
+
+    state = load_state(config)
+    targets: list[tuple[str, FeatureState]] = [
+        (fid, fs)
+        for fid, fs in state.features.items()
+        if not fs.rebase_pr_url and fs.status in _CLEARABLE_STATUSES
+    ]
+
+    if not targets:
+        console.print(
+            "[dim]Nothing to clear — no local-only damaged features in state.[/dim]"
+        )
+        return True
+
+    console.print(
+        f"[yellow]Found {len(targets)} local-only damaged feature(s):[/yellow]"
+    )
+    for fid, fs in targets:
+        branch = fs.branch_name or "(no branch recorded)"
+        console.print(
+            f"  [cyan]{fid}[/cyan]  status=[red]{fs.status}[/red]  branch={branch}"
+        )
+
+    if dry_run:
+        console.print()
+        for fid, fs in targets:
+            _clear_one_feature(config, state, fid, fs, work_dir, dry_run=True)
+        console.print("[dim]--dry-run: nothing changed.[/dim]")
+        return True
+
+    if not assume_yes and not click.confirm(
+        "Proceed with clearing all of these?", default=False,
+    ):
+        console.print("[dim]Aborted, nothing changed.[/dim]")
+        return False
+
+    all_ok = True
+    for fid, fs in targets:
+        if not _clear_one_feature(config, state, fid, fs, work_dir, dry_run=False):
+            all_ok = False
+    _persist_state(config, state)
+    return all_ok
+
+
 def print_status(config: Config) -> None:
     """Print the current pipeline state, grouped by status.
 
@@ -4405,6 +4994,8 @@ def print_status(config: Config) -> None:
             table.add_column("Conflict Files", style="red")
         if status == "blocked":
             table.add_column("Blocked By", style="yellow")
+        if status == "skipped":
+            table.add_column("Reason", style="yellow")
         for fid, fs in rows:
             feat = next((f for f in config.features if f.id == fid), None)
             label = fs.branch_name or (feat.source_branch if feat else None) or fid
@@ -4436,6 +5027,8 @@ def print_status(config: Config) -> None:
                     dep_status = dep_fs.status if dep_fs else "unknown"
                     blockers.append(f"{dep_id} ({dep_status})")
                 row.append(", ".join(blockers))
+            if status == "skipped":
+                row.append(fs.skip_reason or "")
             table.add_row(*row)
         console.print()
         console.print(table)

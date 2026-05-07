@@ -10,12 +10,18 @@ After ``releasy run`` opens a batch of rebase PRs, the target branch
 will eventually conflict with the new tip even though they were clean
 when first opened. That's what this command exists for:
 
-1. Iterate every tracked PR (entries in ``state.features`` that have a
-   ``rebase_pr_url`` and a live ``branch_name``). No discovery, no new
-   entries, no new PRs.
-2. Fetch the latest tips of the target branch and the PR branch from
+1. Promote any tracked PR whose rebase PR has merged on GitHub since
+   the last run to ``status: merged`` (one cheap GraphQL call per
+   tracked unit), and run the configured ``merged_label`` sweep —
+   apply the label to the merged port PR, strip it from the source
+   PRs the port was cherry-picked from. Idempotent across runs via
+   the ``merged_label_applied`` flag.
+2. Iterate every still-active tracked PR (entries in ``state.features``
+   that have a ``rebase_pr_url`` + ``branch_name`` and aren't already
+   ``merged`` / ``skipped``). No discovery, no new entries, no new PRs.
+3. Fetch the latest tips of the target branch and the PR branch from
    origin (so we don't operate on a stale local copy).
-3. Attempt ``git merge --no-ff origin/<base_branch>`` into the PR branch.
+4. Attempt ``git merge --no-ff origin/<base_branch>`` into the PR branch.
    - Clean merge → leave the PR alone (we only act on conflicts).
    - Conflict → invoke the same AI resolver used for cherry-picks (with
      the merge-flavoured prompt) and, on success, push the resolved
@@ -157,6 +163,7 @@ def refresh_tracked_prs(
     work_dir: Path | None = None,
     resolve_conflicts: bool = True,
     only: OnlyFilter | None = None,
+    force_merge: bool = False,
 ) -> bool:
     """Walk tracked PRs, merge target into each, AI-resolve any conflicts.
 
@@ -173,7 +180,11 @@ def refresh_tracked_prs(
     """
     # Late import to avoid a cycle: pipeline imports nothing from here,
     # but it owns the shared repo-setup helper we want to reuse.
-    from releasy.pipeline import _setup_repo
+    from releasy.pipeline import (
+        _apply_merged_labels,
+        _refresh_all_merge_status_from_github,
+        _setup_repo,
+    )
 
     state = load_state(config)
     if not state.features:
@@ -230,6 +241,15 @@ def refresh_tracked_prs(
         )
         console.print(f"[dim]AI conflict resolver: {why}[/dim]")
 
+    # Catch ports merged externally since the previous run, then apply
+    # the configured merged_label (if any) — same post-merge bookkeeping
+    # the main pipeline does. Refresh is the natural home for it: this
+    # command runs on a schedule, while ``releasy run`` only runs when
+    # the user wants to port more work.
+    _refresh_all_merge_status_from_github(config, state)
+    _apply_merged_labels(config, state)
+    _persist(config, state)
+
     console.print(
         f"\n[bold]Phase:[/bold] Merging [cyan]{base_ref}[/cyan] "
         f"into tracked PR branches"
@@ -237,7 +257,7 @@ def refresh_tracked_prs(
 
     candidates: list[tuple[str, FeatureState]] = []
     for fid, fs in state.features.items():
-        if fs.status == "skipped":
+        if fs.status in ("skipped", "merged"):
             continue
         if not fs.branch_name or not fs.rebase_pr_url:
             continue
@@ -268,7 +288,7 @@ def refresh_tracked_prs(
     for fid, fs in candidates:
         outcome = _process_one(
             config, repo_path, state, fid, fs, base_branch, base_ref,
-            remote, ai_active,
+            remote, ai_active, force_merge=force_merge,
         )
         if outcome == "conflict":
             any_unresolved = True
@@ -302,6 +322,11 @@ class MergeResolveOutcome:
     ``releasy resolve-conflicts`` (URL-driven, possibly stateless).
     Callers translate ``status`` + cost / iteration counters into
     whatever bookkeeping they own.
+
+    ``ai_used`` distinguishes a clean ``--merge-target`` push (no AI
+    involvement) from a conflict the AI resolver fixed: both end up as
+    ``status="resolved"``, but only the latter should bump
+    ``ai_resolved`` / ``ai_iterations`` on the FeatureState.
     """
     status: str  # "clean" | "resolved" | "conflict" | "skipped"
     conflict_files: list[str] = field(default_factory=list)
@@ -309,6 +334,7 @@ class MergeResolveOutcome:
     ai_cost_usd: float | None = None
     pushed: bool = False
     error: str | None = None
+    ai_used: bool = False
 
 
 def run_merge_resolve(
@@ -321,6 +347,7 @@ def run_merge_resolve(
     rebase_pr_url: str | None,
     ai_active: bool,
     remote: str | None = None,
+    force_merge: bool = False,
 ) -> MergeResolveOutcome:
     """Drive merge + (optional) AI resolve for ONE PR branch.
 
@@ -336,10 +363,17 @@ def run_merge_resolve(
     Postconditions:
       * On ``"resolved"``: merge commit pushed to origin/<head_branch>.
       * On ``"clean"``: working tree reset to head_branch's original
-        tip — we deliberately don't push clean merges (use GitHub's
-        "Update branch" button if you want a fresh merge commit).
+        tip — we deliberately don't push clean merges (use the
+        ``force_merge`` flag if you want a fresh merge commit even
+        without conflicts).
       * On ``"conflict"`` / ``"skipped"``: working tree reset to the
         original tip; nothing pushed.
+
+    ``force_merge`` (the ``--merge-target`` flag) flips the clean-merge
+    path to "push the merge commit anyway" — useful when you want every
+    PR branch to ingest the latest target tip even though it would
+    cherry-pick cleanly. AI resolution still kicks in for actual
+    conflicts.
     """
     if remote is None:
         remote = config.origin.remote_name
@@ -382,10 +416,34 @@ def run_merge_resolve(
         )
         new_head = new_sha.stdout.strip() if new_sha.returncode == 0 else start_sha
         if new_head != start_sha:
+            if force_merge:
+                push = run_git(
+                    ["push", remote, head_branch], repo_path, check=False,
+                )
+                if push.returncode != 0:
+                    console.print(
+                        "    [yellow]![/yellow] clean merge produced "
+                        "locally but push failed (origin moved? auth?). "
+                        "Re-run to retry."
+                    )
+                    for line in (push.stderr or "").strip().splitlines()[:3]:
+                        console.print(f"      [dim]{line}[/dim]")
+                    run_git(
+                        ["reset", "--hard", start_sha], repo_path, check=False,
+                    )
+                    return MergeResolveOutcome(
+                        status="skipped",
+                        error=f"push failed: {(push.stderr or '').strip()}",
+                    )
+                console.print(
+                    f"    [green]✓[/green] clean merge pushed "
+                    f"[cyan]{head_branch}[/cyan] [dim](--merge-target)[/dim]"
+                )
+                return MergeResolveOutcome(status="resolved", pushed=True)
             console.print(
                 "    [dim]clean merge — no conflicts, leaving the PR "
-                "untouched (use the GitHub 'Update branch' button to "
-                "publish a fresh merge if you want one)[/dim]"
+                "untouched (pass --merge-target to push a fresh merge "
+                "commit anyway)[/dim]"
             )
             run_git(["reset", "--hard", start_sha], repo_path, check=False)
         else:
@@ -500,6 +558,7 @@ def run_merge_resolve(
         ai_iterations=result.iterations,
         ai_cost_usd=result.cost_usd,
         pushed=True,
+        ai_used=True,
     )
 
 
@@ -513,6 +572,8 @@ def _process_one(
     base_ref: str,
     remote: str,
     ai_active: bool,
+    *,
+    force_merge: bool = False,
 ) -> str:
     """Drive merge + (optional) AI resolve for ONE state-tracked PR.
 
@@ -554,6 +615,7 @@ def _process_one(
         rebase_pr_url=fs.rebase_pr_url,
         ai_active=ai_active,
         remote=remote,
+        force_merge=force_merge,
     )
 
     # Cost is billed even when the resolve failed — accumulate before
@@ -592,10 +654,11 @@ def _process_one(
         # state — once the PR is mergeable they no longer apply.
         fs.failed_step_index = None
         fs.partial_pr_count = None
-    fs.ai_resolved = True
-    if outcome.ai_iterations:
-        prior = fs.ai_iterations or 0
-        fs.ai_iterations = prior + outcome.ai_iterations
+    if outcome.ai_used:
+        fs.ai_resolved = True
+        if outcome.ai_iterations:
+            prior = fs.ai_iterations or 0
+            fs.ai_iterations = prior + outcome.ai_iterations
     _persist(config, state)
     return "resolved"
 
@@ -736,6 +799,7 @@ def resolve_conflicts_for_pr(
     work_dir: Path | None = None,
     *,
     resolve_conflicts: bool = True,
+    force_merge: bool = False,
 ) -> bool:
     """Drive ``releasy resolve-conflicts --pr <url>`` end-to-end.
 
@@ -852,6 +916,7 @@ def resolve_conflicts_for_pr(
         rebase_pr_url=rebase_pr.url,
         ai_active=ai_active,
         remote=remote,
+        force_merge=force_merge,
     )
 
     # Optional state sync: if a state file is around AND a tracked
@@ -914,10 +979,11 @@ def _maybe_update_tracked_state(
             matched.status = "needs_review"
             matched.failed_step_index = None
             matched.partial_pr_count = None
-        matched.ai_resolved = True
-        if outcome.ai_iterations:
-            prior = matched.ai_iterations or 0
-            matched.ai_iterations = prior + outcome.ai_iterations
+        if outcome.ai_used:
+            matched.ai_resolved = True
+            if outcome.ai_iterations:
+                prior = matched.ai_iterations or 0
+                matched.ai_iterations = prior + outcome.ai_iterations
         _persist(config, state)
         return
 

@@ -84,6 +84,28 @@ name: antalya-26.3
 #                     it.
 # update_existing_prs: false
 
+# ── Merged-port label (optional) ────────────────────────────────────
+# When set, releasy applies this label to the rebase (port) PR once it
+# has been merged into target_branch, and strips the same label from
+# every source PR the port was cherry-picked from. Useful for marking
+# "this PR has been ported into release X" with a single label that
+# moves automatically as ports land.
+#
+# Source-PR cleanup is best-effort and only touches PRs hosted on the
+# configured origin — source PRs on a different repo are skipped (RelEasy
+# never writes outside origin). The label is auto-created on origin the
+# first time a merged port is observed.
+#
+# Each tracked unit is processed exactly once: a per-feature flag on
+# the state file (`merged_label_applied`) prevents re-hitting GitHub on
+# every subsequent `releasy run`. Renaming the label here does NOT
+# auto-relabel previously-processed units.
+#
+# Requires push: true to take effect. Unset / empty disables the feature.
+# merged_label: port-antalya
+# merged_label_color: "8B5CF6"   # 6-hex color used when releasy creates
+#                                #   the label on origin (default: purple).
+
 # ── Work directory ──────────────────────────────────────────────────
 # Where to clone/find the origin repo for git operations.
 # If it points to an existing git repo, it will be reused (no clone).
@@ -135,7 +157,8 @@ target_branch: antalya-26.3
 #
 # pr_policy:
 #   if_exists: skip
-#     # When the port branch already exists locally:
+#     # When the port branch already exists locally AND no rebase PR has
+#     # been opened for it yet:
 #     # "skip"     (default) — leave the local branch alone; don't re-process.
 #     #                        Also: refuse to start if a cherry-pick / merge
 #     #                        / rebase is still in progress in the work dir.
@@ -157,11 +180,22 @@ target_branch: antalya-26.3
 #     #                        there's nothing to top up). The remote-already-
 #     #                        exists safety lock is bypassed in this mode
 #     #                        since appending is the explicit user opt-in.
-#     # Note: if the branch already exists on the REMOTE it is ALWAYS skipped
-#     # in "skip"/"recreate" modes (resolve those manually so you don't
-#     # clobber someone else's work). Individual session entries
-#     # (pr_sources.by_labels[] / pr_sources.groups[]) can override this
-#     # default per-entry with their own if_exists.
+#     #
+#     # ONCE A REBASE PR IS OPEN: if_exists no longer controls whether the
+#     # branch is rebuilt — it never is. `releasy run` switches to
+#     # merging origin/<base> into the PR branch (the same flow
+#     # `releasy refresh` uses): clean merge → leave PR alone, conflict →
+#     # AI-resolve and plain push. Pass --merge-target on the CLI to
+#     # push a fresh merge commit even on clean merges. The only setting
+#     # that still touches an open PR's branch directly is `append`,
+#     # which cherry-picks newly declared PRs on top.
+#     #
+#     # Note: if the branch already exists on the REMOTE without a tracked
+#     # rebase PR, it is ALWAYS skipped in "skip"/"recreate" modes (resolve
+#     # those manually so you don't clobber someone else's work).
+#     # Individual session entries (pr_sources.by_labels[] /
+#     # pr_sources.groups[]) can override this default per-entry with
+#     # their own if_exists.
 #   auto_pr: true
 #     # When true (the default), every pushed port branch gets a PR opened
 #     # against the base. Set to false to push branches only and open PRs
@@ -169,13 +203,12 @@ target_branch: antalya-26.3
 #   retry_failed: true
 #     # When a PR unit has a `conflict` entry in state from a previous run:
 #     #   true (default) — process the unit again on this run, per the
-#     #                    unit's `if_exists` value (see above). The retry
-#     #                    does NOT override if_exists — it only decides
-#     #                    whether to revisit the unit at all. To force a
-#     #                    rebuild from base (the only thing that can blow
-#     #                    away existing port commits), the user must set
-#     #                    `if_exists: recreate` explicitly. Append-mode
-#     #                    units retry on top of the existing branch.
+#     #                    unit's `if_exists` value (see above). For units
+#     #                    WITHOUT an open rebase PR, retry can rebuild
+#     #                    from base (`recreate`), append, or skip per
+#     #                    if_exists. For units WITH an open rebase PR,
+#     #                    retry routes through merge-target instead —
+#     #                    an open PR's history is never blown away.
 #     #   false          — leave the conflicted entry exactly as-is; no
 #     #                    cherry-pick, no PR side-effects.
 #     # CLI flag `--retry-failed / --no-retry-failed` overrides per-invocation.

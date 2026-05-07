@@ -237,6 +237,17 @@ def cli(
          "units are dropped before any side-effects. Exits non-zero if "
          "nothing matches.",
 )
+@click.option(
+    "--merge-target/--no-merge-target",
+    "merge_target",
+    default=False,
+    help="For units whose rebase PR is already open: push a merge "
+         "commit of the latest target tip into the PR branch even when "
+         "there are no conflicts. Without this, RelEasy only touches an "
+         "existing PR's branch when target conflicts with it (and AI "
+         "resolves them). Never force-pushes — only fast-forward / "
+         "merge-commit pushes. Default: off.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -245,6 +256,7 @@ def run(
     resolve_conflicts: bool,
     retry_failed: bool | None,
     only: str | None,
+    merge_target: bool,
 ) -> None:
     """Discover and port new PRs onto the base branch (cherry-pick + open PR)."""
     from releasy.pipeline import parse_only, run_pipeline, run_sequential
@@ -274,6 +286,7 @@ def run(
                 resolve_conflicts=resolve_conflicts,
                 retry_failed=effective_retry_failed,
                 only=only_filter,
+                force_merge=merge_target,
             )
             return
 
@@ -282,6 +295,7 @@ def run(
             resolve_conflicts=resolve_conflicts,
             retry_failed=effective_retry_failed,
             only=only_filter,
+            force_merge=merge_target,
         )
 
         has_conflicts = any(
@@ -510,6 +524,60 @@ def abort(ctx: click.Context) -> None:
         abort_run(config)
 
 
+@cli.command(
+    short_help="Wipe local-only port artifacts (aborted cherry-picks, "
+               "damaged branches with no PR).",
+)
+@click.argument("identifier", required=False)
+@click.option(
+    "--work-dir", default=None,
+    help="Working directory for git operations (defaults to config).",
+)
+@click.option(
+    "--dry-run", is_flag=True, default=False,
+    help="Show what would be cleaned without changing anything.",
+)
+@click.option(
+    "--yes", "-y", "assume_yes", is_flag=True, default=False,
+    help="Skip the interactive confirmation in multi-clear mode.",
+)
+@click.pass_context
+def clear(
+    ctx: click.Context,
+    identifier: str | None,
+    work_dir: str | None,
+    dry_run: bool,
+    assume_yes: bool,
+) -> None:
+    """Wipe local-only port artifacts that never made it to a PR.
+
+    With IDENTIFIER (feature ID, branch name, source-PR number, or
+    source-PR URL), clears that one feature. Without it, scans state for
+    every feature in a damaged local-only state (``conflict`` or
+    ``branch_created`` with no rebase PR), shows the list, and clears
+    them after a confirmation prompt.
+
+    For each cleared feature: aborts any in-progress cherry-pick / merge /
+    rebase in the work-dir repo, force-deletes the local port branch,
+    and drops the state entry so the next ``releasy run`` starts fresh.
+
+    Refuses to touch a feature whose rebase PR is already open — those
+    are user-visible on GitHub and out of scope for ``clear``.
+    """
+    from releasy.pipeline import clear_all_dirty, clear_branch
+
+    with _locked_config(ctx, session="skip") as config:
+        wd = Path(work_dir) if work_dir else None
+        if identifier:
+            ok = clear_branch(config, identifier, wd, dry_run=dry_run)
+        else:
+            ok = clear_all_dirty(
+                config, wd, dry_run=dry_run, assume_yes=assume_yes,
+            )
+        if not ok:
+            raise SystemExit(1)
+
+
 @cli.command(short_help="Print current pipeline state (read-only).")
 @click.pass_context
 def status(ctx: click.Context) -> None:
@@ -549,7 +617,10 @@ def status(ctx: click.Context) -> None:
 )
 @click.option(
     "--no-ai", is_flag=True, default=False,
-    help="Skip Claude refinement; use deterministic git-graph deps as-is.",
+    help="Skip ALL Claude calls — both the lightweight refinement of "
+         "deterministic candidates and the heavyweight AI-resolver "
+         "fallback that runs when the deterministic mapping yields no "
+         "candidates. Use deterministic git-graph deps as-is.",
 )
 @click.option(
     "--max-depth", default=4, type=int, show_default=True,
@@ -692,18 +763,27 @@ def _print_discovery_summary(report) -> None:  # noqa: ANN001 — DiscoveryRepor
     if method_counts:
         # Show what came out of the trial-pick loop. ``trial-clean`` =
         # standalone unit; ``git-graph`` / ``git-graph+claude`` = had
-        # conflicts that got mapped to deps; ``depth-cutoff`` = recursion
-        # bound hit (deps incomplete).
-        ordered_keys = ["trial-clean", "git-graph", "git-graph+claude", "depth-cutoff"]
+        # conflicts that got mapped to deps; ``ai-resolve(-clean)`` =
+        # AI fallback resolved the conflict; ``depth-cutoff`` =
+        # recursion bound hit (deps incomplete).
+        ordered_keys = [
+            "trial-clean", "git-graph", "git-graph+claude",
+            "ai-resolve", "ai-resolve-clean", "depth-cutoff",
+        ]
         bits = []
         for k in ordered_keys:
             if method_counts.get(k):
                 bits.append(f"{method_counts[k]} {k}")
-        # Surface unrecognised methods if any (defensive).
         for k, v in method_counts.items():
             if k not in ordered_keys:
                 bits.append(f"{v} {k}")
         click.echo(f"  trial-picked: {' · '.join(bits)}")
+    cached_count = sum(1 for n in report.nodes if n.cached)
+    if cached_count:
+        click.echo(
+            f"  cached: {cached_count} port branch(es) preserved at "
+            f"feature/<base>/<unit_id> for `releasy run` to reuse"
+        )
     if to_pick == 0 and report.candidate_unit_count > 0:
         click.echo(
             "  (every candidate is already in target — deps overlay "
@@ -874,6 +954,16 @@ def import_cmd(ctx: click.Context) -> None:
          "Mutually exclusive with --pr and --stateless. "
          "Exits non-zero if nothing matches.",
 )
+@click.option(
+    "--merge-target/--no-merge-target",
+    "merge_target",
+    default=False,
+    help="Push a merge commit of the latest target tip into the PR "
+         "branch even when there are no conflicts. Without this, "
+         "RelEasy only touches the PR's branch when target conflicts "
+         "with it (and AI resolves them). Never force-pushes — only "
+         "fast-forward / merge-commit pushes. Default: off.",
+)
 @click.pass_context
 def refresh(
     ctx: click.Context,
@@ -888,6 +978,7 @@ def refresh(
     timeout_seconds: int | None,
     max_iterations_cli: int | None,
     only: str | None,
+    merge_target: bool,
 ) -> None:
     """Merge target branch into a PR (or every tracked PR), AI-resolve conflicts.
 
@@ -1054,6 +1145,7 @@ def refresh(
         config.stateless = True
         if not resolve_conflicts_for_pr(
             config, pr_url, wd, resolve_conflicts=ai_resolve_flag,
+            force_merge=merge_target,
         ):
             raise SystemExit(1)
         return
@@ -1063,7 +1155,7 @@ def refresh(
         with _locked_config(ctx, session="skip") as config:
             if not refresh_tracked_prs(
                 config, wd, resolve_conflicts=ai_resolve_flag,
-                only=only_filter,
+                only=only_filter, force_merge=merge_target,
             ):
                 raise SystemExit(1)
         return
@@ -1071,6 +1163,7 @@ def refresh(
     with _locked_config(ctx, session="skip") as config:
         if not resolve_conflicts_for_pr(
             config, pr_url, wd, resolve_conflicts=ai_resolve_flag,
+            force_merge=merge_target,
         ):
             raise SystemExit(1)
 

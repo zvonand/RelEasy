@@ -38,13 +38,16 @@ from pathlib import Path
 import yaml
 
 from releasy.ai_resolve import (
+    AIResolveContext,
     _MISSING_PREREQS_RE,
     _parse_missing_prereqs,
+    attempt_ai_resolve,
     synthesize_text,
 )
 from releasy.config import Config
 from releasy.git_ops import (
     abort_in_progress_op,
+    append_commit_trailer,
     cherry_pick_merge_commit,
     ensure_work_repo,
     fetch_remote,
@@ -74,6 +77,14 @@ class _PickOutcome:
     clean: bool
     conflict_files: list[str]
     error_message: str | None = None
+    # Index into ``unit.feature_unit.prs`` of the PR whose cherry-pick
+    # failed. ``None`` for clean outcomes or for failures that didn't
+    # reach a real cherry-pick (e.g. a PR with no merge_commit_sha).
+    conflicting_pr_idx: int | None = None
+    # Name of the local branch the cache was attempted on. Always set;
+    # the caller decides whether to keep or delete it based on outcome
+    # and AI fallback result.
+    cache_branch: str | None = None
 
 
 @dataclass
@@ -99,8 +110,17 @@ class DAGNode:
     pr_titles: list[str]
     earliest_merged_at: str | None
     deps: list[str]
-    discovery_method: str  # "trial-clean" | "git-graph" | "git-graph+claude"
+    # "trial-clean" | "git-graph" | "git-graph+claude" |
+    # "ai-resolve" | "ai-resolve-clean" | "depth-cutoff"
+    discovery_method: str
     conflict_files_at_discovery: list[str] = field(default_factory=list)
+    # ``True`` iff a local port branch was preserved at
+    # ``feature/<base>/<unit_id>`` for ``releasy run`` to reuse.
+    # ``True`` for trial-clean and AI-resolved outcomes. ``False`` for
+    # conflict-with-empty-deps (we couldn't resolve), refinement-only
+    # (no resolution attempted), or depth-cutoff. The presence of the
+    # branch lets ``run`` skip the cherry-pick step entirely.
+    cached: bool = False
 
 
 @dataclass
@@ -219,6 +239,13 @@ def run_discover_deps(
             "object database is in an unexpected state."
         )
 
+    # Caching is enabled iff we're also writing the deps overlay file —
+    # i.e. NOT in ``--no-write`` mode. ``--no-write`` is "true dry-run":
+    # no deps file, no cache branches, no persistent state changes
+    # beyond the diagnostic report.
+    cache_enabled = deps_overlay_path is not None
+    origin_slug = get_origin_repo_slug(config)
+
     # Capture the auto-discovered unit IDs from the existing overlay (if
     # any) so we can show a refresh diff after the new overlay is built.
     # ``deps_overlay_path`` is None in --no-write mode; in that case we
@@ -336,24 +363,48 @@ def run_discover_deps(
                 )
                 continue
 
-            outcome = _trial_pick_unit(scratch, cu, target_ref)
+            # Cache branch path: when caching is enabled (the default),
+            # trial-pick onto a named branch ``feature/<base>/<unit_id>``
+            # so a successful pick is preserved for ``releasy run`` to
+            # reuse. When caching is disabled (``--no-write``), the
+            # trial runs detached and always resets — pure dry-run.
+            cache_branch = (
+                _cache_branch_name(base_branch, unit_id)
+                if cache_enabled else None
+            )
+            outcome = _trial_pick_unit(
+                scratch, cu, target_ref,
+                cache_branch=cache_branch,
+                is_group=cu.is_user_group,
+                origin_slug=origin_slug,
+            )
+            cache_kept = False  # decided below
+
             if outcome.clean:
+                # Trial-clean: keep the cache branch (it carries the
+                # cherry-pick at target_ref tip, ready for ``run``).
+                cache_kept = bool(cache_branch)
+                if cache_branch:
+                    _release_cache_branch(
+                        scratch, target_ref, cache_branch, keep=True,
+                    )
                 nodes[unit_id] = _make_node(
                     cu, deps=[], method="trial-clean", conflict_files=[],
+                    cached=cache_kept,
                 )
                 continue
 
             if outcome.error_message and not outcome.conflict_files:
-                # Trial-pick failed without producing conflict markers —
-                # almost always "merge_commit_sha is None" or a git error.
-                # Surface it so the user isn't left wondering why this
-                # unit shows up with no deps.
                 warnings_acc.append(
                     f"unit {unit_id!r}: trial pick failed without "
                     f"conflict files: {outcome.error_message}"
                 )
 
-            # Conflict path — find candidate-deps via git history
+            # --- Conflict path ---
+            # Worktree is on cache_branch in conflict state (when caching)
+            # OR detached at target_ref already-reset (when --no-write).
+            # Either way we can compute the deterministic candidate-deps
+            # via ``git log``, which doesn't depend on worktree state.
             if merge_containment_cache is None:
                 merge_containment_cache = _build_merge_containment_map(
                     repo_path, target_ref, candidates, warnings_acc,
@@ -369,22 +420,54 @@ def run_discover_deps(
             )
 
             method = "git-graph"
-            if use_ai and cand_dep_unit_ids:
-                confirmed = _ask_claude_for_prereqs(
-                    config, cu, outcome.conflict_files, cand_dep_unit_ids,
-                    by_unit_id, base_branch, warnings_acc,
-                )
-                if confirmed is not None:
-                    cand_dep_unit_ids = confirmed
-                    method = "git-graph+claude"
+            ai_path_invoked = False
+
+            if use_ai:
+                if cand_dep_unit_ids:
+                    # Refinement path: deterministic gave candidates,
+                    # confirm them via lightweight Claude call. We
+                    # never keep the cache branch on this path — the
+                    # cherry-pick conflicted and we didn't try to
+                    # resolve, so the branch would carry conflict
+                    # markers. Drop it.
+                    confirmed = _ask_claude_for_prereqs(
+                        config, cu, outcome.conflict_files,
+                        cand_dep_unit_ids, by_unit_id, base_branch,
+                        warnings_acc,
+                    )
+                    if confirmed is not None:
+                        cand_dep_unit_ids = confirmed
+                        method = "git-graph+claude"
+                    ai_path_invoked = True
+                elif cache_branch and outcome.conflicting_pr_idx is not None:
+                    # Fallback path: deterministic empty AND we have the
+                    # conflict state preserved in the cache branch. Hand
+                    # it directly to the AI resolver — no need to
+                    # recreate the conflict.
+                    fb = _ai_resolve_fallback(
+                        config, scratch, base_branch, cu,
+                        outcome.conflicting_pr_idx,
+                        pr_url_to_unit, fully_merged_units,
+                        outcome.conflict_files, warnings_acc,
+                    )
+                    ai_path_invoked = True
+                    if fb is None:
+                        warnings_acc.append(
+                            f"unit {unit_id!r}: AI resolver could not "
+                            "classify the conflict; deps left empty"
+                        )
+                    else:
+                        cand_dep_unit_ids = fb.deps
+                        method = fb.method or "git-graph"
+                        cache_kept = fb.resolved
+                # In ``--no-write`` (no cache_branch), we skip the AI
+                # fallback entirely — without the conflict state
+                # preserved we'd have to recreate it, defeating the
+                # caching simplification. Use whatever the deterministic
+                # mapping gave us.
 
             # Drop dep references to unit IDs not in the candidate set —
-            # this happens when ``--limit`` truncated the universe,
-            # leaving an out-of-limit unit visible in the conflict map
-            # but never trial-picked. The component-build at line 354
-            # already silently ignores edges referencing non-nodes;
-            # filtering here keeps ``report.nodes[].deps`` consistent
-            # with the eventual ``components`` list.
+            # ``--limit`` truncation, already-merged exclusion, etc.
             dropped_deps: list[str] = []
             deps: list[str] = []
             for d in cand_dep_unit_ids:
@@ -399,9 +482,20 @@ def run_discover_deps(
                     f"{', '.join(dropped_deps)} — likely truncated by "
                     "--limit or already-merged exclusion"
                 )
+
+            # Always end the unit's processing with scratch detached at
+            # target_ref. ``cache_kept`` decides whether the branch
+            # stays in the ref namespace for ``releasy run`` to find or
+            # gets hard-deleted.
+            if cache_branch:
+                _release_cache_branch(
+                    scratch, target_ref, cache_branch, keep=cache_kept,
+                )
+
             nodes[unit_id] = _make_node(
                 cu, deps=deps, method=method,
                 conflict_files=outcome.conflict_files,
+                cached=cache_kept,
             )
             for d in deps:
                 edges.add((unit_id, d))
@@ -593,12 +687,43 @@ def _git_cherry_already(
     candidates: list[_CandidateUnit], warnings_acc: list[str],
 ) -> set[str]:
     """For each candidate PR's merge_commit_sha, ask ``git cherry`` whether
-    its patch-id is already applied in target.
+    every commit the PR introduced has a patch-id equivalent in target.
 
-    We don't have one canonical "source ref" because PRs may come from
-    different repos / branches; instead we run ``git cherry`` per
-    candidate merge SHA against target_ref. Cheap (single rev-parse
-    each), and tolerant of missing objects (skipped silently).
+    Implementation note (was a bug, now fixed):
+
+    ``git cherry <upstream> <head>`` walks ``<upstream>..<head>`` —
+    EVERY non-merge commit between the merge-base and ``<head>``. For a
+    PR's merge commit on master, that's typically *hundreds* of master
+    commits, including unrelated PRs the user may have cherry-picked
+    into target. Marking the candidate PR as "already in target"
+    because *any* of those master commits had a patch-id match is
+    wrong — that's what produced false positives where PRs that were
+    never ported showed up under ``skipped_already_in_target``.
+
+    Two scoping changes:
+
+    1. Constrain the walk to the PR's *own* commits via the
+       ``<limit>`` argument: ``git cherry <target> <head> <limit>``
+       walks ``<limit>..<head>`` only.
+       * For a true merge commit (2+ parents), ``<limit>`` is
+         ``parents[0]`` and ``<head>`` is ``parents[1]`` — the PR
+         branch's own commits.
+       * For a single-parent commit (squash-merged PR — and rebase-
+         merged PRs whose ``merge_commit_sha`` happens to be the last
+         commit), ``<limit>`` is ``<sha>~1``. For squashes this
+         walks exactly the squash commit; for rebase-merged PRs with
+         multiple commits this is an under-approximation (we only
+         check the last one), which is a deliberate trade-off:
+         missing a true positive (false negative) is far less harmful
+         than mistakenly skipping a PR that needs porting.
+
+    2. Require *every* line in the constrained output to start with
+       ``- `` (patch-id match) before marking the PR as already-in-
+       target. The previous "any match" policy was the actual source
+       of false positives even after scoping is corrected.
+
+    Cross-repo / unfetched merge SHAs are skipped silently via the
+    ``cat-file -e`` precheck, same as before.
     """
     out: set[str] = set()
     for cu in candidates:
@@ -613,16 +738,47 @@ def _git_cherry_already(
             )
             if check.returncode != 0:
                 continue
-            cherry = run_git(
-                ["cherry", target_ref, sha], repo_path, check=False,
+
+            # Determine the right (head, limit) pair for ``git cherry``
+            # by inspecting the merge commit's parents.
+            parents_res = run_git(
+                ["rev-list", "--parents", "-n", "1", sha],
+                repo_path, check=False,
             )
+            if parents_res.returncode != 0 or not parents_res.stdout.strip():
+                continue
+            parts = parents_res.stdout.strip().split()
+            # parts: [<sha>, <p1>] for non-merge commits (squash / rebase).
+            # parts: [<sha>, <p1>, <p2>, ...] for merge commits.
+            if len(parts) >= 3:
+                _, p1, p2 = parts[0], parts[1], parts[2]
+                cherry = run_git(
+                    ["cherry", target_ref, p2, p1],
+                    repo_path, check=False,
+                )
+            elif len(parts) == 2:
+                cherry = run_git(
+                    ["cherry", target_ref, sha, parts[1]],
+                    repo_path, check=False,
+                )
+            else:
+                # Initial commit / no parents — can't scope; skip.
+                continue
             if cherry.returncode != 0:
                 continue
-            for line in cherry.stdout.splitlines():
-                line = line.strip()
-                if line.startswith("- "):
-                    out.add(p.url)
-                    break
+
+            lines = [
+                line.strip() for line in cherry.stdout.splitlines()
+                if line.strip()
+            ]
+            if not lines:
+                # Empty range (degenerate merge / no commits to compare).
+                # Be conservative: don't mark.
+                continue
+            # Strict: every PR commit must have a patch-id equivalent in
+            # target before we conclude the PR is already there.
+            if all(line.startswith("- ") for line in lines):
+                out.add(p.url)
     return out
 
 
@@ -689,41 +845,135 @@ def _close_scratch_worktree(repo_path: Path, scratch: Path) -> None:
     )
 
 
+def _cache_branch_name(base_branch: str, unit_id: str) -> str:
+    """Same naming convention :func:`Config.feature_branch_name` uses,
+    so a branch left here by ``discover-deps`` is automatically picked
+    up by ``releasy run`` via its existing ``if_exists`` policy.
+    """
+    return f"feature/{base_branch}/{unit_id}"
+
+
 def _trial_pick_unit(
     scratch: Path, unit: _CandidateUnit, target_ref: str,
+    *,
+    cache_branch: str | None,
+    is_group: bool,
+    origin_slug: str | None,
 ) -> _PickOutcome:
-    """Sequentially cherry-pick every PR in the unit. Returns clean iff
-    every PR applied. On the first conflict, captures the conflict files
-    and exits the loop (subsequent PRs in the unit are not attempted in
-    this trial). Always resets after.
+    """Sequentially cherry-pick every PR in the unit onto a named branch.
+
+    On clean: returns ``clean=True``; the worktree is left on
+    ``cache_branch`` at ``target_ref + unit_PRs`` (caller decides whether
+    to keep it). For multi-PR groups, each commit gets a ``Source-PR:``
+    trailer mirroring the convention ``releasy run`` uses, so the
+    resulting PR's commit list is self-attributing.
+
+    On conflict: returns ``clean=False`` with the offending PR's index
+    and conflict files. The worktree is **left in conflict state on
+    ``cache_branch``** so the caller can hand it to the AI resolver
+    without having to recreate the conflict.
+
+    No automatic reset — the caller drives cleanup based on the outcome
+    and any AI fallback decision.
+
+    When ``cache_branch`` is ``None`` (e.g. ``--no-write`` mode), the
+    worktree stays detached at ``target_ref`` and the function ALWAYS
+    resets afterwards regardless of outcome — pure dry-run behaviour.
     """
     prs = _ordered_prs_for_pick(unit)
-    try:
-        for p in prs:
-            sha = p.merge_commit_sha
-            if not sha:
-                # Unmerged or cross-repo PR with no merge SHA — skip the
-                # unit; record an empty-conflict outcome with a synthetic
-                # marker so the caller surfaces it as a warning.
-                return _PickOutcome(
-                    clean=False, conflict_files=[],
-                    error_message=f"PR {p.url} has no merge_commit_sha",
+
+    if cache_branch is None:
+        # Pure dry-run mode: detached HEAD, always reset.
+        try:
+            for idx, p in enumerate(prs):
+                sha = p.merge_commit_sha
+                if not sha:
+                    return _PickOutcome(
+                        clean=False, conflict_files=[],
+                        error_message=f"PR {p.url} has no merge_commit_sha",
+                        conflicting_pr_idx=idx,
+                    )
+                res = cherry_pick_merge_commit(
+                    scratch, sha, abort_on_conflict=False,
                 )
-            res = cherry_pick_merge_commit(
-                scratch, sha, abort_on_conflict=False,
+                if not res.success:
+                    return _PickOutcome(
+                        clean=False,
+                        conflict_files=list(res.conflict_files),
+                        error_message=res.error_message,
+                        conflicting_pr_idx=idx,
+                    )
+            return _PickOutcome(clean=True, conflict_files=[])
+        finally:
+            abort_in_progress_op(scratch)
+            run_git(["reset", "--hard", target_ref], scratch, check=False)
+            run_git(["clean", "-fdx"], scratch, check=False)
+
+    # Caching path: switch scratch to the cache branch, force-resetting
+    # any prior cache for this unit. ``-B`` is "create-or-reset to ref".
+    run_git(["checkout", "-B", cache_branch, target_ref], scratch, check=False)
+
+    for idx, p in enumerate(prs):
+        sha = p.merge_commit_sha
+        if not sha:
+            # No merge SHA — caller will reset/delete the branch. Don't
+            # leave junk state behind.
+            return _PickOutcome(
+                clean=False, conflict_files=[],
+                error_message=f"PR {p.url} has no merge_commit_sha",
+                conflicting_pr_idx=idx,
+                cache_branch=cache_branch,
             )
-            if not res.success:
-                return _PickOutcome(
-                    clean=False,
-                    conflict_files=list(res.conflict_files),
-                    error_message=res.error_message,
-                )
-        return _PickOutcome(clean=True, conflict_files=[])
-    finally:
-        # Reset after EVERY trial, clean or otherwise. Cheap.
-        abort_in_progress_op(scratch)
-        run_git(["reset", "--hard", target_ref], scratch, check=False)
-        run_git(["clean", "-fdx"], scratch, check=False)
+        res = cherry_pick_merge_commit(
+            scratch, sha, abort_on_conflict=False,
+        )
+        if not res.success:
+            # Leave the worktree in conflict state on cache_branch — the
+            # caller's AI fallback path can operate on it directly.
+            return _PickOutcome(
+                clean=False,
+                conflict_files=list(res.conflict_files),
+                error_message=res.error_message,
+                conflicting_pr_idx=idx,
+                cache_branch=cache_branch,
+            )
+        # Tag commit with Source-PR trailer for multi-PR groups, mirroring
+        # ``pipeline._tag_commit_with_source_pr``. Singletons skip this —
+        # the branch IS the source PR, trailer would be redundant noise.
+        if is_group and len(prs) > 1:
+            from releasy.github_ops import pr_ref_label
+            ref = pr_ref_label(p.repo_slug, p.number, origin_slug)
+            append_commit_trailer(
+                scratch, "Source-PR", f"{ref} ({p.url})",
+            )
+
+    return _PickOutcome(
+        clean=True, conflict_files=[],
+        cache_branch=cache_branch,
+    )
+
+
+def _release_cache_branch(
+    scratch: Path, target_ref: str, branch_name: str | None,
+    *, keep: bool,
+) -> None:
+    """Detach scratch from the cache branch and (optionally) delete it.
+
+    ``keep=True``: branch persists in the main repo's ref namespace —
+    ``releasy run`` will find it via its ``if_exists`` policy.
+    ``keep=False``: branch is hard-deleted (used when caching wasn't
+    appropriate for this unit, e.g. AI fallback failed).
+
+    Always aborts any in-progress op and resets the scratch worktree
+    to a detached state at ``target_ref`` so the next unit starts
+    from a clean slate.
+    """
+    abort_in_progress_op(scratch)
+    # Detach so the branch (if kept) isn't holding a checkout lock.
+    run_git(["checkout", "--detach", target_ref], scratch, check=False)
+    run_git(["clean", "-fdx"], scratch, check=False)
+    if branch_name and not keep:
+        run_git(["branch", "-D", branch_name], scratch, check=False)
 
 
 def _ordered_prs_for_pick(unit: _CandidateUnit) -> list[PRInfo]:
@@ -994,6 +1244,133 @@ def _ask_claude_for_prereqs(
     return confirmed_units
 
 
+@dataclass
+class _AIFallbackResult:
+    """Outcome of the AI-resolve fallback path. Distinguishes the cases
+    so the caller can pick a ``discovery_method`` AND decide whether to
+    keep the cache branch.
+    """
+    # Confirmed missing-prereq unit IDs, mapped from URLs Claude returned.
+    # Empty list when the resolver found no real prereqs.
+    deps: list[str]
+    # ``True``  — resolver advanced HEAD with a real resolution. Caller
+    #             should keep the cache branch (it carries the
+    #             AI-resolved cherry-pick).
+    # ``False`` — resolver couldn't resolve cleanly. Caller should drop
+    #             the cache branch.
+    resolved: bool
+    # ``"ai-resolve"``       — deps populated, resolver gave up, prereqs
+    #                          point at older un-ported units.
+    # ``"ai-resolve-clean"`` — resolver succeeded without prereqs (drift).
+    # ``None``               — neither: resolver failed without info.
+    method: str | None
+
+
+def _ai_resolve_fallback(
+    config: Config,
+    scratch: Path,
+    base_branch: str,
+    unit: _CandidateUnit,
+    conflicting_pr_idx: int,
+    pr_url_to_unit: dict[str, str],
+    already_in_target_units: set[str],
+    conflict_files: list[str],
+    warnings_acc: list[str],
+) -> _AIFallbackResult | None:
+    """Heavyweight fallback: hand an *existing* conflict state to the
+    full AI resolver and read its missing-prereqs / resolution outcome.
+
+    Caller guarantees the worktree is currently in conflict state on
+    ``unit.feature_unit.prs[conflicting_pr_idx]`` (left there by the
+    trial-pick on the cache branch). We don't recreate the conflict —
+    we just hand it to ``attempt_ai_resolve`` and read the result.
+
+    Three possible returns:
+
+    * ``_AIFallbackResult(deps=[...], resolved=True, method="ai-resolve")``
+      — Claude reported ``MISSING_PREREQS`` AND advanced HEAD. Deps
+      populated; cache branch carries the resolution.
+    * ``_AIFallbackResult(deps=[...], resolved=False, method="ai-resolve")``
+      — Claude reported ``MISSING_PREREQS`` but did NOT resolve.
+      Deps populated; cache branch should be dropped.
+    * ``_AIFallbackResult(deps=[], resolved=True,
+      method="ai-resolve-clean")`` — Claude resolved cleanly without
+      prereqs (drift). Cache branch carries the resolution.
+    * ``None`` — resolver failed uncertainly (no resolution, no
+      missing-prereq info). Caller should fall back to empty deps and
+      drop the cache.
+
+    On resolver failure ``attempt_ai_resolve`` already resets HEAD to
+    ``ctx.start_sha`` (which is the cache branch's tip BEFORE the
+    failing pick — i.e. the prefix that DID apply cleanly for groups).
+    The caller's branch-disposal logic resets to ``target_ref`` afterwards.
+    """
+    try:
+        prs = unit.feature_unit.prs
+        if not (0 <= conflicting_pr_idx < len(prs)):
+            return None
+        conflicting_pr = prs[conflicting_pr_idx]
+
+        ctx = AIResolveContext(
+            port_branch=f"discover-deps-trial-{unit.unit_id}",
+            base_branch=base_branch,
+            source_pr=conflicting_pr,
+            conflict_files=list(conflict_files),
+            operation="cherry-pick",
+            user_context=unit.feature_unit.ai_context or "",
+        )
+        result = attempt_ai_resolve(config, scratch, ctx)
+
+        if result.cost_usd:
+            warnings_acc.append(
+                f"unit {unit.unit_id!r}: AI-resolve fallback used "
+                f"${result.cost_usd:.2f}"
+            )
+
+        if result.missing_prereq_prs:
+            # Map URLs → unit IDs.
+            confirmed: list[str] = []
+            seen: set[str] = set()
+            for url in result.missing_prereq_prs:
+                uid = pr_url_to_unit.get(url)
+                if uid is None:
+                    warnings_acc.append(
+                        f"unit {unit.unit_id!r}: AI-resolve fallback "
+                        f"reported {url!r} as a prereq but it's not in "
+                        "the candidate set; ignoring"
+                    )
+                    continue
+                if uid == unit.unit_id:
+                    continue
+                if uid in already_in_target_units:
+                    continue
+                if uid in seen:
+                    continue
+                seen.add(uid)
+                confirmed.append(uid)
+            return _AIFallbackResult(
+                deps=confirmed,
+                # ``MISSING_PREREQS`` always pairs with success=False per
+                # the resolver's contract — no resolution happened.
+                resolved=False,
+                method="ai-resolve",
+            )
+
+        if result.success:
+            # Resolved cleanly without prereqs → drift.
+            return _AIFallbackResult(
+                deps=[], resolved=True, method="ai-resolve-clean",
+            )
+
+        # Failed without info.
+        return None
+    except Exception as e:  # pragma: no cover — defensive
+        warnings_acc.append(
+            f"unit {unit.unit_id!r}: AI-resolve fallback crashed: {e}"
+        )
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Components and articulation
 # ---------------------------------------------------------------------------
@@ -1233,7 +1610,7 @@ def _break_cycles(
 
 def _make_node(
     cu: _CandidateUnit, *, deps: list[str], method: str,
-    conflict_files: list[str],
+    conflict_files: list[str], cached: bool = False,
 ) -> DAGNode:
     return DAGNode(
         unit_id=cu.unit_id,
@@ -1244,6 +1621,7 @@ def _make_node(
         deps=sorted(deps),
         discovery_method=method,
         conflict_files_at_discovery=list(conflict_files),
+        cached=cached,
     )
 
 
@@ -1331,6 +1709,7 @@ def _write_report(report: DiscoveryReport, path: Path) -> None:
                 "conflict_files_at_discovery": (
                     n.conflict_files_at_discovery or None
                 ),
+                "cached": True if n.cached else None,
             }.items()
             if v is not None
         }

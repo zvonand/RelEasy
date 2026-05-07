@@ -672,6 +672,16 @@ class Config:
     #                     tweaked the body format and want the rebase PR to
     #                     reflect it.
     update_existing_prs: bool = False
+    # Optional label applied to a port (rebase) PR once it has been merged
+    # into the target branch, and stripped from each of the source PRs that
+    # the port was cherry-picked from. Empty / unset disables the feature.
+    # The label is auto-created on origin (purple, like other releasy
+    # labels) the first time a merged port is observed. Source-PR cleanup
+    # is best-effort and only touches PRs hosted on the configured origin
+    # — source PRs on a different repo are skipped (we never write outside
+    # origin).
+    merged_label: str | None = None
+    merged_label_color: str = "8B5CF6"  # purple, matches releasy defaults
     pr_policy: PRPolicyConfig = field(default_factory=PRPolicyConfig)
     notifications: NotificationsConfig = field(default_factory=NotificationsConfig)
     ai_resolve: AIResolveConfig = field(default_factory=AIResolveConfig)
@@ -804,6 +814,26 @@ class Config:
 
 # Keys that used to live at the top level of config.yaml but now belong
 # elsewhere. Presence triggers a helpful error pointing at the new layout.
+def _parse_optional_label(value: object, *, key: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string label name (got {type(value).__name__})")
+    stripped = value.strip()
+    return stripped or None
+
+
+def _parse_label_color(value: object, *, key: str, default: str) -> str:
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a 6-hex-digit color string (got {type(value).__name__})")
+    stripped = value.strip().lstrip("#")
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", stripped):
+        raise ValueError(f"{key} must be 6 hex digits (got {value!r})")
+    return stripped.upper()
+
+
 _LEGACY_TOP_LEVEL_KEYS = {
     "features": (
         "features: now lives in the session file — move this list to the "
@@ -1162,6 +1192,14 @@ def load_config(config_path: Path | None = None) -> Config:
         project=project,
         target_branch=raw.get("target_branch") or None,
         update_existing_prs=bool(raw.get("update_existing_prs", False)),
+        merged_label=_parse_optional_label(
+            raw.get("merged_label"), key="merged_label",
+        ),
+        merged_label_color=_parse_label_color(
+            raw.get("merged_label_color"),
+            key="merged_label_color",
+            default="8B5CF6",
+        ),
         pr_policy=pr_policy,
         notifications=notifications,
         ai_resolve=ai_resolve,
@@ -1209,6 +1247,11 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
 
     if config.update_existing_prs:
         data["update_existing_prs"] = True
+
+    if config.merged_label:
+        data["merged_label"] = config.merged_label
+        if config.merged_label_color != "8B5CF6":
+            data["merged_label_color"] = config.merged_label_color
 
     if config.work_dir:
         data["work_dir"] = str(config.work_dir)

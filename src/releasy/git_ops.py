@@ -18,6 +18,11 @@ class OperationResult:
     success: bool
     conflict_files: list[str]
     error_message: str | None = None
+    # True when ``cherry_pick_sha`` recognised git's "previous cherry-pick
+    # is now empty" outcome — the patch is already in target via some
+    # other path (sibling backport, prior port, squash, etc.). The
+    # caller should treat the PR as a no-op rather than a conflict.
+    already_applied: bool = False
 
 
 def _git_env() -> dict[str, str]:
@@ -151,9 +156,36 @@ def stash_and_clean(repo_path: Path) -> None:
     run_git(["clean", "-fd"], repo_path, check=False)
 
 
+def _resolved_git_dir(repo_path: Path) -> Path:
+    """Resolve the actual gitdir for ``repo_path``.
+
+    For a regular checkout this is ``<repo>/.git`` (a directory). For a
+    *git worktree* it's ``<main-repo>/.git/worktrees/<id>/`` — and that
+    matters: per-worktree state files (``CHERRY_PICK_HEAD``,
+    ``MERGE_HEAD``, ``rebase-*``) live there, NOT in the main gitdir.
+
+    The previous naive ``repo_path / ".git"`` check returned False in a
+    worktree even when a cherry-pick was actually in progress, because
+    ``.git`` is a *file* in worktrees that points at the real gitdir.
+    """
+    result = run_git(
+        ["rev-parse", "--absolute-git-dir"], repo_path, check=False,
+    )
+    if result.returncode != 0:
+        # Fallback to the naive path if rev-parse somehow fails — better
+        # to keep the old behaviour than crash on unrelated callers.
+        return repo_path / ".git"
+    return Path(result.stdout.strip())
+
+
 def is_operation_in_progress(repo_path: Path) -> bool:
-    """Check if a cherry-pick, merge, or rebase is still in progress."""
-    git_dir = repo_path / ".git"
+    """Check if a cherry-pick, merge, or rebase is still in progress.
+
+    Worktree-aware: resolves the per-worktree gitdir (see
+    :func:`_resolved_git_dir`) so checks fire correctly inside
+    ``git worktree add``-created worktrees too.
+    """
+    git_dir = _resolved_git_dir(repo_path)
     return (
         (git_dir / "CHERRY_PICK_HEAD").exists()
         or (git_dir / "MERGE_HEAD").exists()
@@ -167,9 +199,9 @@ def abort_in_progress_op(repo_path: Path) -> str | None:
 
     Returns the operation kind (``"cherry-pick"`` / ``"merge"`` /
     ``"rebase"``) when something was aborted, or ``None`` if the working
-    tree was already clean.
+    tree was already clean. Worktree-aware via :func:`_resolved_git_dir`.
     """
-    git_dir = repo_path / ".git"
+    git_dir = _resolved_git_dir(repo_path)
     if (git_dir / "CHERRY_PICK_HEAD").exists():
         run_git(["cherry-pick", "--abort"], repo_path, check=False)
         kind = "cherry-pick"
@@ -536,6 +568,22 @@ def cherry_pick_sha(
         return OperationResult(success=True, conflict_files=[])
 
     conflict_files = get_conflict_files(repo_path)
+
+    # "previous cherry-pick is now empty" — git's signal that the patch
+    # is already present in target. No conflict files, just a non-zero
+    # exit and that specific stderr fingerprint. Recognise it here so
+    # the pipeline can treat the PR as already-applied instead of
+    # invoking the AI resolver on a phantom conflict.
+    stderr = result.stderr or ""
+    if not conflict_files and "is now empty" in stderr:
+        run_git(["cherry-pick", "--skip"], repo_path, check=False)
+        return OperationResult(
+            success=False,
+            conflict_files=[],
+            already_applied=True,
+            error_message=stderr.strip(),
+        )
+
     if abort_on_conflict:
         run_git(["cherry-pick", "--abort"], repo_path, check=False)
     return OperationResult(

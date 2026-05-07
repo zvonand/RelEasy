@@ -167,6 +167,17 @@ class FeatureState:
     # for groups, ``pr-<N>`` / ``<owner>-<repo>-pr-<N>`` for singletons).
     # Cleared once the unit unblocks and starts processing.
     blocked_by: list[str] = field(default_factory=list)
+    # Set once the ``config.merged_label`` post-merge bookkeeping has run
+    # for this unit (label applied to the rebase PR, stripped from source
+    # PRs hosted on origin). Idempotent flag — avoids re-hitting GitHub on
+    # every subsequent ``releasy run``. Stays ``False`` when
+    # ``merged_label`` is unset in config.
+    merged_label_applied: bool = False
+    # Free-form one-line explanation of why ``status == "skipped"``.
+    # Written by the pipeline (e.g. "already in target — empty cherry-pick")
+    # and surfaced by ``releasy status``. ``None`` for skips that predate
+    # the field or were applied without a reason.
+    skip_reason: str | None = None
 
 
 @dataclass
@@ -223,6 +234,8 @@ def _parse_features(raw_features: dict) -> dict[str, FeatureState]:
             queued_prereq_units=list(fraw.get("queued_prereq_units", []) or []),
             last_review_addressed_at=fraw.get("last_review_addressed_at"),
             blocked_by=list(fraw.get("blocked_by", []) or []),
+            merged_label_applied=bool(fraw.get("merged_label_applied", False)),
+            skip_reason=fraw.get("skip_reason"),
         )
     return features
 
@@ -337,6 +350,10 @@ def save_state(state: PipelineState, config: Config) -> None:
             entry["last_review_addressed_at"] = fs.last_review_addressed_at
         if fs.blocked_by:
             entry["blocked_by"] = list(fs.blocked_by)
+        if fs.merged_label_applied:
+            entry["merged_label_applied"] = True
+        if fs.skip_reason:
+            entry["skip_reason"] = fs.skip_reason
         features_data[fid] = entry
 
     data: dict = {

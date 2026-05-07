@@ -14,7 +14,22 @@
       "Bash(python3 -m releasy --config /nonexistent.yaml discover-deps --no-write --deps-file foo.yaml)",
       "Bash(echo \"exit=$?\")",
       "Bash(grep -rn \"\\\\-\\\\-write\\\\b\" /home/zvonand/releasy/src/ /home/zvonand/releasy/prompts/ /home/zvonand/releasy/README.md /home/zvonand/releasy/session.yaml.example /home/zvonand/.claude/plans/ 2>&1 | grep -v \"\\\\-\\\\-write-\" | head -10)",
-      "Read(//home/zvonand/.claude/plans/**)"
+      "Read(//home/zvonand/.claude/plans/**)",
+      "Bash(git stash *)",
+      "Bash(git checkout *)",
+      "Bash(python3 -c \"from releasy import pipeline; print\\('OK'\\)\")",
+      "Bash(grep -A 5 \"apassos-3:\" ~/.local/state/releasy/antalya-26.3.state.yaml 2>/dev/null | head -30)",
+      "Read(//home/zvonand/.local/state/releasy/**)",
+      "Bash(python -c \"from releasy.pipeline import clear_branch, clear_all_dirty, _resolve_clear_target; print\\('ok'\\)\")",
+      "Bash(python3 -c \"from releasy.pipeline import clear_branch, clear_all_dirty, _resolve_clear_target; from releasy.cli import cli; print\\('imports ok'\\)\")",
+      "Bash(git cherry-pick *)",
+      "Bash(python3 -c \"import sys; sys.path.insert\\(0, 'src'\\); from releasy import dag_discovery, cli; print\\('imports OK'\\)\")",
+      "Bash(python3 -c \"from releasy import refresh; print\\(refresh.refresh_tracked_prs\\)\")",
+      "Bash(python -c \"from releasy import pipeline, refresh, cli; print\\('imports ok'\\)\")",
+      "Bash(python3 -c \"from releasy import pipeline, refresh, cli; print\\('imports ok'\\)\")",
+      "Bash(python3 -c \"from releasy.cli import cli; cli.main\\(['run', '--help'], standalone_mode=False\\)\")",
+      "Bash(python3 -c \"from releasy.cli import cli; cli.main\\(['refresh', '--help'], standalone_mode=False\\)\")",
+      "Bash(python3 -c \"from releasy import pipeline, refresh, cli; print\\('ok'\\)\")"
     ]
   }
 }
