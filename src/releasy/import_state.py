@@ -1,4 +1,4 @@
-"""``releasy import`` — rebuild the per-project state file from GitHub.
+"""``releasy project pull`` — rebuild the per-project state file from GitHub.
 
 The per-project state lives under ``$XDG_STATE_HOME/releasy/<name>.state.yaml``
 and isn't shared between machines, so a fresh checkout / new teammate /
@@ -129,7 +129,7 @@ def import_from_github(config: Config) -> bool:
     if not get_github_token():
         console.print(
             "[red]RELEASY_GITHUB_TOKEN not set.[/red] "
-            "`releasy import` needs API access to fetch source PRs, "
+            "`releasy project pull` needs API access to fetch source PRs, "
             "rebase PRs, and the project board."
         )
         return False

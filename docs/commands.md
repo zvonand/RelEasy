@@ -27,7 +27,8 @@ config they read, see [configuration.md](configuration.md).
   [`adopt`](#releasy-adopt)
 - Project board:
   [`setup-project`](#releasy-setup-project) ·
-  [`sync-project`](#releasy-sync-project)
+  [`project push`](#releasy-project-push) ·
+  [`project pull`](#releasy-project-pull)
 - Release: [`release`](#releasy-release)
 - Features: [`feature *`](#feature-management)
 
@@ -534,20 +535,39 @@ releasy setup-project
 > **Destructive:** drops non-canonical Status options. Cards on dropped
 > options are re-synced based on local state immediately after.
 
-### `releasy sync-project`
+### `releasy project push`
 
 *Push local state to the project board.*
 
 Reconciles every known feature: attaches missing PR cards, refreshes
-existing, updates Status. No git, no PRs — only the board. Use after
-hand-editing state, rotating tokens, or wiring up a new project URL.
+existing, updates Status, and deletes cards no longer backed by local
+state. No git, no PRs — only the board. Use after hand-editing state,
+rotating tokens, or wiring up a new project URL.
 
 ```bash
-releasy sync-project
+releasy project push
 ```
 
 Exit: `1` if sync was skipped (no project / no token / bad URL) or any
 item failed, `0` otherwise.
+
+### `releasy project pull`
+
+*Rebuild local state from GitHub + the project board.*
+
+Use when local state is missing or stale (fresh machine, teammate
+takeover, throwaway CI runner) but the world outside is intact. Read-only
+on git — only the GitHub APIs are hit. Merges into any existing state
+file; the board wins for `Skipped` and `AI Cost`, GitHub wins for PR
+status, local-only fields (`ai_iterations`, `failed_step_index`,
+`partial_pr_count`) are preserved.
+
+```bash
+releasy project pull
+```
+
+Requires `notifications.github_project` in config and
+`RELEASY_GITHUB_TOKEN` with `project` scope.
 
 ## Release construction
 

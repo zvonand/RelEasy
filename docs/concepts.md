@@ -100,7 +100,7 @@ After conflicts:
 | Mark a manually-resolved port branch as done | [`releasy continue`](commands.md#releasy-continue) |
 | Resolve target-drift conflicts on an open rebase PR | [`releasy refresh`](commands.md#releasy-refresh) |
 | Drop a port from this run | [`releasy skip`](commands.md#releasy-skip) |
-| Resync the GitHub Project board | [`releasy sync-project`](commands.md#releasy-sync-project) |
+| Resync the GitHub Project board | [`releasy project push`](commands.md#releasy-project-push) |
 
 **Status semantics:** clean or AI-resolved port with rebase PR open →
 `needs_review`. Pushed branch without PR → `branch_created`. Needs human →

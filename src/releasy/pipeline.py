@@ -483,7 +483,7 @@ def discover_feature_units(config: Config) -> list["FeatureUnit"]:
 
     Pure discovery: hits GitHub but touches no git worktree. Returns the
     fully-filtered, ordered list of :class:`FeatureUnit`s the pipeline
-    would attempt to port, so other commands (``releasy import``) can
+    would attempt to port, so other commands (``releasy project pull``) can
     rebuild state from the same source-of-truth definition.
 
     Output (``console.print``) mirrors ``releasy run``'s "Phase: Porting"
@@ -988,7 +988,7 @@ def run_pipeline(
         existing_ids.add(unit.feature_id)
         # Skip units already in a terminal state on the local state file —
         # ``merged`` (port already shipped, no work left to do) or ``skipped``
-        # (user opted out). Without this, a re-run after `releasy import`
+        # (user opted out). Without this, a re-run after `releasy project pull`
         # or after the merged-status sweep promoted a unit would re-cherry-
         # pick source PRs whose port is already merged.
         prev_fs = state.features.get(unit.feature_id)
@@ -4614,7 +4614,7 @@ def sync_to_project(config: Config) -> bool:
         f"\n[bold]Syncing local state[/bold] → "
         f"[cyan]{config.notifications.github_project}[/cyan]"
     )
-    summary = sync_project(config, state)
+    summary = sync_project(config, state, prune_orphans=True)
 
     if summary.skipped:
         console.print(
@@ -4630,7 +4630,12 @@ def sync_to_project(config: Config) -> bool:
         console.print(
             f"  [dim]refreshed {summary.updated} existing card(s)[/dim]"
         )
-    if not summary.added and not summary.updated and not summary.errors:
+    if summary.removed:
+        console.print(
+            f"  [yellow]✓[/yellow] removed {summary.removed} orphan card(s) "
+            "(not in local state)"
+        )
+    if not summary.changed and not summary.errors:
         console.print("  [dim]project board already up to date[/dim]")
     if summary.errors:
         console.print(

@@ -1349,7 +1349,7 @@ def analyze_fails(
         # one PR's cost actually landed in state. No-op gracefully if
         # the project isn't configured / token lacks the scope — the
         # state file already has the right value, so the next
-        # ``releasy sync-project`` will catch up.
+        # ``releasy project push`` will catch up.
         if cost_attributed_any and config.push:
             try:
                 from releasy.github_ops import sync_project
@@ -1361,7 +1361,7 @@ def analyze_fails(
                 console.print(
                     f"[yellow]![/yellow] project sync failed: {exc} "
                     "(state file is still up to date — re-sync with "
-                    "`releasy sync-project` when convenient)"
+                    "`releasy project push` when convenient)"
                 )
 
     success = all(r.error is None for r in runs)

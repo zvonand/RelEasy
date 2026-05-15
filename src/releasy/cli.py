@@ -843,38 +843,6 @@ def _print_discovery_summary(report) -> None:  # noqa: ANN001 — DiscoveryRepor
 
 
 @cli.command(
-    name="import",
-    short_help="Rebuild project state from GitHub + the project board.",
-)
-@click.pass_context
-def import_cmd(ctx: click.Context) -> None:
-    """Rebuild the per-project state file from GitHub + the GitHub Project board.
-
-    Use this when the local state is missing or out of date (fresh
-    machine, teammate takeover, throwaway CI runner) but the rest of the
-    world is unchanged — source PRs still live on GitHub, rebase PRs are
-    still open on origin, and the configured project board still carries
-    the Skipped / AI Cost history.
-
-    Read-only on git: no checkouts, no clones, no pushes, no new PRs.
-    The command only hits the GitHub REST / GraphQL APIs. It merges into
-    any existing state file — local-only fields (ai_iterations,
-    failed_step_index, partial_pr_count) are preserved verbatim; the
-    board wins for `Skipped` decisions and `AI Cost`; every other field
-    is refreshed from the authoritative source.
-
-    Requires notifications.github_project in config — without a project
-    board there's no durable source for the Skipped / cost values that
-    can't be re-derived from PRs alone.
-    """
-    from releasy.import_state import import_from_github
-
-    with _locked_config(ctx, session="optional") as config:
-        if not import_from_github(config):
-            raise SystemExit(1)
-
-
-@cli.command(
     short_help="Resolve target-branch conflicts on a PR (or every tracked PR).",
 )
 @click.option(
@@ -2092,23 +2060,68 @@ def setup_project_cmd(ctx: click.Context) -> None:
         sync_to_project(config)
 
 
-@cli.command(
-    name="sync-project",
+@cli.group(
+    name="project",
+    short_help="Sync local state with the GitHub Project board.",
+)
+def project_cmd() -> None:
+    """Sync local state with the GitHub Project board.
+
+    ``push`` writes local state to the board (the board mirrors state).
+    ``pull`` rebuilds local state from the board + GitHub PRs (state
+    mirrors the world).
+    """
+
+
+@project_cmd.command(
+    name="push",
     short_help="Push local state to the Project board.",
 )
 @click.pass_context
-def sync_project_cmd(ctx: click.Context) -> None:
+def project_push_cmd(ctx: click.Context) -> None:
     """Push the current local state to the GitHub Project board.
 
     Reads the per-project state file and reconciles every known feature
     with the configured project: attaches any missing PR cards, refreshes
-    existing ones, and updates their Status field. No git operations,
-    no PRs — just the project board.
+    existing ones, updates Status, and deletes cards no longer backed by
+    local state. No git operations, no PRs — just the project board.
     """
     from releasy.pipeline import sync_to_project
 
     with _locked_config(ctx, session="optional") as config:
         if not sync_to_project(config):
+            raise SystemExit(1)
+
+
+@project_cmd.command(
+    name="pull",
+    short_help="Rebuild local state from GitHub + the project board.",
+)
+@click.pass_context
+def project_pull_cmd(ctx: click.Context) -> None:
+    """Rebuild the per-project state file from GitHub + the project board.
+
+    Use this when the local state is missing or out of date (fresh
+    machine, teammate takeover, throwaway CI runner) but the rest of the
+    world is unchanged — source PRs still live on GitHub, rebase PRs are
+    still open on origin, and the configured project board still carries
+    the Skipped / AI Cost history.
+
+    Read-only on git: no checkouts, no clones, no pushes, no new PRs.
+    The command only hits the GitHub REST / GraphQL APIs. It merges into
+    any existing state file — local-only fields (ai_iterations,
+    failed_step_index, partial_pr_count) are preserved verbatim; the
+    board wins for `Skipped` decisions and `AI Cost`; every other field
+    is refreshed from the authoritative source.
+
+    Requires notifications.github_project in config — without a project
+    board there's no durable source for the Skipped / cost values that
+    can't be re-derived from PRs alone.
+    """
+    from releasy.import_state import import_from_github
+
+    with _locked_config(ctx, session="optional") as config:
+        if not import_from_github(config):
             raise SystemExit(1)
 
 

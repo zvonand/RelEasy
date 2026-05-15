@@ -320,7 +320,7 @@ class PRInfo:
     labels: list[str] = None  # type: ignore[assignment]
     author: str | None = None  # GitHub login of the PR author
     # GitHub's ``mergeable_state`` for OPEN PRs. Set on the lookups used
-    # by ``releasy import`` so we can decide whether a rebase PR is
+    # by ``releasy project pull`` so we can decide whether a rebase PR is
     # currently clean or conflicting without a trial merge. Values seen
     # in the wild: "clean", "dirty" (= conflicting), "unstable" (CI red
     # but no conflicts), "blocked" (branch-protection / review wait),
@@ -1071,7 +1071,7 @@ def find_latest_pr_for_branch(
 
     Unlike :func:`find_pr_for_branch` which is scoped to open PRs, this
     looks across ``state="all"`` and returns whichever PR was updated
-    most recently. ``releasy import`` uses it so a rebase PR that's
+    most recently. ``releasy project pull`` uses it so a rebase PR that's
     already been merged (or closed in favour of a replacement) still
     gets surfaced in reconstructed state — otherwise the feature would
     silently reappear as "never ported" on a fresh checkout.
@@ -1433,7 +1433,7 @@ def _list_project_items_with_fields(project_id: str) -> list[dict]:
     ``fieldValues`` node carrying each item's Status option and AI Cost
     number. Broken out as a separate query so we don't slow down the hot
     write-path in :func:`sync_project` (which doesn't need field values
-    to match items). ``releasy import`` is the sole caller today.
+    to match items). ``releasy project pull`` is the sole caller today.
     """
     query = """
     query($projectId: ID!, $cursor: String) {
@@ -1500,7 +1500,7 @@ def fetch_project_board_snapshot(
     no token, unparseable URL, or GraphQL couldn't resolve the project
     id. Returns an empty list for an empty (but valid) board.
 
-    Consumers (``releasy import``) match returned cards against local
+    Consumers (``releasy project pull``) match returned cards against local
     features by ``pr_url`` first and fall back to ``draft_title``
     parsing — see :func:`_project_item_body`'s title convention
     (``"<branch_name> (<feature_id>)"``).
@@ -1649,6 +1649,46 @@ def _prune_closed_pr_items(
                 "Failed to remove closed PR %s from project board",
                 content.get("url"),
             )
+        survivors.append(item)
+    items[:] = survivors
+    return removed
+
+
+def _prune_orphan_items(
+    project_id: str, items: list[dict], kept_ids: set[str],
+) -> int:
+    """Delete DraftIssue / PullRequest items not in ``kept_ids``.
+
+    ``kept_ids`` holds the project item IDs the current sync claims as
+    still backed by local state. Anything else of those two kinds is
+    removed. Bare ``Issue`` items are left alone — releasy doesn't
+    create them, so they're assumed user-added. Mutates ``items`` in
+    place. Returns the count actually deleted.
+    """
+    removed = 0
+    survivors: list[dict] = []
+    for item in items:
+        if item["id"] in kept_ids:
+            survivors.append(item)
+            continue
+        content = item.get("content") or {}
+        if content.get("__typename") not in ("DraftIssue", "PullRequest"):
+            survivors.append(item)
+            continue
+        if _delete_item(project_id, item["id"]):
+            removed += 1
+            label = (
+                content.get("title")
+                or content.get("url")
+                or item["id"]
+            )
+            log.info(
+                "Removed orphan project item %r (not in local state)", label,
+            )
+            continue
+        log.warning(
+            "Failed to remove orphan project item %s", item["id"],
+        )
         survivors.append(item)
     items[:] = survivors
     return removed
@@ -2346,7 +2386,11 @@ class ProjectSyncSummary:
         return ", ".join(parts)
 
 
-def sync_project(config: Config, state: PipelineState) -> ProjectSyncSummary:
+def sync_project(
+    config: Config, state: PipelineState,
+    *,
+    prune_orphans: bool = False,
+) -> ProjectSyncSummary:
     """Sync pipeline state to a GitHub Project board.
 
     Iterates every feature actually present in ``state.features`` (ports
@@ -2364,6 +2408,12 @@ def sync_project(config: Config, state: PipelineState) -> ProjectSyncSummary:
     * Otherwise (pending / disabled / dropped singleton) we fall back to a
       DraftIssue carrying the same status info, so the board still
       reflects the run.
+
+    When ``prune_orphans`` is set, DraftIssue / PullRequest items on the
+    board that aren't backed by a state entry in this run are deleted.
+    Off by default so per-run incremental sync calls (after every state
+    save) don't reap items mid-mutation; only the standalone
+    ``releasy project push`` opts in.
 
     The returned ``ProjectSyncSummary`` reports how many cards were added
     vs. refreshed, so reconciliation passes (e.g. at the end of ``releasy
@@ -2467,6 +2517,7 @@ def sync_project(config: Config, state: PipelineState) -> ProjectSyncSummary:
 
     existing_items = _list_project_items(project_id)
     summary.removed = _prune_closed_pr_items(project_id, existing_items)
+    kept_item_ids: set[str] = set()
 
     for feat_id, title, status, conflict_files, fs in rows:
         body = _project_item_body(
@@ -2483,6 +2534,7 @@ def sync_project(config: Config, state: PipelineState) -> ProjectSyncSummary:
             if item_id:
                 was_existing = True
                 attached_real_pr = True
+                kept_item_ids.add(item_id)
             else:
                 pr_ref = parse_pr_url(pr_url)
                 pr_slug = (
@@ -2522,6 +2574,7 @@ def sync_project(config: Config, state: PipelineState) -> ProjectSyncSummary:
                 item_id, draft_id = existing_draft
                 _update_draft_issue(draft_id, body=body)
                 was_existing = True
+                kept_item_ids.add(item_id)
             else:
                 item_id = _add_draft_issue(project_id, title, body)
                 if not item_id:
@@ -2536,6 +2589,9 @@ def sync_project(config: Config, state: PipelineState) -> ProjectSyncSummary:
             if stale_draft:
                 stale_item_id, _ = stale_draft
                 if _delete_item(project_id, stale_item_id):
+                    existing_items[:] = [
+                        i for i in existing_items if i["id"] != stale_item_id
+                    ]
                     log.info(
                         "Removed stale draft project item %r (replaced by "
                         "PR %s)", title, pr_url,
@@ -2593,6 +2649,11 @@ def sync_project(config: Config, state: PipelineState) -> ProjectSyncSummary:
             summary.updated += 1
         else:
             summary.added += 1
+
+    if prune_orphans:
+        summary.removed += _prune_orphan_items(
+            project_id, existing_items, kept_item_ids,
+        )
 
     log.info(
         "Synced %d items to GitHub Project "
