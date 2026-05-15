@@ -295,21 +295,39 @@ def refresh_tracked_prs(
     # Session labels: add any missing ones to in-scope rebase PRs.
     # Cheap N-GET pass; only writes when a PR is short a label.
     from releasy.pipeline import (
-        _pr_number_from_url, reconcile_session_labels_on_prs,
+        _pr_number_from_url, _session_pr_labels,
+        reconcile_session_labels_on_prs,
     )
-    pr_refs: list[tuple[str, int]] = []
-    for _fid, fs in candidates:
-        if not fs.rebase_pr_url:
-            continue
-        num = _pr_number_from_url(fs.rebase_pr_url)
-        if num is not None:
-            pr_refs.append((fs.rebase_pr_url, num))
-    if pr_refs:
-        prs_mod, labels_added = reconcile_session_labels_on_prs(config, pr_refs)
-        if prs_mod:
+    session_labels = _session_pr_labels(config)
+    if session_labels:
+        console.print(
+            f"\n[bold]Reconciling session labels[/bold] "
+            f"([cyan]{', '.join(session_labels)}[/cyan]) "
+            f"across {len(candidates)} tracked PR(s)…"
+        )
+        pr_refs: list[tuple[str, int]] = []
+        for _fid, fs in candidates:
+            if not fs.rebase_pr_url:
+                continue
+            num = _pr_number_from_url(fs.rebase_pr_url)
+            if num is not None:
+                pr_refs.append((fs.rebase_pr_url, num))
+        added_per_pr = reconcile_session_labels_on_prs(config, pr_refs)
+        if added_per_pr:
+            for pr_url, labels in added_per_pr:
+                console.print(
+                    f"  [green]+[/green] [link={pr_url}]{pr_url}[/link] — "
+                    f"added: [cyan]{', '.join(labels)}[/cyan]"
+                )
+            total = sum(len(ls) for _, ls in added_per_pr)
             console.print(
-                f"  [green]✓[/green] session labels: added "
-                f"{labels_added} label(s) across {prs_mod} PR(s)"
+                f"  [green]✓[/green] {total} label(s) added across "
+                f"{len(added_per_pr)} PR(s)"
+            )
+        else:
+            console.print(
+                "  [dim]all tracked PRs already carry every session "
+                "label — nothing to do[/dim]"
             )
 
     any_unresolved = False

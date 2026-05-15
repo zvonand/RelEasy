@@ -3637,21 +3637,21 @@ def _apply_session_labels_to_pr(
 def reconcile_session_labels_on_prs(
     config: Config,
     pr_refs: list[tuple[str, int]],
-) -> tuple[int, int]:
+) -> list[tuple[str, list[str]]]:
     """Ensure every PR in ``pr_refs`` carries every session pr_label.
 
     ``pr_refs`` is ``[(pr_url, pr_number), …]``. Reads each PR's current
     labels via ``fetch_pr_by_url`` (one GET per PR) and only adds the
     missing ones — so a fully-labelled set costs N GETs and zero writes.
-    Returns ``(prs_modified, labels_added)`` for the caller's summary.
+    Returns ``[(pr_url, [added_labels])]`` for every PR where at least
+    one label was added — so the caller can render per-PR detail.
     """
     from releasy.github_ops import fetch_pr_by_url
 
     labels = _session_pr_labels(config)
+    result: list[tuple[str, list[str]]] = []
     if not labels or not pr_refs:
-        return 0, 0
-    prs_modified = 0
-    labels_added = 0
+        return result
     for pr_url, pr_number in pr_refs:
         info = fetch_pr_by_url(config, pr_url, include_closed=True)
         current = {
@@ -3660,14 +3660,13 @@ def reconcile_session_labels_on_prs(
         missing = [l for l in labels if l.lower() not in current]
         if not missing:
             continue
-        added_here = 0
+        actually_added: list[str] = []
         for lbl in missing:
             if add_label_to_pr(config, pr_number, lbl):
-                added_here += 1
-        if added_here:
-            prs_modified += 1
-            labels_added += added_here
-    return prs_modified, labels_added
+                actually_added.append(lbl)
+        if actually_added:
+            result.append((pr_url, actually_added))
+    return result
 
 
 def _apply_missing_prereqs_label_to_pr(
