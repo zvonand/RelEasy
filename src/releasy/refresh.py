@@ -292,6 +292,26 @@ def refresh_tracked_prs(
         )
         return True
 
+    # Session labels: add any missing ones to in-scope rebase PRs.
+    # Cheap N-GET pass; only writes when a PR is short a label.
+    from releasy.pipeline import (
+        _pr_number_from_url, reconcile_session_labels_on_prs,
+    )
+    pr_refs: list[tuple[str, int]] = []
+    for _fid, fs in candidates:
+        if not fs.rebase_pr_url:
+            continue
+        num = _pr_number_from_url(fs.rebase_pr_url)
+        if num is not None:
+            pr_refs.append((fs.rebase_pr_url, num))
+    if pr_refs:
+        prs_mod, labels_added = reconcile_session_labels_on_prs(config, pr_refs)
+        if prs_mod:
+            console.print(
+                f"  [green]✓[/green] session labels: added "
+                f"{labels_added} label(s) across {prs_mod} PR(s)"
+            )
+
     any_unresolved = False
     for fid, fs in candidates:
         outcome = _process_one(

@@ -644,6 +644,11 @@ class SessionConfig:
     """
     features: list[FeatureConfig] = field(default_factory=list)
     pr_sources: PRSourcesConfig = field(default_factory=PRSourcesConfig)
+    # Labels applied to every rebase PR opened in this session. Each name
+    # is auto-created on origin (with releasy's default purple colour) the
+    # first time it's needed. ``releasy refresh`` also reconciles them
+    # onto tracked PRs that are missing one or more.
+    pr_labels: list[str] = field(default_factory=list)
     session_path: Path | None = None
     # Non-fatal issues encountered while loading, e.g. a deps_file overlay
     # entry whose id collided with the main session. Surfaced once at CLI
@@ -1834,9 +1839,20 @@ def load_session(
         overlay_warnings,
     )
 
+    raw_pr_labels = raw.get("pr_labels", []) or []
+    if isinstance(raw_pr_labels, str):
+        raw_pr_labels = [raw_pr_labels]
+    if not isinstance(raw_pr_labels, list) or not all(
+        isinstance(x, str) and x.strip() for x in raw_pr_labels
+    ):
+        raise ValueError(
+            "pr_labels must be a list of non-empty strings"
+        )
+
     return SessionConfig(
         features=features,
         pr_sources=pr_sources,
+        pr_labels=[x.strip() for x in raw_pr_labels],
         session_path=path,
         load_warnings=overlay_warnings,
     )
@@ -2089,6 +2105,9 @@ def save_session(session: SessionConfig, path: Path | None = None) -> None:
         ]
     if ps_data:
         data["pr_sources"] = ps_data
+
+    if session.pr_labels:
+        data["pr_labels"] = list(session.pr_labels)
 
     target.parent.mkdir(parents=True, exist_ok=True)
     with open(target, "w") as f:

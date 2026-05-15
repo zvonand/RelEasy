@@ -949,6 +949,11 @@ def run_pipeline(
         ensure_label(
             config, RELEASY_LABEL, RELEASY_LABEL_COLOR, RELEASY_LABEL_DESCRIPTION,
         )
+        for sess_label in _session_pr_labels(config):
+            ensure_label(
+                config, sess_label, RELEASY_LABEL_COLOR,
+                "Session label (session.pr_labels)",
+            )
 
     ai_active = resolve_conflicts and config.ai_resolve.enabled
     if ai_active:
@@ -1229,6 +1234,11 @@ def run_sequential(
         ensure_label(
             config, RELEASY_LABEL, RELEASY_LABEL_COLOR, RELEASY_LABEL_DESCRIPTION,
         )
+        for sess_label in _session_pr_labels(config):
+            ensure_label(
+                config, sess_label, RELEASY_LABEL_COLOR,
+                "Session label (session.pr_labels)",
+            )
 
     ai_active = resolve_conflicts and config.ai_resolve.enabled
     if ai_active:
@@ -3292,6 +3302,7 @@ def _ensure_pr_for_existing_remote_branch(
         fs.rebase_pr_url = pr_url
         fs.status = "needs_review"
         _apply_releasy_label_to_pr(config, pr_url)
+        _apply_session_labels_to_pr(config, pr_url)
         if fs.ai_resolved:
             _apply_ai_label_to_pr(config, pr_url)
         if needs_recovery:
@@ -3384,6 +3395,7 @@ def _finish_clean_unit(
             state.features[unit.feature_id].rebase_pr_url = rebase_pr_url
             state.features[unit.feature_id].status = "needs_review"
             _apply_releasy_label_to_pr(config, rebase_pr_url)
+            _apply_session_labels_to_pr(config, rebase_pr_url)
             if ai_used:
                 _apply_ai_label_to_pr(config, rebase_pr_url)
             if has_auto_prereqs:
@@ -3402,6 +3414,9 @@ def _finish_clean_unit(
         existing = find_pr_for_branch(config, new_branch, base_branch)
         if existing:
             _apply_releasy_label_to_pr(
+                config, existing.url, pr_number=existing.number,
+            )
+            _apply_session_labels_to_pr(
                 config, existing.url, pr_number=existing.number,
             )
             if ai_used:
@@ -3591,6 +3606,68 @@ def _apply_releasy_label_to_pr(
     if pr_number is None:
         return
     add_label_to_pr(config, pr_number, RELEASY_LABEL)
+
+
+def _session_pr_labels(config: Config) -> list[str]:
+    """Session-defined labels to apply to every rebase PR (may be empty)."""
+    if config.session is None:
+        return []
+    return list(config.session.pr_labels)
+
+
+def _apply_session_labels_to_pr(
+    config: Config, pr_url: str, pr_number: int | None = None,
+) -> None:
+    """Best-effort: attach every ``session.pr_labels`` label to the PR.
+
+    Idempotent — ``add_label_to_pr`` is a no-op for labels the PR
+    already carries.
+    """
+    labels = _session_pr_labels(config)
+    if not labels:
+        return
+    if pr_number is None:
+        pr_number = _pr_number_from_url(pr_url)
+    if pr_number is None:
+        return
+    for label in labels:
+        add_label_to_pr(config, pr_number, label)
+
+
+def reconcile_session_labels_on_prs(
+    config: Config,
+    pr_refs: list[tuple[str, int]],
+) -> tuple[int, int]:
+    """Ensure every PR in ``pr_refs`` carries every session pr_label.
+
+    ``pr_refs`` is ``[(pr_url, pr_number), …]``. Reads each PR's current
+    labels via ``fetch_pr_by_url`` (one GET per PR) and only adds the
+    missing ones — so a fully-labelled set costs N GETs and zero writes.
+    Returns ``(prs_modified, labels_added)`` for the caller's summary.
+    """
+    from releasy.github_ops import fetch_pr_by_url
+
+    labels = _session_pr_labels(config)
+    if not labels or not pr_refs:
+        return 0, 0
+    prs_modified = 0
+    labels_added = 0
+    for pr_url, pr_number in pr_refs:
+        info = fetch_pr_by_url(config, pr_url, include_closed=True)
+        current = {
+            (l or "").lower() for l in ((info.labels if info else None) or [])
+        }
+        missing = [l for l in labels if l.lower() not in current]
+        if not missing:
+            continue
+        added_here = 0
+        for lbl in missing:
+            if add_label_to_pr(config, pr_number, lbl):
+                added_here += 1
+        if added_here:
+            prs_modified += 1
+            labels_added += added_here
+    return prs_modified, labels_added
 
 
 def _apply_missing_prereqs_label_to_pr(
@@ -4181,6 +4258,9 @@ def _handle_unresolved_conflict(
             _apply_releasy_label_to_pr(
                 config, rebase_pr_url, pr_number=existing.number,
             )
+            _apply_session_labels_to_pr(
+                config, rebase_pr_url, pr_number=existing.number,
+            )
         else:
             rebase_pr_url = create_pull_request(
                 config, new_branch, base_branch, title, body,
@@ -4194,6 +4274,7 @@ def _handle_unresolved_conflict(
                     f"[dim](label: {config.ai_resolve.needs_attention_label})[/dim]"
                 )
                 _apply_releasy_label_to_pr(config, rebase_pr_url)
+                _apply_session_labels_to_pr(config, rebase_pr_url)
             else:
                 console.print(
                     "    [yellow]![/yellow] Could not open draft PR for "
@@ -4525,6 +4606,9 @@ def _open_pr_for_resolved(
         # Make sure the `releasy` label is present even on PRs from older
         # runs that predated label-based identification.
         _apply_releasy_label_to_pr(config, fs.rebase_pr_url, pr_number=pr_num)
+        _apply_session_labels_to_pr(
+            config, fs.rebase_pr_url, pr_number=pr_num,
+        )
         if fs.ai_resolved:
             _apply_ai_label_to_pr(
                 config, fs.rebase_pr_url, pr_number=pr_num,
@@ -4561,6 +4645,7 @@ def _open_pr_for_resolved(
         fs.status = "needs_review"
         state.features[_feature_id_from_branch(state, branch)] = fs
         _apply_releasy_label_to_pr(config, pr_url)
+        _apply_session_labels_to_pr(config, pr_url)
         if fs.ai_resolved:
             _apply_ai_label_to_pr(config, pr_url)
 
