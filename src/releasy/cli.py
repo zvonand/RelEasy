@@ -1173,9 +1173,12 @@ def refresh(
             raise SystemExit(1)
         return
 
-    # Non-stateless paths: load + lock the project's config.
+    # Non-stateless paths: load + lock the project's config. Session is
+    # loaded "optional" (not "skip") so session.pr_labels is visible and
+    # `refresh` can reconcile labels onto tracked PRs. A missing session
+    # file is still fine — the label pass is a no-op when not configured.
     if pr_url is None:
-        with _locked_config(ctx, session="skip") as config:
+        with _locked_config(ctx, session="optional") as config:
             config.dry_run = dry_run
             if not refresh_tracked_prs(
                 config, wd, resolve_conflicts=ai_resolve_flag,
@@ -1184,7 +1187,7 @@ def refresh(
                 raise SystemExit(1)
         return
 
-    with _locked_config(ctx, session="skip") as config:
+    with _locked_config(ctx, session="optional") as config:
         config.dry_run = dry_run
         if not resolve_conflicts_for_pr(
             config, pr_url, wd, resolve_conflicts=ai_resolve_flag,

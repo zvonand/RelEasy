@@ -960,6 +960,31 @@ def resolve_conflicts_for_pr(
             "GitHub writes will happen. Output shows intended actions only."
         )
 
+    # Session labels: add any missing ones to this PR.
+    from releasy.pipeline import (
+        _session_pr_labels, reconcile_session_labels_on_prs,
+    )
+    session_labels = _session_pr_labels(config)
+    if session_labels:
+        console.print(
+            f"\n[bold]Reconciling session labels[/bold] "
+            f"([cyan]{', '.join(session_labels)}[/cyan]) on the PR…"
+        )
+        added_per_pr = reconcile_session_labels_on_prs(
+            config, [(rebase_pr.url, rebase_pr.number)],
+        )
+        if added_per_pr:
+            for pr_url_, labels_ in added_per_pr:
+                console.print(
+                    f"  [green]+[/green] [link={pr_url_}]{pr_url_}[/link] — "
+                    f"added: [cyan]{', '.join(labels_)}[/cyan]"
+                )
+        else:
+            console.print(
+                "  [dim]PR already carries every session label — nothing "
+                "to do[/dim]"
+            )
+
     source_pr = _resolve_source_pr(config, rebase_pr)
 
     console.print(
