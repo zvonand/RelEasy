@@ -80,6 +80,19 @@ def _persist_state(config: Config, state: PipelineState) -> None:
         sync_project(config, state)
 
 
+def _dry_record(state: PipelineState, action: str) -> None:
+    """Increment a dry-run action counter on ``state``.
+
+    Counts are populated only when ``run_pipeline`` is invoked with
+    ``config.dry_run`` (it seeds ``state._dry_run_actions``); otherwise
+    this is a no-op. ``run_pipeline`` reads them back at the end to
+    print a planned-actions summary.
+    """
+    counts = getattr(state, "_dry_run_actions", None)
+    if counts is not None:
+        counts[action] = counts.get(action, 0) + 1
+
+
 def _setup_repo(
     config: Config, work_dir: Path | None, base_branch: str | None = None,
 ) -> Path:
@@ -921,6 +934,7 @@ def run_pipeline(
         "(origin) — RelEasy never opens PRs against any other repo."
     )
     if config.dry_run:
+        state._dry_run_actions = {}  # type: ignore[attr-defined]
         console.print(
             "\n[bold magenta]DRY RUN[/bold magenta]: no state, repo, or "
             "GitHub writes will happen. Output shows intended actions only."
@@ -1020,6 +1034,23 @@ def run_pipeline(
             console.print(
                 f"  [dim]{unit.feature_id} ({ref}) — {prev_fs.status}, skipping[/dim]"
             )
+            if config.dry_run:
+                if unit.is_group:
+                    console.print(
+                        f"    [dim]· group of {len(unit.prs)} PR(s); "
+                        f"primary {ref}[/dim]"
+                    )
+                if prev_fs.rebase_pr_url:
+                    console.print(
+                        f"    [dim]· rebase PR: "
+                        f"[link={prev_fs.rebase_pr_url}]"
+                        f"{prev_fs.rebase_pr_url}[/link][/dim]"
+                    )
+                if prev_fs.status == "skipped" and prev_fs.skip_reason:
+                    console.print(
+                        f"    [dim]· reason: {prev_fs.skip_reason}[/dim]"
+                    )
+                _dry_record(state, f"skip-{prev_fs.status}")
             continue
         # _process_feature_unit always returns "continue" — unresolved
         # conflicts are now handled in-place (drop the branch or open a
@@ -1035,6 +1066,39 @@ def run_pipeline(
     _persist_state(config, state)
 
     # --- Summary ---
+    if config.dry_run:
+        counts = getattr(state, "_dry_run_actions", {}) or {}
+        total = sum(counts.values())
+        console.print(
+            f"\n[bold magenta]Dry-run plan[/bold magenta] — "
+            f"{total} unit(s) inspected"
+        )
+        if state.base_branch:
+            console.print(f"  Base branch: [cyan]{state.base_branch}[/cyan]")
+        if counts:
+            order = [
+                ("fresh-port",                  "would fresh-port"),
+                ("rebuild-from-base",           "would rebuild from base (retry-failed)"),
+                ("append",                      "would append to existing branch"),
+                ("refresh-existing-pr",         "would refresh existing rebase PR"),
+                ("open-pr-for-existing-branch", "would open PR for already-pushed branch"),
+                ("record-existing-branch-state","would record state for existing branch"),
+                ("blocked-by-deps",             "blocked by unmet deps (no action)"),
+                ("skip-conflict-retry-off",     "skip — prior conflict, retry-off"),
+                ("skip-merged",                 "skip — already merged"),
+                ("skip-skipped",                "skip — user-marked skipped"),
+            ]
+            for code, label in order:
+                if counts.get(code):
+                    console.print(f"  [magenta]·[/magenta] {label}: {counts[code]}")
+            # Catch any unmapped action codes so the summary stays honest
+            # if a new one is added but not registered above.
+            mapped = {code for code, _ in order}
+            for code, n in counts.items():
+                if code not in mapped:
+                    console.print(f"  [magenta]·[/magenta] {code}: {n}")
+        return state
+
     console.print(f"\n[bold]Pipeline complete.[/bold] Phase: {state.phase}")
     if state.base_branch:
         console.print(f"  Base branch: [cyan]{state.base_branch}[/cyan]")
@@ -2337,6 +2401,23 @@ def _refresh_existing_pr_unit(
             f"[cyan]{remote}/{base_branch}[/cyan] into "
             f"[cyan]{new_branch}[/cyan]{tail}"
         )
+        if prev_state.rebase_pr_url:
+            console.print(
+                f"    [dim]· rebase PR: "
+                f"[link={prev_state.rebase_pr_url}]"
+                f"{prev_state.rebase_pr_url}[/link][/dim]"
+            )
+        primary = unit.primary_pr()
+        if primary and primary.url:
+            extra = (
+                f" (+{len(unit.prs) - 1} more)"
+                if unit.is_group else ""
+            )
+            console.print(
+                f"    [dim]· source PR: "
+                f"[link={primary.url}]{primary.url}[/link]{extra}[/dim]"
+            )
+        _dry_record(state, "refresh-existing-pr")
         return
 
     source_pr = _synthesise_source_pr(prev_state)
@@ -2482,6 +2563,7 @@ def _process_feature_unit(
             blocked_state.prereq_recovery_exhausted = False
             state.features[unit.feature_id] = blocked_state
             _persist_state(config, state)
+            _dry_record(state, "blocked-by-deps")
             return "continue"
         # Deps were just satisfied — clear stale blocked state so the
         # unit re-enters the normal flow below.
@@ -2498,6 +2580,7 @@ def _process_feature_unit(
             "skipping (pr_policy.retry_failed: false / "
             "--no-retry-failed)[/dim]"
         )
+        _dry_record(state, "skip-conflict-retry-off")
         return "continue"
 
     on_remote_canon = remote_branch_exists(
@@ -2713,21 +2796,25 @@ def _process_feature_unit(
                     f"cherry-pick {len(unit.prs)} PR(s) onto existing branch tip "
                     f"(append)"
                 )
+                action_code = "append"
             elif force_retry:
                 action = (
                     f"rebuild [cyan]{new_branch}[/cyan] from [cyan]{base_ref}[/cyan] "
                     f"and cherry-pick {len(unit.prs)} PR(s) (retry-failed)"
                 )
+                action_code = "rebuild-from-base"
             else:
                 action = (
                     f"create [cyan]{new_branch}[/cyan] from [cyan]{base_ref}[/cyan] "
                     f"and cherry-pick {len(unit.prs)} PR(s)"
                 )
+                action_code = "fresh-port"
             console.print(f"    [magenta]dry-run:[/magenta] would {action}")
             console.print(
                 "    [magenta]dry-run:[/magenta] then push + open rebase PR "
                 "(conflict outcome unknown — not simulated)"
             )
+            _dry_record(state, action_code)
             return "continue"
 
         pr_meta = _unit_pr_meta(unit)
@@ -3142,6 +3229,12 @@ def _ensure_pr_for_existing_remote_branch(
         console.print(
             f"    [magenta]dry-run:[/magenta] would {verb} existing remote "
             f"branch [cyan]{new_branch}[/cyan]"
+        )
+        _dry_record(
+            state,
+            "open-pr-for-existing-branch"
+            if config.pr_policy.auto_pr
+            else "record-existing-branch-state",
         )
         return
 
