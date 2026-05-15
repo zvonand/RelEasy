@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from releasy.config import Config, get_ssh_key_path
+from releasy.termlog import console
 
 
 @dataclass
@@ -278,6 +279,13 @@ def force_push(repo_path: Path, branch: str, config: Config) -> None:
     Any future code that wants to push elsewhere has to be added
     explicitly — it can't happen by accident through this helper.
     """
+    if config.dry_run:
+        console.print(
+            f"    [magenta]dry-run:[/magenta] would force-push "
+            f"[cyan]{branch}[/cyan] to "
+            f"[cyan]{config.origin.remote_name}[/cyan]"
+        )
+        return
     run_git(["push", "--force", config.origin.remote_name, branch], repo_path)
 
 

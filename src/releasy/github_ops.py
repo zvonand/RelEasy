@@ -119,6 +119,12 @@ def create_pull_request(
 
     Returns the PR URL, or None if creation failed.
     """
+    if config.dry_run:
+        log.info(
+            "[dry-run] would open PR on origin: %s → %s — %r", head, base, title,
+        )
+        return None
+
     token = get_github_token()
     if not token:
         log.warning("RELEASY_GITHUB_TOKEN not set — cannot create PR")
@@ -168,6 +174,10 @@ def update_pull_request(
     "leave that field alone". Like ``create_pull_request``, this only ever
     targets the configured origin — no parameter to point elsewhere.
     """
+    if config.dry_run:
+        log.info("[dry-run] would update PR #%d", pr_number)
+        return True
+
     token = get_github_token()
     if not token:
         log.warning("RELEASY_GITHUB_TOKEN not set — cannot update PR")
@@ -792,6 +802,10 @@ def ensure_label(
 
     Returns True if the label exists (pre-existing or freshly created).
     """
+    if config.dry_run:
+        log.info("[dry-run] would ensure label %r on origin", name)
+        return True
+
     token = get_github_token()
     if not token:
         log.warning("RELEASY_GITHUB_TOKEN not set \u2014 cannot ensure label %s", name)
@@ -832,6 +846,10 @@ def ensure_label(
 
 def add_label_to_pr(config: Config, pr_number: int, label: str) -> bool:
     """Attach a label to a PR **on the origin repo**. Idempotent on repeated calls."""
+    if config.dry_run:
+        log.info("[dry-run] would add label %r to PR #%d", label, pr_number)
+        return True
+
     token = get_github_token()
     if not token:
         log.warning("RELEASY_GITHUB_TOKEN not set \u2014 cannot label PR #%d", pr_number)
@@ -919,6 +937,12 @@ def remove_label_from_pr(config: Config, pr_number: int, label: str) -> bool:
     ``ai-needs-attention`` once a previously-conflicted port has been
     re-resolved.
     """
+    if config.dry_run:
+        log.info(
+            "[dry-run] would remove label %r from PR #%d", label, pr_number,
+        )
+        return True
+
     token = get_github_token()
     if not token:
         log.warning(
@@ -2420,6 +2444,11 @@ def sync_project(
     continue``) can tell the user "added 3 missing items" without parsing
     log output.
     """
+    if config.dry_run:
+        return ProjectSyncSummary(
+            skipped=True, skipped_reason="dry-run",
+        )
+
     project_url = config.notifications.github_project
     if not project_url:
         return ProjectSyncSummary(

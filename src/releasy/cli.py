@@ -248,6 +248,18 @@ def cli(
          "resolves them). Never force-pushes — only fast-forward / "
          "merge-commit pushes. Default: off.",
 )
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    default=False,
+    help="Show what the run would do without changing anything: no "
+         "state writes, no git mutations (cherry-pick / push / branch), "
+         "no GitHub writes (PR / labels / project board). Read-only "
+         "GitHub fetches still happen so the plan reflects current "
+         "reality. Cannot predict cherry-pick conflicts — shows "
+         "intended actions only.",
+)
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -257,6 +269,7 @@ def run(
     retry_failed: bool | None,
     only: str | None,
     merge_target: bool,
+    dry_run: bool,
 ) -> None:
     """Discover and port new PRs onto the base branch (cherry-pick + open PR)."""
     from releasy.pipeline import parse_only, run_pipeline, run_sequential
@@ -279,6 +292,7 @@ def run(
             config.pr_policy.retry_failed
             if retry_failed is None else retry_failed
         )
+        config.dry_run = dry_run
 
         if config.sequential:
             run_sequential(

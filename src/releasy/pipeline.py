@@ -73,6 +73,8 @@ from releasy.state import FeatureState, PipelineState, load_state, save_state
 
 def _persist_state(config: Config, state: PipelineState) -> None:
     """Persist state to the per-project state file and (optionally) sync the project board."""
+    if config.dry_run:
+        return
     save_state(state, config)
     if config.push:
         sync_project(config, state)
@@ -758,6 +760,13 @@ def _apply_merged_labels(config: Config, state: PipelineState) -> None:
     if not pending:
         return
 
+    if config.dry_run:
+        console.print(
+            f"  [magenta]dry-run:[/magenta] would apply merged label "
+            f"[cyan]{label}[/cyan] to {len(pending)} merged port PR(s)"
+        )
+        return
+
     if not ensure_label(
         config, label, config.merged_label_color,
         f"Port merged into {state.base_branch or 'target'}",
@@ -869,11 +878,18 @@ def run_pipeline(
 
     if is_operation_in_progress(repo_path):
         if config.pr_policy.if_exists == "recreate":
-            kind = abort_in_progress_op(repo_path)
-            console.print(
-                f"\n[yellow]↻ Aborted in-progress {kind} in [cyan]{repo_path}[/cyan][/yellow] "
-                f"(pr_policy.if_exists: recreate)"
-            )
+            if config.dry_run:
+                console.print(
+                    f"\n[magenta]dry-run:[/magenta] would abort in-progress "
+                    f"git op in [cyan]{repo_path}[/cyan] "
+                    "(pr_policy.if_exists: recreate)"
+                )
+            else:
+                kind = abort_in_progress_op(repo_path)
+                console.print(
+                    f"\n[yellow]↻ Aborted in-progress {kind} in [cyan]{repo_path}[/cyan][/yellow] "
+                    f"(pr_policy.if_exists: recreate)"
+                )
         else:
             console.print(
                 f"\n[red]✗[/red] A cherry-pick/merge/rebase is already in progress "
@@ -904,6 +920,11 @@ def run_pipeline(
         f"PRs will be opened against [bold cyan]{require_origin_repo_slug(config)}[/bold cyan] "
         "(origin) — RelEasy never opens PRs against any other repo."
     )
+    if config.dry_run:
+        console.print(
+            "\n[bold magenta]DRY RUN[/bold magenta]: no state, repo, or "
+            "GitHub writes will happen. Output shows intended actions only."
+        )
 
     state.set_started(onto)
     state.base_branch = base_branch
@@ -1089,11 +1110,18 @@ def run_sequential(
 
     if is_operation_in_progress(repo_path):
         if config.pr_policy.if_exists == "recreate":
-            kind = abort_in_progress_op(repo_path)
-            console.print(
-                f"\n[yellow]↻ Aborted in-progress {kind} in [cyan]{repo_path}[/cyan][/yellow] "
-                f"(pr_policy.if_exists: recreate)"
-            )
+            if config.dry_run:
+                console.print(
+                    f"\n[magenta]dry-run:[/magenta] would abort in-progress "
+                    f"git op in [cyan]{repo_path}[/cyan] "
+                    "(pr_policy.if_exists: recreate)"
+                )
+            else:
+                kind = abort_in_progress_op(repo_path)
+                console.print(
+                    f"\n[yellow]↻ Aborted in-progress {kind} in [cyan]{repo_path}[/cyan][/yellow] "
+                    f"(pr_policy.if_exists: recreate)"
+                )
         else:
             console.print(
                 f"\n[red]✗[/red] A cherry-pick/merge/rebase is already in progress "
@@ -2298,6 +2326,19 @@ def _refresh_existing_pr_unit(
         "skipping cherry-pick rebuild)[/dim]"
     )
 
+    if config.dry_run:
+        tail = (
+            " (always-push --merge-target)"
+            if force_merge
+            else " (push only if conflicts AI-resolved)"
+        )
+        console.print(
+            f"    [magenta]dry-run:[/magenta] would merge "
+            f"[cyan]{remote}/{base_branch}[/cyan] into "
+            f"[cyan]{new_branch}[/cyan]{tail}"
+        )
+        return
+
     source_pr = _synthesise_source_pr(prev_state)
     if source_pr is None:
         # We have a rebase_pr_url but the FeatureState has no source PR
@@ -2665,6 +2706,29 @@ def _process_feature_unit(
             if pr.url in fs_dynamic_prereq_urls:
                 tag = " [dim](auto-prereq)[/dim]"
             console.print(f"    PR {ref}: {pr.url}  [{pr.state}]{tag}")
+
+        if config.dry_run:
+            if append_active:
+                action = (
+                    f"cherry-pick {len(unit.prs)} PR(s) onto existing branch tip "
+                    f"(append)"
+                )
+            elif force_retry:
+                action = (
+                    f"rebuild [cyan]{new_branch}[/cyan] from [cyan]{base_ref}[/cyan] "
+                    f"and cherry-pick {len(unit.prs)} PR(s) (retry-failed)"
+                )
+            else:
+                action = (
+                    f"create [cyan]{new_branch}[/cyan] from [cyan]{base_ref}[/cyan] "
+                    f"and cherry-pick {len(unit.prs)} PR(s)"
+                )
+            console.print(f"    [magenta]dry-run:[/magenta] would {action}")
+            console.print(
+                "    [magenta]dry-run:[/magenta] then push + open rebase PR "
+                "(conflict outcome unknown — not simulated)"
+            )
+            return "continue"
 
         pr_meta = _unit_pr_meta(unit)
         stash_and_clean(repo_path)
@@ -3067,6 +3131,18 @@ def _ensure_pr_for_existing_remote_branch(
     compare-URL link.
     """
     if not config.push:
+        return
+
+    if config.dry_run:
+        verb = (
+            "open PR (if missing) for"
+            if config.pr_policy.auto_pr
+            else "record state for"
+        )
+        console.print(
+            f"    [magenta]dry-run:[/magenta] would {verb} existing remote "
+            f"branch [cyan]{new_branch}[/cyan]"
+        )
         return
 
     fs = state.features.get(unit.feature_id)

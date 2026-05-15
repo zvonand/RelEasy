@@ -717,6 +717,14 @@ class Config:
     # via :func:`is_stateless` so the flag lives in one place.
     stateless: bool = False
 
+    # Set by ``--dry-run`` on ``releasy run``. When True, every mutating
+    # helper (state writes, repo writes, GitHub writes) short-circuits to
+    # a logged no-op so the user can see what the command *would* do
+    # against the current state of the world without committing any
+    # changes. Read-only GitHub fetches still happen so the plan is
+    # accurate.
+    dry_run: bool = False
+
     @property
     def repo_dir(self) -> Path:
         """Directory containing ``config.yaml``.
