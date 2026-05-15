@@ -13,6 +13,7 @@ multi-project bookkeeping it's meant to side-step.
 
 from __future__ import annotations
 
+import re
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,9 +43,13 @@ from releasy.github_ops import (
     PRInfo,
     create_pull_request,
     fetch_pr_by_number,
+    get_origin_repo_slug,
     parse_source_url,
     slug_to_https_url,
 )
+
+
+FORMATTING_SECTION_HEADER = "CI/CD Options"
 
 
 SourceKind = Literal["pr", "commit", "tag"]
@@ -75,6 +80,7 @@ class StatelessOptions:
     prompt_file: str | None = None
     timeout_seconds: int = 7200
     max_iterations: int = 5
+    formatting_example_url: str | None = None
 
 
 @dataclass
@@ -327,6 +333,73 @@ def _try_ai_resolve(
 # ---------------------------------------------------------------------------
 
 
+_HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+_CHECKBOX_RE = re.compile(r"^\s*[-*+]\s*\[[ xX]\]")
+
+
+def _extract_markdown_section(body: str, header_text: str) -> str | None:
+    """Return the section from ``header_text`` to EOF, trimmed after the
+    last ``- [ ]`` / ``- [x]`` checkbox if any exist. ``None`` if the
+    header isn't found. Header match is case-insensitive."""
+    target = header_text.strip().lower()
+    lines = body.splitlines()
+    start: int | None = None
+    for i, line in enumerate(lines):
+        m = _HEADER_RE.match(line)
+        if m and m.group(2).strip().lower() == target:
+            start = i
+            break
+    if start is None:
+        return None
+
+    section = lines[start:]
+    last_checkbox = -1
+    for j, line in enumerate(section):
+        if _CHECKBOX_RE.match(line):
+            last_checkbox = j
+    if last_checkbox >= 0:
+        section = section[: last_checkbox + 1]
+    return "\n".join(section).rstrip()
+
+
+def _fetch_formatting_section(
+    config: Config, url: str,
+) -> tuple[str | None, str | None]:
+    """Fetch a same-origin PR and return ``(section, error)`` — exactly
+    one is non-None. The PR slug must match origin."""
+    parsed = parse_source_url(url)
+    if parsed is None or parsed[0] != "pr":
+        return None, (
+            f"--formatting-example must be a PR URL (/pull/N), got: {url!r}"
+        )
+    _, owner, repo, ident = parsed
+    example_slug = f"{owner}/{repo}"
+    origin_slug = get_origin_repo_slug(config)
+    if origin_slug and example_slug.lower() != origin_slug.lower():
+        return None, (
+            f"--formatting-example PR must live in the origin repo "
+            f"({origin_slug}); got {example_slug}"
+        )
+
+    pr = fetch_pr_by_number(
+        config, int(ident), slug=example_slug, include_closed=True,
+    )
+    if pr is None:
+        return None, (
+            f"could not fetch --formatting-example PR {example_slug}#{ident}"
+        )
+
+    section = _extract_markdown_section(
+        pr.body or "", FORMATTING_SECTION_HEADER,
+    )
+    if section is None:
+        return None, (
+            f"--formatting-example PR {pr.url} has no "
+            f"{FORMATTING_SECTION_HEADER!r} section"
+        )
+    return section, None
+
+
 def _pr_title(
     kind: SourceKind, slug: str, ident: str, pr_info: PRInfo | None,
 ) -> str:
@@ -342,13 +415,16 @@ def _pr_title(
 
 def _pr_body(
     kind: SourceKind, source_url: str, pr_info: PRInfo | None,
+    *,
+    extra_section: str | None = None,
 ) -> str:
     """Compose the rebase PR body.
 
     Starts with a one-line "cherry-picked from <url>" so reviewers can
     jump back to the source, then folds the source title / body in
     when we have it. Body is truncated for non-PR commits to avoid
-    pasting in a 1000-line conventional-commit dump.
+    pasting in a 1000-line conventional-commit dump. ``extra_section``
+    is appended verbatim.
     """
     lines: list[str] = [f"Cherry-picked from {source_url}."]
     if pr_info is not None:
@@ -363,6 +439,11 @@ def _pr_body(
             if kind != "pr" and len(body) > 4000:
                 body = body[:4000] + "\n\n_(truncated)_"
             lines.append(body)
+    if extra_section:
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        lines.append(extra_section)
     return "\n".join(lines)
 
 
@@ -543,8 +624,25 @@ def run_stateless_cherry_pick(opts: StatelessOptions) -> StatelessResult:
                 "[yellow]![/yellow] --with-pr requires push; skipping PR creation."
             )
         else:
+            extra_section: str | None = None
+            if opts.formatting_example_url:
+                extra_section, err = _fetch_formatting_section(
+                    config, opts.formatting_example_url,
+                )
+                if err:
+                    console.print(f"[yellow]![/yellow] {err}")
+                else:
+                    console.print(
+                        f"[green]✓[/green] Copied "
+                        f"{FORMATTING_SECTION_HEADER!r} section from "
+                        f"[link={opts.formatting_example_url}]"
+                        f"formatting example[/link]"
+                    )
             title = _pr_title(kind, slug, ident, pr_info)
-            body = _pr_body(kind, opts.source_url, pr_info)
+            body = _pr_body(
+                kind, opts.source_url, pr_info,
+                extra_section=extra_section,
+            )
             pr_url = create_pull_request(
                 config, branch, opts.target, title, body,
             )

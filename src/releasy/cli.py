@@ -399,6 +399,14 @@ def run(
     show_default=True,
     help="Maximum build attempts Claude may make per resolve invocation.",
 )
+@click.option(
+    "--formatting-example",
+    "formatting_example_url",
+    default=None,
+    help="URL of a PR in the origin repo whose 'CI/CD Options' section "
+         "should be appended to the new PR body. The rest of that PR's "
+         "body is ignored. Requires --with-pr.",
+)
 def cherry_pick_cmd(
     origin: str,
     target: str,
@@ -413,6 +421,7 @@ def cherry_pick_cmd(
     prompt_file: str | None,
     timeout_seconds: int,
     max_iterations: int,
+    formatting_example_url: str | None,
 ) -> None:
     """One-off cross-repo cherry-pick — no config file, no state file.
 
@@ -436,6 +445,11 @@ def cherry_pick_cmd(
             "--with-pr requires --push; cannot open a PR for an "
             "unpushed branch."
         )
+    if formatting_example_url and not with_pr:
+        raise click.UsageError(
+            "--formatting-example only applies when opening a PR; "
+            "pass --with-pr or drop --formatting-example."
+        )
 
     from releasy.stateless import StatelessOptions, run_stateless_cherry_pick
 
@@ -453,6 +467,7 @@ def cherry_pick_cmd(
         prompt_file=prompt_file,
         timeout_seconds=timeout_seconds,
         max_iterations=max_iterations,
+        formatting_example_url=formatting_example_url,
     )
 
     result = run_stateless_cherry_pick(opts)
