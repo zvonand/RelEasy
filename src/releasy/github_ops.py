@@ -226,6 +226,10 @@ def close_pull_request(
     PR was already closed, False on any GitHub failure. Like the other
     write helpers this only ever targets the configured origin.
     """
+    if config.dry_run:
+        log.info("[dry-run] would close PR #%d", pr_number)
+        return True
+
     token = get_github_token()
     if not token:
         log.warning("RELEASY_GITHUB_TOKEN not set — cannot close PR")

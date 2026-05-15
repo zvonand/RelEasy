@@ -515,6 +515,16 @@ def rebase_one_pr(
         f"branch [cyan]{new_branch}[/cyan][/dim]"
     )
 
+    if config.dry_run:
+        console.print(
+            f"    [magenta]dry-run:[/magenta] would create "
+            f"[cyan]{new_branch}[/cyan] off [cyan]{target_ref}[/cyan], "
+            f"cherry-pick {len(commits)} commit(s), push, and open a "
+            "fresh PR (closing the original as superseded). Conflict "
+            "outcome unknown — not simulated."
+        )
+        return RebaseOutcome(pr_url=pr_url, success=True)
+
     stash_and_clean(repo_path)
     _abort_any(repo_path)
     if local_branch_exists(repo_path, new_branch):
@@ -638,6 +648,11 @@ def rebase_single(
 ) -> RebaseSummary:
     """Drive ``releasy rebase --pr <url> --target <branch>``."""
     repo_path = _setup(config, work_dir, target_branch)
+    if config.dry_run:
+        console.print(
+            "\n[bold magenta]DRY RUN[/bold magenta]: no branches, "
+            "cherry-picks, pushes, or PR opens/closes will happen."
+        )
     summary = RebaseSummary()
     summary.outcomes.append(
         rebase_one_pr(
@@ -695,6 +710,11 @@ def rebase_all_tracked(
         f"\n[bold]Rebasing {len(candidates)} tracked PR(s) onto "
         f"[cyan]{target_branch}[/cyan]{scope}[/bold]"
     )
+    if config.dry_run:
+        console.print(
+            "[bold magenta]DRY RUN[/bold magenta]: no branches, "
+            "cherry-picks, pushes, or PR opens/closes will happen."
+        )
     for _fid, url in candidates:
         summary.outcomes.append(
             rebase_one_pr(

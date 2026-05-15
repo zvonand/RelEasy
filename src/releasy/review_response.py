@@ -311,6 +311,8 @@ def _record_review_addressed(
     if fs is None:
         return
     fs.last_review_addressed_at = when_iso
+    if config.dry_run:
+        return
     try:
         save_state(state, config)
     except Exception as exc:  # pragma: no cover — defensive

@@ -4278,6 +4278,11 @@ def _resolve_branch_target(
 
 def continue_branch(config: Config, branch_name: str) -> bool:
     """Mark a previously-conflicted port as resolved."""
+    if config.dry_run:
+        console.print(
+            "[bold magenta]DRY RUN[/bold magenta]: no state, repo, or "
+            "GitHub writes will happen."
+        )
     state = load_state(config)
     feat = _resolve_branch_target(config, state, branch_name)
 
@@ -4544,6 +4549,11 @@ def continue_all(config: Config, work_dir: Path | None = None) -> bool:
     console.print(
         f"\n[bold]Continuing[/bold] — base [cyan]{base_branch}[/cyan]"
     )
+    if config.dry_run:
+        console.print(
+            "\n[bold magenta]DRY RUN[/bold magenta]: no state, repo, or "
+            "GitHub writes will happen."
+        )
 
     # Pick up ports merged externally since the last run; ``continue``
     # is the natural place to reconcile, so apply the merged_label sweep

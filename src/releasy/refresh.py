@@ -83,6 +83,8 @@ def _persist(config: Config, state: PipelineState) -> None:
     the new ``conflict`` status as soon as we mark it (instead of
     waiting for the next ``releasy continue`` pass).
     """
+    if config.dry_run:
+        return
     save_state(state, config)
     if config.push:
         sync_project(config, state)
@@ -241,6 +243,12 @@ def refresh_tracked_prs(
         )
         console.print(f"[dim]AI conflict resolver: {why}[/dim]")
 
+    if config.dry_run:
+        console.print(
+            "\n[bold magenta]DRY RUN[/bold magenta]: no state, repo, or "
+            "GitHub writes will happen. Output shows intended actions only."
+        )
+
     # Catch ports merged externally since the previous run, then apply
     # the configured merged_label (if any) — same post-merge bookkeeping
     # the main pipeline does. Refresh is the natural home for it: this
@@ -388,6 +396,18 @@ def run_merge_resolve(
             status="skipped",
             error=f"branch {head_branch!r} missing on {remote}",
         )
+
+    if config.dry_run:
+        tail = (
+            " (always push --merge-target)"
+            if force_merge
+            else " (push only if conflicts AI-resolved)"
+        )
+        console.print(
+            f"    [magenta]dry-run:[/magenta] would merge "
+            f"[cyan]{base_ref}[/cyan] into [cyan]{head_branch}[/cyan]{tail}"
+        )
+        return MergeResolveOutcome(status="clean")
 
     start_sha = _refresh_local_branch(repo_path, head_branch, remote)
     if start_sha is None:
@@ -895,6 +915,12 @@ def resolve_conflicts_for_pr(
             else "disabled in config"
         )
         console.print(f"[dim]AI conflict resolver: {why}[/dim]")
+
+    if config.dry_run:
+        console.print(
+            "\n[bold magenta]DRY RUN[/bold magenta]: no state, repo, or "
+            "GitHub writes will happen. Output shows intended actions only."
+        )
 
     source_pr = _resolve_source_pr(config, rebase_pr)
 

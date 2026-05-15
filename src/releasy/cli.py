@@ -505,12 +505,27 @@ def cherry_pick_cmd(
          "and refreshes the GitHub Project board.",
 )
 @click.option("--work-dir", default=None, help="Working directory for git operations")
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    default=False,
+    help="Show what would happen without changing anything: no state "
+         "writes, no pushes, no PR opens, no project sync. Read-only "
+         "GitHub fetches still happen.",
+)
 @click.pass_context
-def continue_cmd(ctx: click.Context, branch: str | None, work_dir: str | None) -> None:
+def continue_cmd(
+    ctx: click.Context,
+    branch: str | None,
+    work_dir: str | None,
+    dry_run: bool,
+) -> None:
     """Reconcile state after a manual fix (push + open any missing PRs)."""
     from releasy.pipeline import continue_all, continue_branch, run_sequential
 
     with _locked_config(ctx, session="optional") as config:
+        config.dry_run = dry_run
         wd = Path(work_dir) if work_dir else None
         if branch:
             if not continue_branch(config, branch):
@@ -961,6 +976,15 @@ def _print_discovery_summary(report) -> None:  # noqa: ANN001 — DiscoveryRepor
          "with it (and AI resolves them). Never force-pushes — only "
          "fast-forward / merge-commit pushes. Default: off.",
 )
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    default=False,
+    help="Show what would happen without changing anything: no state "
+         "writes, no merges, no pushes, no GitHub writes. Read-only "
+         "GitHub fetches still happen. Cannot predict merge conflicts.",
+)
 @click.pass_context
 def refresh(
     ctx: click.Context,
@@ -976,6 +1000,7 @@ def refresh(
     max_iterations_cli: int | None,
     only: str | None,
     merge_target: bool,
+    dry_run: bool,
 ) -> None:
     """Merge target branch into a PR (or every tracked PR), AI-resolve conflicts.
 
@@ -1140,6 +1165,7 @@ def refresh(
 
         config.session = None
         config.stateless = True
+        config.dry_run = dry_run
         if not resolve_conflicts_for_pr(
             config, pr_url, wd, resolve_conflicts=ai_resolve_flag,
             force_merge=merge_target,
@@ -1150,6 +1176,7 @@ def refresh(
     # Non-stateless paths: load + lock the project's config.
     if pr_url is None:
         with _locked_config(ctx, session="skip") as config:
+            config.dry_run = dry_run
             if not refresh_tracked_prs(
                 config, wd, resolve_conflicts=ai_resolve_flag,
                 only=only_filter, force_merge=merge_target,
@@ -1158,6 +1185,7 @@ def refresh(
         return
 
     with _locked_config(ctx, session="skip") as config:
+        config.dry_run = dry_run
         if not resolve_conflicts_for_pr(
             config, pr_url, wd, resolve_conflicts=ai_resolve_flag,
             force_merge=merge_target,
@@ -1454,6 +1482,7 @@ def address_review_cmd(
         # Stateless: never load state, never lock, never attach session.
         config.session = None
         config.stateless = True
+        config.dry_run = dry_run
         result = address_review(
             config,
             pr_url,
@@ -1473,6 +1502,7 @@ def address_review_cmd(
         return
 
     with _locked_config(ctx, session="skip") as config:
+        config.dry_run = dry_run
         result = address_review(
             config,
             pr_url,
@@ -1763,6 +1793,7 @@ def analyze_fails_cmd(
 
         config.session = None
         config.stateless = True
+        config.dry_run = dry_run
         result = analyze_fails(
             config, pr_url=pr_url, work_dir=wd, dry_run=dry_run,
             push=push, no_flaky_check=no_flaky_check,
@@ -1780,6 +1811,7 @@ def analyze_fails_cmd(
     if pr_url is None:
         # Multi-PR mode needs the state file to enumerate tracked PRs.
         with _locked_config(ctx, session="optional") as config:
+            config.dry_run = dry_run
             result = analyze_fails(
                 config, pr_url=None, work_dir=wd, dry_run=dry_run,
                 push=push, no_flaky_check=no_flaky_check,
@@ -1792,6 +1824,7 @@ def analyze_fails_cmd(
         return
 
     with _locked_config(ctx, session="skip") as config:
+        config.dry_run = dry_run
         result = analyze_fails(
             config, pr_url=pr_url, work_dir=wd, dry_run=dry_run,
             push=push, no_flaky_check=no_flaky_check,
@@ -1837,6 +1870,15 @@ def analyze_fails_cmd(
          "source or rebase) or a single feature / group ID. "
          "Mutually exclusive with --pr. Exits non-zero if nothing matches.",
 )
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    default=False,
+    help="Show what would happen without changing anything: no "
+         "branches, no cherry-picks, no pushes, no PR opens / closes. "
+         "Read-only GitHub fetches still happen.",
+)
 @click.pass_context
 def rebase_cmd(
     ctx: click.Context,
@@ -1845,6 +1887,7 @@ def rebase_cmd(
     work_dir: str | None,
     resolve_conflicts: bool,
     only: str | None,
+    dry_run: bool,
 ) -> None:
     """Re-port a rebase PR onto a different target branch.
 
@@ -1885,6 +1928,7 @@ def rebase_cmd(
         raise click.UsageError(str(e))
 
     with _locked_config(ctx, session="skip") as config:
+        config.dry_run = dry_run
         if pr_url is not None:
             summary = rebase_single(
                 config, pr_url, target_branch,
