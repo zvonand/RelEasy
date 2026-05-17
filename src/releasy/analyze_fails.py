@@ -60,6 +60,7 @@ from releasy.git_ops import (
     stash_and_clean,
 )
 from releasy.github_ops import (
+    fetch_pr_by_url,
     get_origin_repo_slug,
     parse_pr_url,
 )
@@ -133,8 +134,15 @@ def _tracked_pr_urls(
     """Every PR URL ``releasy run`` has opened that's still in state.
 
     Skips entries without a ``rebase_pr_url`` (those are still pending
-    a PR — nothing to analyse) and de-duplicates while preserving
-    insertion order. Returns ``[]`` when ``state`` is ``None``.
+    a PR — nothing to analyse), entries the local state already marks
+    ``merged`` or ``skipped`` (no point poking dead PRs), and
+    de-duplicates while preserving insertion order. Returns ``[]`` when
+    ``state`` is ``None``.
+
+    The authoritative open/merged/closed check still happens per-PR
+    inside :func:`_process_pr` against GitHub, so a stale local
+    ``needs_review`` for a PR merged externally is caught there. This
+    prefilter just avoids one round-trip per obvious dead entry.
 
     ``only`` (optional) restricts the result to the single tracked
     feature whose URL or feature-id matches the filter.
@@ -146,6 +154,8 @@ def _tracked_pr_urls(
     for fid, fs in state.features.items():
         url = fs.rebase_pr_url
         if not url or url in seen:
+            continue
+        if fs.status in ("merged", "skipped"):
             continue
         if only is not None and not only.matches_state(fid, fs):
             continue
@@ -639,6 +649,30 @@ def _process_pr(
     dry_run: bool,
 ) -> PRRunResult:
     """Drive the per-shard Claude loop + push for ONE PR."""
+    # Authoritative open-state check. analyze-fails pushes commits to
+    # the PR's head branch; doing that on a merged or closed PR is
+    # either pointless (merged — branch is no longer the source of
+    # truth) or harmful (closed — the author already decided not to
+    # land it). Skip with a one-line explanation so the operator sees
+    # which PRs were excluded.
+    pr_info = fetch_pr_by_url(config, pr_url, include_closed=True)
+    if pr_info is None:
+        return PRRunResult(
+            pr_url=pr_url, head_sha="", head_ref="",
+            error=(
+                "Could not fetch PR metadata — check the URL and "
+                "RELEASY_GITHUB_TOKEN."
+            ),
+        )
+    if pr_info.state != "open":
+        console.print(
+            f"  [dim]{pr_url}: {pr_info.state} — skipping "
+            "(analyze-fails only operates on open PRs)[/dim]"
+        )
+        return PRRunResult(
+            pr_url=pr_url, head_sha=pr_info.head_sha, head_ref="",
+        )
+
     head = _fetch_pr_meta(pr_url)
     if head is None:
         return PRRunResult(
@@ -1196,6 +1230,13 @@ def analyze_fails(
     if pr_url:
         primary_pr_urls = [pr_url]
     else:
+        # Refresh local merge status from GitHub so the _tracked_pr_urls
+        # prefilter doesn't queue a PR that's already been merged
+        # externally. Cheap (parallel GETs); skipped on dry-run / no
+        # state since there's nothing to update.
+        if state is not None and not dry_run:
+            from releasy.pipeline import _refresh_all_merge_status_from_github
+            _refresh_all_merge_status_from_github(config, state)
         primary_pr_urls = _tracked_pr_urls(state, only=only)
         if not primary_pr_urls:
             if only is not None:
